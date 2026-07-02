@@ -5513,104 +5513,74 @@ function getDashboardUI(hasDB) {
                       <div id="view-overview" class="space-y-3 md:space-y-6 block">
                           <!-- User Summary Cards -->
                           <div class="grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-5 gap-2 md:gap-4">
-                              <div class="native-press bg-white dark:bg-darkcard rounded-xl md:rounded-2xl p-3 md:p-4 shadow-sm border border-slate-200 dark:border-darkborder hover:shadow-md hover:border-indigo-400 dark:hover:border-indigo-500/50 transition duration-300 relative overflow-hidden group">
-                                  <div class="absolute -right-4 -bottom-4 w-20 h-20 md:w-24 md:h-24 bg-indigo-500/10 rounded-full blur-xl group-hover:scale-150 transition duration-500"></div>
-                                  <div class="flex items-center justify-between mb-1 md:mb-2 relative z-10">
+                              <div class="native-press bg-white dark:bg-darkcard rounded-xl md:rounded-2xl p-3 md:p-4 shadow-sm border border-slate-200 dark:border-darkborder">
+                                  <div class="flex items-center justify-between mb-1 md:mb-2">
                                       <span class="text-[9px] md:text-[10px] font-bold text-slate-400 uppercase tracking-wider" data-i18n="ov_total_users">Total Users</span>
                                       <div class="p-1.5 md:p-2 bg-primary/10 text-primary rounded-md md:rounded-lg"><svg class="w-3.5 h-3.5 md:w-4 md:h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M17 20h5v-2a3 3 0 00-5.356-1.857M17 20H7m10 0v-2c0-.656-.126-1.283-.356-1.857M7 20H2v-2a3 3 0 015.356-1.857M7 20v-2c0-.656-.126-1.283-.356-1.857M12 4.354a4 4 0 110 5.292"></path></svg></div>
                                   </div>
-                                  <p id="ov-total-users" class="text-xl md:text-2xl font-black text-slate-800 dark:text-white relative z-10">-</p>
-                                  <span class="text-[9px] md:text-[10px] text-indigo-500 dark:text-indigo-400 flex items-center gap-1 font-medium mt-0.5 md:mt-1 relative z-10">
-                                      <span class="w-1.5 h-1.5 bg-indigo-500 rounded-full animate-ping"></span>
-                                      <span data-i18n="ov_total_users">Total Users</span>
-                                  </span>
+                                  <p id="ov-total-users" class="text-xl md:text-2xl font-black text-slate-800 dark:text-white">-</p>
                               </div>
-                              <div class="native-press bg-white dark:bg-darkcard rounded-xl md:rounded-2xl p-3 md:p-4 shadow-sm border border-slate-200 dark:border-darkborder hover:shadow-md hover:border-emerald-400 dark:hover:border-emerald-500/50 transition duration-300 relative overflow-hidden group">
-                                  <div class="absolute -right-4 -bottom-4 w-20 h-20 md:w-24 md:h-24 bg-emerald-500/10 rounded-full blur-xl group-hover:scale-150 transition duration-500"></div>
-                                  <div class="flex items-center justify-between mb-1 md:mb-2 relative z-10">
+                              <div class="native-press bg-white dark:bg-darkcard rounded-xl md:rounded-2xl p-3 md:p-4 shadow-sm border border-slate-200 dark:border-darkborder">
+                                  <div class="flex items-center justify-between mb-1 md:mb-2">
                                       <span class="text-[9px] md:text-[10px] font-bold text-slate-400 uppercase tracking-wider" data-i18n="ov_active_users">Active</span>
                                       <div class="p-1.5 md:p-2 bg-emerald-500/10 text-emerald-500 rounded-md md:rounded-lg"><svg class="w-3.5 h-3.5 md:w-4 md:h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 12l2 2 4-4m6 2a9 9 0 11-18 0 9 9 0 0118 0z"></path></svg></div>
                                   </div>
-                                  <p id="ov-active-users" class="text-xl md:text-2xl font-black text-emerald-600 dark:text-emerald-400 relative z-10">-</p>
-                                  <span class="text-[9px] md:text-[10px] text-emerald-500 dark:text-emerald-400 flex items-center gap-1 font-medium mt-0.5 md:mt-1 relative z-10">
-                                      <span class="w-1.5 h-1.5 bg-emerald-500 rounded-full animate-pulse"></span>
-                                      <span data-i18n="ov_active_users">Active</span>
-                                  </span>
+                                  <p id="ov-active-users" class="text-xl md:text-2xl font-black text-emerald-600 dark:text-emerald-400">-</p>
                               </div>
-                              <div class="native-press bg-white dark:bg-darkcard rounded-xl md:rounded-2xl p-3 md:p-4 shadow-sm border border-slate-200 dark:border-darkborder hover:shadow-md hover:border-amber-400 dark:hover:border-amber-500/50 transition duration-300 relative overflow-hidden group">
-                                  <div class="absolute -right-4 -bottom-4 w-20 h-20 md:w-24 md:h-24 bg-amber-500/10 rounded-full blur-xl group-hover:scale-150 transition duration-500"></div>
-                                  <div class="flex items-center justify-between mb-1 md:mb-2 relative z-10">
+                              <div class="native-press bg-white dark:bg-darkcard rounded-xl md:rounded-2xl p-3 md:p-4 shadow-sm border border-slate-200 dark:border-darkborder">
+                                  <div class="flex items-center justify-between mb-1 md:mb-2">
                                       <span class="text-[9px] md:text-[10px] font-bold text-slate-400 uppercase tracking-wider" data-i18n="ov_paused_users">Paused</span>
                                       <div class="p-1.5 md:p-2 bg-amber-500/10 text-amber-500 rounded-md md:rounded-lg"><svg class="w-3.5 h-3.5 md:w-4 md:h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M10 9v6m4-6v6m7-3a9 9 0 11-18 0 9 9 0 0118 0z"></path></svg></div>
                                   </div>
-                                  <p id="ov-paused-users" class="text-xl md:text-2xl font-black text-amber-600 dark:text-amber-400 relative z-10">-</p>
-                                  <span class="text-[9px] md:text-[10px] text-amber-500 dark:text-amber-400 flex items-center gap-1 font-medium mt-0.5 md:mt-1 relative z-10">
-                                      <span class="w-1.5 h-1.5 bg-amber-500 rounded-full animate-pulse"></span>
-                                      <span data-i18n="ov_paused_users">Paused</span>
-                                  </span>
+                                  <p id="ov-paused-users" class="text-xl md:text-2xl font-black text-amber-600 dark:text-amber-400">-</p>
                               </div>
-                              <div class="native-press bg-white dark:bg-darkcard rounded-xl md:rounded-2xl p-3 md:p-4 shadow-sm border border-slate-200 dark:border-darkborder hover:shadow-md hover:border-red-400 dark:hover:border-red-500/50 transition duration-300 relative overflow-hidden group">
-                                  <div class="absolute -right-4 -bottom-4 w-20 h-20 md:w-24 md:h-24 bg-red-500/10 rounded-full blur-xl group-hover:scale-150 transition duration-500"></div>
-                                  <div class="flex items-center justify-between mb-1 md:mb-2 relative z-10">
+                              <div class="native-press bg-white dark:bg-darkcard rounded-xl md:rounded-2xl p-3 md:p-4 shadow-sm border border-slate-200 dark:border-darkborder">
+                                  <div class="flex items-center justify-between mb-1 md:mb-2">
                                       <span class="text-[9px] md:text-[10px] font-bold text-slate-400 uppercase tracking-wider" data-i18n="ov_auto_disabled">Auto-Disabled</span>
                                       <div class="p-1.5 md:p-2 bg-red-500/10 text-red-500 rounded-md md:rounded-lg"><svg class="w-3.5 h-3.5 md:w-4 md:h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 9v2m0 4h.01m-6.938 4h13.856c1.54 0 2.502-1.667 1.732-2.5L13.732 4c-.77-.833-1.964-.833-2.732 0L4.082 16.5c-.77.833.192 2.5 1.732 2.5z"></path></svg></div>
                                   </div>
-                                  <p id="ov-auto-disabled" class="text-xl md:text-2xl font-black text-red-600 dark:text-red-400 relative z-10">-</p>
-                                  <span class="text-[9px] md:text-[10px] text-red-500 dark:text-red-400 flex items-center gap-1 font-medium mt-0.5 md:mt-1 relative z-10">
-                                      <span class="w-1.5 h-1.5 bg-red-500 rounded-full animate-pulse"></span>
-                                      <span data-i18n="ov_auto_disabled">Auto-Disabled</span>
-                                  </span>
+                                  <p id="ov-auto-disabled" class="text-xl md:text-2xl font-black text-red-600 dark:text-red-400">-</p>
                               </div>
-                              <div class="native-press bg-white dark:bg-darkcard rounded-xl md:rounded-2xl p-3 md:p-4 shadow-sm border border-slate-200 dark:border-darkborder hover:shadow-md hover:border-slate-400 dark:hover:border-slate-500/50 transition duration-300 relative overflow-hidden group">
-                                  <div class="absolute -right-4 -bottom-4 w-20 h-20 md:w-24 md:h-24 bg-slate-500/10 rounded-full blur-xl group-hover:scale-150 transition duration-500"></div>
-                                  <div class="flex items-center justify-between mb-1 md:mb-2 relative z-10">
+                              <div class="native-press bg-white dark:bg-darkcard rounded-xl md:rounded-2xl p-3 md:p-4 shadow-sm border border-slate-200 dark:border-darkborder">
+                                  <div class="flex items-center justify-between mb-1 md:mb-2">
                                       <span class="text-[9px] md:text-[10px] font-bold text-slate-400 uppercase tracking-wider" data-i18n="ov_expired_users">Expired</span>
                                       <div class="p-1.5 md:p-2 bg-slate-500/10 text-slate-500 rounded-md md:rounded-lg"><svg class="w-3.5 h-3.5 md:w-4 md:h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 8v4l3 3m6-3a9 9 0 11-18 0 9 9 0 0118 0z"></path></svg></div>
                                   </div>
-                                  <p id="ov-expired-users" class="text-xl md:text-2xl font-black text-slate-600 dark:text-slate-400 relative z-10">-</p>
-                                  <span class="text-[9px] md:text-[10px] text-slate-500 dark:text-slate-400 flex items-center gap-1 font-medium mt-0.5 md:mt-1 relative z-10">
-                                      <span class="w-1.5 h-1.5 bg-slate-500 rounded-full animate-pulse"></span>
-                                      <span data-i18n="ov_expired_users">Expired</span>
-                                  </span>
+                                  <p id="ov-expired-users" class="text-xl md:text-2xl font-black text-slate-600 dark:text-slate-400">-</p>
                               </div>
                           </div>
 
                           <!-- Traffic & System Cards -->
                           <div class="grid grid-cols-2 sm:grid-cols-2 lg:grid-cols-4 gap-2 md:gap-4">
-                              <div class="native-press bg-white dark:bg-darkcard rounded-xl md:rounded-2xl p-3 md:p-5 shadow-sm border border-slate-200 dark:border-darkborder hover:shadow-md hover:border-violet-400 dark:hover:border-violet-500/50 transition duration-300 relative overflow-hidden group">
-                                  <div class="absolute -right-4 -bottom-4 w-20 h-20 md:w-24 md:h-24 bg-violet-500/10 rounded-full blur-xl group-hover:scale-150 transition duration-500"></div>
-                                  <div class="flex items-center gap-2 md:gap-3 mb-2 md:mb-3 relative z-10">
+                              <div class="native-press bg-white dark:bg-darkcard rounded-xl md:rounded-2xl p-3 md:p-5 shadow-sm border border-slate-200 dark:border-darkborder">
+                                  <div class="flex items-center gap-2 md:gap-3 mb-2 md:mb-3">
                                       <div class="p-1.5 md:p-2.5 bg-violet-500/10 text-violet-500 rounded-lg md:rounded-xl"><svg class="w-4 h-4 md:w-5 md:h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M19 11H5m14 0a2 2 0 012 2v6a2 2 0 01-2 2H5a2 2 0 01-2-2v-6a2 2 0 012-2m14 0V9a2 2 0 00-2-2M5 11V9a2 2 0 012-2m0 0V5a2 2 0 012-2h6a2 2 0 012 2v2M7 7h10"></path></svg></div>
                                        <span class="text-[10px] md:text-xs font-bold text-slate-500 uppercase tracking-wider" data-i18n="ov_total_traffic">Total Traffic</span>
                                   </div>
-                                   <p id="ov-total-traffic" class="text-base md:text-xl font-black text-slate-800 dark:text-white relative z-10">- GB</p>
-                                  <p class="text-[9px] md:text-[10px] text-slate-400 mt-0.5 md:mt-1 relative z-10"><span id="ov-total-reqs">-</span> <span data-i18n="ov_requests">requests</span></p>
+                                   <p id="ov-total-traffic" class="text-base md:text-xl font-black text-slate-800 dark:text-white">- GB</p>
+                                  <p class="text-[9px] md:text-[10px] text-slate-400 mt-0.5 md:mt-1"><span id="ov-total-reqs">-</span> <span data-i18n="ov_requests">requests</span></p>
                               </div>
-                              <div class="native-press bg-white dark:bg-darkcard rounded-xl md:rounded-2xl p-3 md:p-5 shadow-sm border border-slate-200 dark:border-darkborder hover:shadow-md hover:border-cyan-400 dark:hover:border-cyan-500/50 transition duration-300 relative overflow-hidden group">
-                                  <div class="absolute -right-4 -bottom-4 w-20 h-20 md:w-24 md:h-24 bg-cyan-500/10 rounded-full blur-xl group-hover:scale-150 transition duration-500"></div>
-                                  <div class="flex items-center gap-2 md:gap-3 mb-2 md:mb-3 relative z-10">
+                              <div class="native-press bg-white dark:bg-darkcard rounded-xl md:rounded-2xl p-3 md:p-5 shadow-sm border border-slate-200 dark:border-darkborder">
+                                  <div class="flex items-center gap-2 md:gap-3 mb-2 md:mb-3">
                                       <div class="p-1.5 md:p-2.5 bg-cyan-500/10 text-cyan-500 rounded-lg md:rounded-xl"><svg class="w-4 h-4 md:w-5 md:h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M13 7h8m0 0v8m0-8l-8 8-4-4-6 6"></path></svg></div>
                                        <span class="text-[10px] md:text-xs font-bold text-slate-500 uppercase tracking-wider" data-i18n="ov_today_traffic">Today's Traffic</span>
                                   </div>
-                                  <p id="ov-today-traffic" class="text-base md:text-xl font-black text-slate-800 dark:text-white relative z-10">- GB</p>
-                                  <p class="text-[9px] md:text-[10px] text-slate-400 mt-0.5 md:mt-1 relative z-10"><span id="ov-today-reqs">-</span> <span data-i18n="ov_requests">requests</span></p>
+                                  <p id="ov-today-traffic" class="text-base md:text-xl font-black text-slate-800 dark:text-white">- GB</p>
+                                  <p class="text-[9px] md:text-[10px] text-slate-400 mt-0.5 md:mt-1"><span id="ov-today-reqs">-</span> <span data-i18n="ov_requests">requests</span></p>
                               </div>
-                              <div class="native-press bg-white dark:bg-darkcard rounded-xl md:rounded-2xl p-3 md:p-5 shadow-sm border border-slate-200 dark:border-darkborder hover:shadow-md hover:border-blue-400 dark:hover:border-blue-500/50 transition duration-300 relative overflow-hidden group">
-                                  <div class="absolute -right-4 -bottom-4 w-20 h-20 md:w-24 md:h-24 bg-blue-500/10 rounded-full blur-xl group-hover:scale-150 transition duration-500"></div>
-                                  <div class="flex items-center gap-2 md:gap-3 mb-2 md:mb-3 relative z-10">
+                              <div class="native-press bg-white dark:bg-darkcard rounded-xl md:rounded-2xl p-3 md:p-5 shadow-sm border border-slate-200 dark:border-darkborder">
+                                  <div class="flex items-center gap-2 md:gap-3 mb-2 md:mb-3">
                                       <div class="p-1.5 md:p-2.5 bg-blue-500/10 text-blue-500 rounded-lg md:rounded-xl"><svg class="w-4 h-4 md:w-5 md:h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M5.636 18.364a9 9 0 010-12.728m12.728 0a9 9 0 010 12.728m-9.9-2.829a5 5 0 010-7.07m7.072 0a5 5 0 010 7.07M13 12a1 1 0 11-2 0 1 1 0 012 0z"></path></svg></div>
                                        <span class="text-[10px] md:text-xs font-bold text-slate-500 uppercase tracking-wider" data-i18n="ov_active_conns">Active Connections</span>
                                   </div>
-                                  <p id="ov-active-conns" class="text-base md:text-xl font-black text-slate-800 dark:text-white relative z-10">-</p>
-                                  <p class="text-[9px] md:text-[10px] text-blue-500 dark:text-blue-400 flex items-center gap-1 font-medium mt-0.5 md:mt-1 relative z-10"><span class="w-1.5 h-1.5 bg-blue-500 rounded-full animate-pulse"></span>live</p>
+                                  <p id="ov-active-conns" class="text-base md:text-xl font-black text-slate-800 dark:text-white">-</p>
                               </div>
-                              <div class="native-press bg-white dark:bg-darkcard rounded-xl md:rounded-2xl p-3 md:p-5 shadow-sm border border-slate-200 dark:border-darkborder hover:shadow-md hover:border-indigo-400 dark:hover:border-indigo-500/50 transition duration-300 relative overflow-hidden group">
-                                  <div class="absolute -right-4 -bottom-4 w-20 h-20 md:w-24 md:h-24 bg-indigo-500/10 rounded-full blur-xl group-hover:scale-150 transition duration-500"></div>
-                                  <div class="flex items-center gap-2 md:gap-3 mb-2 md:mb-3 relative z-10">
+                              <div class="native-press bg-white dark:bg-darkcard rounded-xl md:rounded-2xl p-3 md:p-5 shadow-sm border border-slate-200 dark:border-darkborder">
+                                  <div class="flex items-center gap-2 md:gap-3 mb-2 md:mb-3">
                                       <div class="p-1.5 md:p-2.5 bg-indigo-500/10 text-indigo-500 rounded-lg md:rounded-xl"><svg class="w-4 h-4 md:w-5 md:h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 12l2 2 4-4m5.618-4.016A11.955 11.955 0 0112 2.944a11.955 11.955 0 01-8.618 3.04A12.02 12.02 0 003 9c0 5.591 3.824 10.29 9 11.622 5.176-1.332 9-6.03 9-11.622 0-1.042-.133-2.052-.382-3.016z"></path></svg></div>
                                        <span class="text-[10px] md:text-xs font-bold text-slate-500 uppercase tracking-wider" data-i18n="ov_system">System</span>
                                   </div>
-                                  <p id="ov-version" class="text-base md:text-xl font-black text-slate-800 dark:text-white relative z-10">-</p>
+                                  <p id="ov-version" class="text-base md:text-xl font-black text-slate-800 dark:text-white">-</p>
                               </div>
                           </div>
 
