@@ -1,8895 +1,4281 @@
 import { connect } from "cloudflare:sockets";
-
-/* 
- * Project lowkey (lowkey) - IoT Device Telemetry Gateway
- * Handles real-time binary streams from remote sensor nodes.
- */
-
-const CURRENT_VERSION = "6.0.0";
-
-const getAlpha = () => String.fromCharCode(118, 108, 101, 115, 115);
-const getBeta = () => String.fromCharCode(116, 114, 111, 106, 97, 110);
-const getGamma = () => String.fromCharCode(99, 108, 97, 115, 104);
-
-const safeBtoa = (str) => {
-    try {
-        const bytes = new TextEncoder().encode(str);
-        let binary = "";
-        for (let i = 0; i < bytes.byteLength; i++) {
-            binary += String.fromCharCode(bytes[i]);
-        }
-        return btoa(binary);
-    } catch (e) {
-        return btoa(str);
-    }
-};
-
-const SYSTEM_DEFAULTS = {
-    name: "",
-    apiRoute: "sh",
-    maintenanceHost: "https://seswtf8.github.io/profal/",
-    backupRelay: "",
-    customRelay: "",
-    masterKey: "151387sh",
-    metricNode: "time.is",
-    cleanIps: "",
-    slaveNodes: "",
-    deviceId: "",
-    mode: "alpha",
-    agent: "chrome",
-    socketPorts: "443",
-    customDns: "https://cloudflare-dns.com/dns-query",
-    resolveIp: "1.1.1.1",
-    cascade: "",
-    enableOpt1: false,
-    enableOpt2: false,
-    tgToken: "",
-    tgChatId: "",
-    tgAdminId: "",
-    cfAccountId: "",
-    cfApiToken: "",
-    cfWorkerName: "",
-    isPaused: false,
-    silentAlerts: false,
-    nameStrategy: "default",
-    namePrefix: "lowkey",
-    tgBotLang: "fa",
-    users: [],
-    subUserAgent: "",
-    customPanelUrl: "",
-    limitTotalReq: 0,
-    expiryMs: 0,
-    linkedPanels: [],
-    hubPanelUrl: "",
-    syncApiKey: "",
-    panelApiKeys: [],
-    nat64Prefix: "",
-    enableDirectConfigs: false,
-    fakeConfigs: [
-        { name: "📊 {usage}", enabled: true },
-        { name: "📅 {expiry}", enabled: true }
-    ],
-};
-
-let sysConfig = { ...SYSTEM_DEFAULTS };
-let isolateStartTime = 0;
-let activeConnections = 0;
-let uuidUsage = new Map();
-let activeConns = new Map();
-let activeDeviceId = "";
-let configRegistry = new Map();
-
-let sysUsageCache = { users: {} };
-let lastSysUsageSync = 0;
-
-const CACHE_TTL_CONFIG = 10000;
-const CACHE_TTL_USAGE = 10000;
-const CACHE_TTL_BACKUP_IP = 30000;
-let sysConfigCacheTime = 0;
-let sysUsageCacheTime = 0;
-let backupIpCache = null;
-let backupIpCacheTime = 0;
-
-async function d1Init(env) {
-    if(env.IOT_DB && !env.IOT_DB_INITIALIZED) {
-        try { await env.IOT_DB.prepare("CREATE TABLE IF NOT EXISTS kv_store (key TEXT PRIMARY KEY, value TEXT)").run(); env.IOT_DB_INITIALIZED = true; } catch(e) { env.IOT_DB_INITIALIZED = true; }
-    }
-}
-async function d1Get(env, key) {
-    if(!env.IOT_DB) return null;
-    await d1Init(env);
-    try { const { results } = await env.IOT_DB.prepare("SELECT value FROM kv_store WHERE key = ?").bind(key).all(); if(results && results.length > 0) return results[0].value; } catch(e) {}
-    return null;
-}
-async function d1Put(env, key, value) {
-    if(!env.IOT_DB) return;
-    await d1Init(env);
-    try { await env.IOT_DB.prepare("INSERT INTO kv_store (key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value=excluded.value").bind(key, value).run(); } catch(e) {}
-}
-
-async function cachedD1Put(env, key, value) {
-    await d1Put(env, key, value);
-    if (key === "sys_config") sysConfigCacheTime = 0;
-    else if (key === "sys_usage") sysUsageCacheTime = 0;
-    else if (key === "backup_ip") backupIpCacheTime = 0;
-}
-
-function sha224Hex(m) {
-    const msg = new TextEncoder().encode(m);
-    const K = [0x428A2F98,0x71374491,0xB5C0FBCF,0xE9B5DBA5,0x3956C25B,0x59F111F1,0x923F82A4,0xAB1C5ED5,0xD807AA98,0x12835B01,0x243185BE,0x550C7DC3,0x72BE5D74,0x80DEB1FE,0x9BDC06A7,0xC19BF174,0xE49B69C1,0xEFBE4786,0x0FC19DC6,0x240CA1CC,0x2DE92C6F,0x4A7484AA,0x5CB0A9DC,0x76F988DA,0x983E5152,0xA831C66D,0xB00327C8,0xBF597FC7,0xC6E00BF3,0xD5A79147,0x06CA6351,0x14292967,0x27B70A85,0x2E1B2138,0x4D2C6DFC,0x53380D13,0x650A7354,0x766A0ABB,0x81C2C92E,0x92722C85,0xA2BFE8A1,0xA81A664B,0xC24B8B70,0xC76C51A3,0xD192E819,0xD6990624,0xF40E3585,0x106AA070,0x19A4C116,0x1E376C08,0x2748774C,0x34B0BCB5,0x391C0CB3,0x4ED8AA4A,0x5B9CCA4F,0x682E6FF3,0x748F82EE,0x78A5636F,0x84C87814,0x8CC70208,0x90BEFFFA,0xA4506CEB,0xBEF9A3F7,0xC67178F2];
-    let H = [0xC1059ED8,0x367CD507,0x3070DD17,0xF70E5939,0xFFC00B31,0x68581511,0x64F98FA7,0xBEFA4FA4];
-    const words = []; const n = Math.ceil((msg.length + 9) / 64) * 16;
-    for (let i = 0; i < n; i++) words[i] = 0;
-    for (let i = 0; i < msg.length; i++) words[i >> 2] |= msg[i] << (24 - (i % 4) * 8);
-    words[msg.length >> 2] |= 0x80 << (24 - (msg.length % 4) * 8);
-    words[n - 1] = msg.length * 8;
-    const W = [];
-    for (let i = 0; i < n; i += 16) {
-        let [a, b, c, d, e, f, g, h] = H;
-        for (let j = 0; j < 64; j++) {
-            if (j < 16) W[j] = words[i + j];
-            else {
-                let w15 = W[j - 15], w2 = W[j - 2];
-                let s0 = (w15 >>> 7 | w15 << 25) ^ (w15 >>> 18 | w15 << 14) ^ (w15 >>> 3);
-                let s1 = (w2 >>> 17 | w2 << 15) ^ (w2 >>> 19 | w2 << 13) ^ (w2 >>> 10);
-                W[j] = (W[j - 16] + s0 + W[j - 7] + s1) >>> 0;
-            }
-            let S1 = (e >>> 6 | e << 26) ^ (e >>> 11 | e << 21) ^ (e >>> 25 | e << 7);
-            let ch = (e & f) ^ (~e & g); let temp1 = (h + S1 + ch + K[j] + W[j]) >>> 0;
-            let S0 = (a >>> 2 | a << 30) ^ (a >>> 13 | a << 19) ^ (a >>> 22 | a << 10);
-            let maj = (a & b) ^ (a & c) ^ (b & c); let temp2 = (S0 + maj) >>> 0;
-            h = g; g = f; f = e; e = (d + temp1) >>> 0; d = c; c = b; b = a; a = (temp1 + temp2) >>> 0;
-        }
-        H[0] = (H[0] + a) >>> 0; H[1] = (H[1] + b) >>> 0; H[2] = (H[2] + c) >>> 0; H[3] = (H[3] + d) >>> 0;
-        H[4] = (H[4] + e) >>> 0; H[5] = (H[5] + f) >>> 0; H[6] = (H[6] + g) >>> 0; H[7] = (H[7] + h) >>> 0;
-    }
-    return H.slice(0, 7).map(v => v.toString(16).padStart(8, '0')).join('');
-}
-const trojanHashCache = new Map();
-function getTrojanHash(uuid) {
-    if (trojanHashCache.has(uuid)) return trojanHashCache.get(uuid);
-    const hash = sha224Hex(uuid);
-    trojanHashCache.set(uuid, hash);
-    return hash;
-}
-
-function registerConfigEntry(uuid, userId, relayIp) {
-    const entry = { userId, relayIp: relayIp || '' };
-    configRegistry.set(uuid.replace(/-/g, '').toLowerCase(), entry);
-    const hashKey = getTrojanHash(uuid);
-    configRegistry.set(hashKey, entry);
-}
-
-function lookupConfigEntry(uuidHex) {
-    return configRegistry.get(uuidHex.toLowerCase()) || null;
-}
-
-function generateConfigUuid(originalUuid, relayIpIndex) {
-    const cleanUuid = originalUuid.replace(/-/g, '').toLowerCase();
-    const userPart = cleanUuid.substring(0, 24);
-    const relayPart = relayIpIndex.toString(16).padStart(8, '0');
-    const fullHex = userPart + relayPart;
-    return `${fullHex.substring(0,8)}-${fullHex.substring(8,12)}-${fullHex.substring(12,16)}-${fullHex.substring(16,20)}-${fullHex.substring(20,32)}`;
-}
-
-function decodeConfigUuid(uuid) {
-    const cleanUuid = uuid.replace(/-/g, '').toLowerCase();
-    if (cleanUuid.length !== 32) return null;
-    const userFingerprint = cleanUuid.substring(0, 24);
-    const relayIpIndex = parseInt(cleanUuid.substring(24, 32), 16);
-    return { userFingerprint, relayIpIndex };
-}
-
-function isPanelApiKey(key) {
-    if (!key || !sysConfig.panelApiKeys || !Array.isArray(sysConfig.panelApiKeys)) return false;
-    return sysConfig.panelApiKeys.some(k => k.key === key);
-}
-
-function extractAuthKey(request, data) {
-    const authHeader = request.headers.get("Authorization") || "";
-    const authKey = authHeader.replace("Bearer ", "") || "";
-    let bodyKey = "";
-    if (data && typeof data === "object") bodyKey = data.key || "";
-    const url = new URL(request.url);
-    const urlKey = url.searchParams.get("key") || "";
-    return authKey || bodyKey || urlKey;
-}
-
-function isAuthorized(request, data) {
-    const key = extractAuthKey(request, data);
-    return key === sysConfig.masterKey || isPanelApiKey(key);
-}
-
-function generateApiKey(name) {
-    const id = crypto.randomUUID();
-    const raw = `lowkey_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 10)}`;
-    const key = raw;
-    return { id, name: name || "Unnamed Key", key, createdAt: Date.now(), lastUsed: null };
-}
-
-function trackUsage(uuid, bytes, env, ctx) {
-    if (!sysUsageCache) sysUsageCache = { users: {} };
-    if (!sysUsageCache.users) sysUsageCache.users = {};
-    if (!sysUsageCache.users[uuid]) sysUsageCache.users[uuid] = { reqs: 0, dReqs: 0, lastDay: new Date().toISOString().split('T')[0] };
-    
-    let u = sysUsageCache.users[uuid];
-    let today = new Date().toISOString().split('T')[0];
-    if (u.lastDay !== today) {
-        u.dReqs = 0;
-        u.lastDay = today;
-    }
-    if (u.reqs === undefined) u.reqs = 0;
-    if (u.dReqs === undefined) u.dReqs = 0;
-
-    if (bytes === 0) {
-        u.reqs += 1;
-        u.dReqs += 1;
-    }
-    
-    const now = Date.now();
-    if (now - lastSysUsageSync > 30000) {
-        lastSysUsageSync = now;
-        if (env && env.IOT_DB) {
-            let changedConfig = false;
-            if (sysConfig.users && sysConfig.users.length > 0) {
-                sysConfig.users.forEach(u => {
-                    let uId = u.id.replace(/-/g, '').toLowerCase();
-                    let sysU = sysUsageCache.users[uId];
-                    if (!u.isPaused) {
-                        let reason = null;
-                        if (u.expiryMs && Date.now() > u.expiryMs) {
-                            reason = `Expiration date reached (${new Date(u.expiryMs).toLocaleDateString()})`;
-                        } else if (sysU && u.limitTotalReq && sysU.reqs >= u.limitTotalReq) {
-                            let usedGB = (sysU.reqs / 6000).toFixed(2);
-                            let limitGB = (u.limitTotalReq / 6000).toFixed(2);
-                            reason = `Traffic limit exceeded (${usedGB}GB / ${limitGB}GB)`;
-                        }
-                        if (reason) {
-                            u.isPaused = true;
-                            u.disabledReason = reason;
-                            u.disabledAt = Date.now();
-                            changedConfig = true;
-                            ctx?.waitUntil(logActivity(env, "User Auto-Disabled", `User "${u.name}" (${u.id}) disabled: ${reason}`).catch(()=>{}));
-                            if (sysConfig.tgToken && (sysConfig.tgAdminId || sysConfig.tgChatId)) {
-                                const tgMsg = `⚠️ <b>User Auto-Disabled</b>\n\n👤 <b>User:</b> ${u.name}\n🆔 <b>ID:</b> <code>${u.id}</code>\n📝 <b>Reason:</b> ${reason}`;
-                                const notifyChatId = sysConfig.tgAdminId || sysConfig.tgChatId;
-                                ctx?.waitUntil(fetch(`https://api.telegram.org/bot${sysConfig.tgToken}/sendMessage`, {
-                                    method: 'POST',
-                                    headers: { 'Content-Type': 'application/json' },
-                                    body: JSON.stringify({ chat_id: notifyChatId, text: tgMsg, parse_mode: 'HTML' })
-                                }).catch(()=>{}));
-                            }
-                        }
-                    }
-                });
-            }
-            
-            if (changedConfig) {
-                ctx?.waitUntil(cachedD1Put(env, "sys_config", JSON.stringify(sysConfig)).catch(()=>{}));
-            }
-            ctx?.waitUntil(cachedD1Put(env, "sys_usage", JSON.stringify(sysUsageCache)).catch(()=>{}));
-        }
-    }
-}
-
+const GLOBAL_TRAFFIC_CACHE = new Map();
+const ACTIVE_CONNECTIONS_COUNT = new Map();
+const GLOBAL_LAST_ACTIVE_WRITE = new Map();
+const GLOBAL_LAST_DB_WRITE = new Map();
+const GLOBAL_WRITE_LOCK = new Map();
+const DNS_CACHE = new Map();
+const USER_REQ_CACHE = new Map();
+let GLOBAL_REQ_COUNT = 0;
+let GLOBAL_LAST_REQ_WRITE = 0;
+const DNS_CACHE_TTL = 5 * 60 * 1000;
+const DOH_RESOLVER = "https://cloudflare-dns.com/dns-query";
+const UPSTREAM_BUNDLE_TARGET_BYTES = 16 * 1024;
+const UPSTREAM_QUEUE_MAX_BYTES = 16 * 1024 * 1024;
+const UPSTREAM_QUEUE_MAX_ITEMS = 4096;
+const DOWNSTREAM_GRAIN_BYTES = 32 * 1024;
+const DOWNSTREAM_GRAIN_TAIL_THRESHOLD = 512;
+const DOWNSTREAM_GRAIN_SILENT_MS = 1;
+const TCP_CONCURRENCY = 2;
+const PRELOAD_RACE_DIAL = true;
 export default {
-    async fetch(request, env, ctx) {
-        try {
-            if (!isolateStartTime) isolateStartTime = Date.now();
-            await loadSysConfig(env);
-            activeDeviceId = sysConfig.deviceId || generateHardwareId(sysConfig.apiRoute);
-
-            const url = new URL(request.url);
-            const upgradeHeader = request.headers.get("Upgrade");
-            const isTelemetryStream = upgradeHeader && upgradeHeader.toLowerCase() === "websocket";
-
-            let reqPath = url.pathname;
-            if (reqPath.endsWith("/") && reqPath.length > 1) reqPath = reqPath.slice(0, -1);
-
-            const routes = {
-                data: `/${encodeURI(sysConfig.apiRoute)}`,
-                dash: `/${encodeURI(sysConfig.apiRoute)}/dash`,
-                auth: `/${encodeURI(sysConfig.apiRoute)}/api/auth`,
-                sync: `/${encodeURI(sysConfig.apiRoute)}/api/sync`,
-                tg: `/${encodeURI(sysConfig.apiRoute)}/tg`,
-                syncPanel: `/${encodeURI(sysConfig.apiRoute)}/tg/sync_panel`,
-                logs: `/${encodeURI(sysConfig.apiRoute)}/api/logs`,
-                users: `/${encodeURI(sysConfig.apiRoute)}/api/users`,
-                stats: `/${encodeURI(sysConfig.apiRoute)}/api/stats`,
-                apiKeys: `/${encodeURI(sysConfig.apiRoute)}/api/keys`,
-            };
-
-            const isSyncRoute = reqPath.endsWith('/api/sync');
-            const isUsersRoute = reqPath === routes.users || reqPath.endsWith('/api/users');
-            const isStatsRoute = reqPath === routes.stats || reqPath.endsWith('/api/stats');
-            const isApiKeysRoute = reqPath === routes.apiKeys || reqPath.endsWith('/api/keys');
-            const isAuthorizedRoute = reqPath === routes.data || reqPath === routes.dash || reqPath === routes.auth || reqPath === routes.sync || reqPath === routes.tg || reqPath === routes.syncPanel || reqPath === routes.logs || isSyncRoute || isUsersRoute || isStatsRoute || isApiKeysRoute;
-
-            if (!isTelemetryStream && !isAuthorizedRoute) {
-                return serveMaintenancePage(request, url);
-            }
-
-            if (!isTelemetryStream) {
-                if (reqPath === routes.dash) {
-                    return new Response(getDashboardUI(env.IOT_DB !== undefined), { headers: { "Content-Type": "text/html;charset=utf-8" } });
-                }
-                if (reqPath === routes.auth) {
-                    if (request.method !== "POST") return new Response("405", { status: 405 });
-                    return await handleAuth(request, url.hostname, ctx, env);
-                }
-                if (reqPath === routes.sync || isSyncRoute) {
-                    if (request.method === "OPTIONS") {
-                        return new Response(null, { status: 204, headers: { "Access-Control-Allow-Origin": "*", "Access-Control-Allow-Methods": "POST, OPTIONS", "Access-Control-Allow-Headers": "Content-Type, Authorization", "Access-Control-Max-Age": "86400" } });
-                    }
-                    if (request.method !== "POST") return new Response("405", { status: 405 });
-                    const syncRes = await handleConfigSync(request, env, ctx);
-                    syncRes.headers.set("Access-Control-Allow-Origin", "*");
-                    syncRes.headers.set("Access-Control-Allow-Headers", "Content-Type, Authorization");
-                    return syncRes;
-                }
-                if (reqPath === routes.logs) {
-                    if (request.method !== "POST" && request.method !== "GET") return new Response("405", { status: 405 });
-                    return await handleLogs(request, env);
-                }
-                if (isUsersRoute) {
-                    return await handleUsersApi(request, env, ctx);
-                }
-                if (isStatsRoute) {
-                    return await handleStatsApi(request, env);
-                }
-                if (isApiKeysRoute) {
-                    return await handleApiKeys(request, env, ctx);
-                }
-                if (reqPath === routes.syncPanel) {
-                    if (request.method !== "POST") return new Response("405", { status: 405 });
-                    return await handleSyncPanel(request, env, ctx);
-                }
-                if (reqPath === routes.tg) {
-                    if (request.method !== "POST") return new Response("405", { status: 405 });
-                    return await handleTelegramWebhook(request, env, url.hostname, ctx);
-                }
-                if (reqPath === routes.data) {
-                    const ua = (request.headers.get("User-Agent") || "").toLowerCase();
-                    const isCustomUaAllowed = sysConfig.subUserAgent && sysConfig.subUserAgent.trim().length > 0 && ua.includes(sysConfig.subUserAgent.trim().toLowerCase());
-                    const clientHost = request.headers.get("Host") || url.hostname;
-                    let targetSub = url.searchParams.get("sub");
-                    let hasMultiUser = (sysConfig.users && sysConfig.users.length > 0);
-                    
-                    let targetUser = null;
-                    let isValidUser = false;
-                    if (hasMultiUser) {
-                        if (targetSub) {
-                            targetUser = sysConfig.users.find(u => u.name.toLowerCase() === targetSub.toLowerCase() || u.id === targetSub);
-                            if (targetUser) isValidUser = true;
-                        }
-                    } else {
-                        isValidUser = true;
-                        targetUser = { id: activeDeviceId, name: "Default" };
-                    }
-                    
-                    const acceptHeader = (request.headers.get("Accept") || "").toLowerCase();
-                    const secFetchDest = (request.headers.get("Sec-Fetch-Dest") || "").toLowerCase();
-                    
-                    const isRealBrowser = (
-                        (secFetchDest === "document") ||
-                        (acceptHeader.includes("text/html"))
-                    ) && (
-                        ua.includes("mozilla") || 
-                        ua.includes("chrome") || 
-                        ua.includes("safari") || 
-                        ua.includes("applewebkit") || 
-                        ua.includes("gecko") || 
-                        ua.includes("opera") || 
-                        ua.includes("edge")
-                    ) && !ua.includes("cla" + "sh") && !ua.includes("si" + "ng-box") && !ua.includes("v" + "2r" + "ay") && !ua.includes("shadow" + "rocket") && !ua.includes("quantum" + "ult") && !ua.includes("surf" + "board") && !ua.includes("sta" + "sh");
-
-                    if (isRealBrowser && !isCustomUaAllowed) {
-                        if (isValidUser) {
-                            return serveSubscriptionInfoPage(targetUser, clientHost, url, request);
-                        } else {
-                            return serveMaintenancePage(request, url);
-                        }
-                    }
-                    
-                    if (hasMultiUser && !isValidUser) {
-                        return new Response("Error: Default profile sync is disabled when multi-user is active.", { status: 403 });
-                    }
-                    
-                    const allowInsecure = url.searchParams.get("insecure") === "true" || 
-                                         url.searchParams.get("allowInsecure") === "true" ||
-                                         url.searchParams.get("allow_insecure") === "1" ||
-                                         url.searchParams.get("allowInsecure") === "1";
-
-                    const resHeaders = new Headers();
-                    resHeaders.set("Cache-Control", "no-store");
-                    resHeaders.set("Access-Control-Allow-Origin", "*");
-                    
-                    let flag = (url.searchParams.get("flag") || url.searchParams.get("format") || url.searchParams.get("type") || url.searchParams.get("output") || "").toLowerCase();
-
-                    if (isValidUser && targetUser) {
-                        let idClean = targetUser.id.replace(/-/g, '').toLowerCase();
-                        let sysU = sysUsageCache?.users?.[idClean] || { reqs: 0, dReqs: 0 };
-                        let totalReqs = sysU.reqs || 0;
-                        let limitTotal = 0;
-                        let expiryMs = 0;
-                        if (hasMultiUser) {
-                            limitTotal = targetUser.limitTotalReq || 0;
-                            expiryMs = targetUser.expiryMs || 0;
-                        } else {
-                            limitTotal = sysConfig.limitTotalReq || 0;
-                            expiryMs = sysConfig.expiryMs || 0;
-                        }
-                        
-                        let usedBytes = Math.floor(totalReqs * (1073741824 / 6000));
-                        let limitBytes = Math.floor(limitTotal * (1073741824 / 6000));
-                        let expireSec = expiryMs ? Math.floor(expiryMs / 1000) : 0;
-                        
-                        const subUserInfo = `upload=0; download=${usedBytes}; total=${limitBytes}; expire=${expireSec}`;
-                        resHeaders.set("Subscription-UserInfo", subUserInfo);
-                        resHeaders.set("subscription-userinfo", subUserInfo);
-                        resHeaders.set("Profile-Update-Interval", "12");
-                        resHeaders.set("profile-update-interval", "12");
-                        
-                        let cleanName = encodeURIComponent(targetUser.name);
-                        resHeaders.set("Content-Disposition", `attachment; filename="${cleanName}"; filename*=UTF-8''${cleanName}`);
-                    }
-
-                    // Determine subscription format
-                    let isClashYaml = false;
-                    let isSingboxJson = false;
-                    let isClashJson = false;
-
-                    // If flag is explicitly set, we respect it
-                    if (flag === "clash" || flag === "yaml" || flag === "meta" || flag === "stash" || flag === "clash-meta" || flag === "y") {
-                        isClashYaml = true;
-                    } else if (flag === "b" || flag === "c_legacy") {
-                        isClashJson = true;
-                    } else if (flag === "sing" || flag === "singbox" || flag === "sing-box" || flag === "sb" || flag === "s" || flag === "c" || flag === "g") {
-                        isSingboxJson = true;
-                    } else if (flag === "a" || flag === "raw" || flag === "") {
-                        // Safe auto-detect for raw sync or no-flag links using target browser / client User-Agent
-                        if (ua.includes(getGamma()) || ua.includes("meta") || ua.includes("sta" + "sh") || ua.includes("verge") || ua.includes("mihomo") || ua.includes("cfw") || ua.includes("stash") || ua.includes("clash")) {
-                            isClashYaml = true;
-                        } else if (ua.includes("sing-box") || ua.includes("singbox") || ua.includes("hiddify") || ua.includes("nekobox") || ua.includes("sfa") || ua.includes("karing") || ua.includes("v2rayng")) {
-                            isSingboxJson = true;
-                        }
-                    }
-
-                    if (isClashYaml) {
-                        resHeaders.set("Content-Type", "text/yaml; charset=utf-8");
-                        return new Response(await buildYamlProfile(clientHost, targetSub, allowInsecure), {
-                            headers: resHeaders
-                        });
-                    } else if (isSingboxJson) {
-                        resHeaders.set("Content-Type", "application/json; charset=utf-8");
-                        return new Response(JSON.stringify(await buildSingBoxJsonProfile(clientHost, targetSub, allowInsecure), null, 2), {
-                            headers: resHeaders
-                        });
-                    } else if (isClashJson) {
-                        resHeaders.set("Content-Type", "application/json; charset=utf-8");
-                        return new Response(JSON.stringify(await buildClashJsonProfile(clientHost, targetSub, allowInsecure), null, 2), {
-                            headers: resHeaders
-                        });
-                    } else {
-                        resHeaders.set("Content-Type", "text/plain; charset=utf-8");
-                        const raw = await buildUriProfile(clientHost, targetSub, allowInsecure);
-                        return new Response(safeBtoa(raw), {
-                            headers: resHeaders
-                        });
-                    }
-                }
-            }
-
-            if (isTelemetryStream) {
-                if (sysConfig.isPaused) return new Response(null, { status: 503 });
-                let wsRelayIdx = -1;
-                try {
-                    const riParam = url.searchParams.get('ri');
-                    if (riParam !== null) wsRelayIdx = parseInt(riParam, 10);
-                } catch(e) {}
-                if (wsRelayIdx < 0) {
-                    try {
-                        const lastSeg = url.pathname.split('/').pop();
-                        if (lastSeg) {
-                            const num = parseInt(lastSeg, 10);
-                            if (!isNaN(num) && num >= 0) wsRelayIdx = num;
-                        }
-                    } catch(e) {}
-                }
-                if (wsRelayIdx < 0) {
-                    try {
-                        const lastSeg = url.pathname.split('/').pop();
-                        if (lastSeg) {
-                            const decoded = JSON.parse(atob(lastSeg));
-                            if (typeof decoded.relayIdx === 'number') wsRelayIdx = decoded.relayIdx;
-                        }
-                    } catch(e) {}
-                }
-                return await processTelemetryStream(env, ctx, wsRelayIdx);
-            }
-
-            return new Response(null, { status: 404 });
-        } catch (err) {
-            return new Response(null, { status: 404 });
-        }
-    },
+	async fetch(request, env, ctx) {
+		trackRequest(env, ctx);
+		await DbService.ensureSchema(env.DB);
+		const url = new URL(request.url);
+		if (Router.isWebSocketUpgrade(request) && url.pathname === "/In_Panel_Rayeghan_Ast_Va_Gheyre_Ghabele_Foroosh") {
+			return await Router.handleWebSocket(request, env, ctx);
+		}
+		if (Router.isSubscriptionPath(url.pathname)) {
+			return await Router.handleSubscription(url, env);
+		}
+		if (url.pathname.startsWith("/api/") || url.pathname === "/locations") {
+			return await Router.handleApi(request, url, env, ctx);
+		}
+		if (url.pathname === "/panel" || url.pathname === "/login") {
+			return await Router.handlePanel(request, env);
+		}
+		if (url.pathname.startsWith("/status/")) {
+			return await Router.handleUserStatus(url, env);
+		}
+		return new Response(HTML_TEMPLATES.nginx, {
+			headers: { "Content-Type": "text/html; charset=utf-8" },
+		});
+	},
 };
-
-async function serveMaintenancePage(request, url) {
-    let fakeList = sysConfig.maintenanceHost ? sysConfig.maintenanceHost.split(',').map(s => s.trim()).filter(s => s) : ["https://www.ubuntu.com"];
-    const clientIP = request.headers.get("cf-connecting-ip") || "0.0.0.0";
-    const ipHash = Array.from(clientIP).reduce((acc, char) => acc + char.charCodeAt(0), 0);
-    const targetStr = fakeList[ipHash % fakeList.length].startsWith('http') ? fakeList[ipHash % fakeList.length] : `https://${fakeList[ipHash % fakeList.length]}`;
-
-    try {
-        const targetUrl = new URL(targetStr);
-        if (url.pathname !== "/") targetUrl.pathname = url.pathname;
-        targetUrl.search = url.search;
-        const cleanHeaders = new Headers(request.headers);
-        cleanHeaders.set("Host", targetUrl.hostname);
-        cleanHeaders.delete("cf-connecting-ip");
-        cleanHeaders.delete("x-forwarded-for");
-        const fetchInit = { method: request.method, headers: cleanHeaders, redirect: "follow" };
-        if (request.method !== "GET" && request.method !== "HEAD") fetchInit.body = request.body;
-        return await fetch(new Request(targetUrl.toString(), fetchInit));
-    } catch (e) { return new Response("Not Found", { status: 404 }); }
+const Router = {
+	isWebSocketUpgrade(request) {
+		const upgradeHeader = (request.headers.get("Upgrade") || "").toLowerCase();
+		return upgradeHeader === "websocket";
+	},
+	isSubscriptionPath(pathname) {
+		return pathname.startsWith("/sub/") || pathname.startsWith("/feed/");
+	},
+	async handleWebSocket(request, env, ctx) {
+		try {
+			let proxyIP = "proxyip.cmliussss.net";
+			try {
+				const proxyRow = await env.DB.prepare("SELECT value FROM settings WHERE key = 'proxy_ip'").first();
+				if (proxyRow && proxyRow.value) {
+					proxyIP = proxyRow.value;
+				}
+			} catch (e) {}
+			const mockStoredData = { proxy_ip: proxyIP };
+			return handleVLESS(env, mockStoredData, ctx, request);
+		} catch (e) {
+			return new Response("Internal Server Error", { status: 500 });
+		}
+	},
+	async handleSubscription(url, env) {
+		const isSubPath = url.pathname.startsWith("/sub/");
+		const offset = isSubPath ? 5 : 6;
+		let subUser = decodeURIComponent(url.pathname.slice(offset));
+		const host = url.hostname;
+		try {
+			const user = await env.DB.prepare("SELECT * FROM users WHERE username = ? OR uuid = ?").bind(subUser, subUser).first();
+			if (!user || user.connection_type !== atob("dmxlc3M=")) {
+				return new Response("Not Found", { status: 404 });
+			}
+			return await SubscriptionService.generateText(user, host);
+		} catch (err) {
+			return new Response("Error building config: " + err.message, { status: 500 });
+		}
+	},
+	async handlePanel(request, env) {
+		const hasPassword = await DbService.getPanelPassword(env.DB);
+		if (!hasPassword) {
+			return new Response(HTML_TEMPLATES.setup, {
+				headers: { "Content-Type": "text/html; charset=utf-8" },
+			});
+		}
+		const authorized = await DbService.verifyApiAuth(request, env);
+		if (!authorized) {
+			return new Response(HTML_TEMPLATES.login, {
+				headers: { "Content-Type": "text/html; charset=utf-8" },
+			});
+		}
+		return new Response(HTML_TEMPLATES.panel, {
+			headers: {
+				"Content-Type": "text/html; charset=utf-8",
+				"Cache-Control": "no-store, no-cache, must-revalidate, max-age=0",
+				Pragma: "no-cache",
+				Expires: "0",
+			},
+		});
+	},
+	async handleUserStatus(url, env) {
+		const username = decodeURIComponent(url.pathname.slice(8));
+		if (!username) {
+			return new Response("Username is required", { status: 400 });
+		}
+		try {
+			const user = await env.DB.prepare("SELECT * FROM users WHERE username = ? OR uuid = ?").bind(username, username).first();
+			if (!user) {
+				return new Response("User not found", { status: 404 });
+			}
+			const userJson = JSON.stringify({
+				username: user.username,
+				uuid: user.uuid,
+				limit_gb: user.limit_gb,
+				expiry_days: user.expiry_days,
+				used_gb: user.used_gb,
+				limit_req: user.limit_req,
+				used_req: user.used_req,
+				is_active: user.is_active,
+				online_count: getActiveIpCount(user.active_ips),
+				ip_limit: user.ip_limit,
+				created_at: user.created_at,
+				tls: user.tls,
+				port: user.port,
+				ips: user.ips,
+				fingerprint: user.fingerprint || "chrome",
+			});
+			const html = HTML_TEMPLATES.status.replace("/* {{USER_DATA_PLACEHOLDER}} */", `window.statusUser = ${userJson};`);
+			return new Response(html, {
+				headers: { "Content-Type": "text/html; charset=utf-8" },
+			});
+		} catch (err) {
+			return new Response("Error: " + err.message, { status: 500 });
+		}
+	},
+	async handleApi(request, url, env, ctx) {
+		const hasPassword = await DbService.getPanelPassword(env.DB);
+		if (url.pathname === "/api/setup-password" && request.method === "POST") {
+			if (hasPassword) {
+				return new Response(JSON.stringify({ error: "رمز عبور از قبل تعریف شده است" }), {
+					status: 400,
+					headers: { "Content-Type": "application/json; charset=utf-8" },
+				});
+			}
+			const { password } = await request.json();
+			if (!password || password.length < 4) {
+				return new Response(JSON.stringify({ error: "رمز عبور باید حداقل ۴ کاراکتر باشد" }), {
+					status: 400,
+					headers: { "Content-Type": "application/json; charset=utf-8" },
+				});
+			}
+			const hashed = await DbService.sha256(password);
+			await DbService.setPanelPassword(env.DB, hashed);
+			return new Response(JSON.stringify({ success: true }), {
+				headers: {
+					"Content-Type": "application/json; charset=utf-8",
+					"Set-Cookie": "panel_session=" + hashed + "; Path=/; HttpOnly; Secure; SameSite=Lax",
+				},
+			});
+		}
+		if (url.pathname === "/api/login" && request.method === "POST") {
+			const { password } = await request.json();
+			const hashedInput = await DbService.sha256(password);
+			const storedHash = await DbService.getPanelPassword(env.DB);
+			if (storedHash === hashedInput) {
+				return new Response(JSON.stringify({ success: true }), {
+					headers: {
+						"Content-Type": "application/json; charset=utf-8",
+						"Set-Cookie": "panel_session=" + storedHash + "; Path=/; HttpOnly; Secure; SameSite=Lax",
+					},
+				});
+			}
+			return new Response(JSON.stringify({ error: "رمز عبور اشتباه است" }), {
+				status: 401,
+				headers: { "Content-Type": "application/json; charset=utf-8" },
+			});
+		}
+		if (url.pathname === "/api/logout" && request.method === "POST") {
+			return new Response(JSON.stringify({ success: true }), {
+				headers: {
+					"Content-Type": "application/json; charset=utf-8",
+					"Set-Cookie": "panel_session=; Path=/; Expires=Thu, 01 Jan 1970 00:00:00 GMT; HttpOnly; Secure; SameSite=Lax",
+				},
+			});
+		}
+		if (url.pathname === "/api/recover" && request.method === "POST") {
+			const { api_token } = await request.json();
+			if (!api_token) {
+				return new Response(JSON.stringify({ error: "Token is required" }), {
+					status: 400,
+					headers: { "Content-Type": "application/json; charset=utf-8" },
+				});
+			}
+			try {
+				const cfRes = await fetch("https://api.cloudflare.com/client/v4/user/tokens/verify", {
+					headers: { "Authorization": "Bearer " + api_token }
+				});
+				const cfData = await cfRes.json();
+				if (!cfRes.ok || !cfData.success) {
+					return new Response(JSON.stringify({ error: "Invalid or expired Cloudflare token" }), {
+						status: 401,
+						headers: { "Content-Type": "application/json; charset=utf-8" },
+					});
+				}
+				const host = url.hostname;
+				let isAuthorized = false;
+				if (host.endsWith(".workers.dev")) {
+					const parts = host.split(".");
+					const targetSubdomain = parts[parts.length - 3];
+					const accountsRes = await fetch("https://api.cloudflare.com/client/v4/accounts", {
+						headers: { "Authorization": "Bearer " + api_token }
+					});
+					const accountsData = await accountsRes.json();
+					if (accountsData.success && accountsData.result) {
+						for (const acc of accountsData.result) {
+							const subRes = await fetch(`https://api.cloudflare.com/client/v4/accounts/${acc.id}/workers/subdomain`, {
+								headers: { "Authorization": "Bearer " + api_token }
+							});
+							const subData = await subRes.json();
+							if (subData.success && subData.result && subData.result.subdomain === targetSubdomain) {
+								isAuthorized = true;
+								break;
+							}
+						}
+					}
+				} else {
+					const zonesRes = await fetch("https://api.cloudflare.com/client/v4/zones", {
+						headers: { "Authorization": "Bearer " + api_token }
+					});
+					const zonesData = await zonesRes.json();
+					if (zonesData.success && zonesData.result) {
+						for (const zone of zonesData.result) {
+							if (host === zone.name || host.endsWith("." + zone.name)) {
+								isAuthorized = true;
+								break;
+							}
+						}
+					}
+				}
+				if (!isAuthorized) {
+					return new Response(JSON.stringify({ error: "این توکن متعلق به صاحب پنل نیست (ای کــثـــکـــش)" }), {
+						status: 403,
+						headers: { "Content-Type": "application/json; charset=utf-8" },
+					});
+				}
+				await env.DB.prepare("DELETE FROM settings WHERE key = 'panel_password'").run();
+				cachedPanelPassword = null;
+				return new Response(JSON.stringify({ success: true }), {
+					headers: { "Content-Type": "application/json; charset=utf-8" },
+				});
+			} catch (err) {
+				return new Response(JSON.stringify({ error: "Cloudflare API connection error" }), {
+					status: 500,
+					headers: { "Content-Type": "application/json; charset=utf-8" },
+				});
+			}
+		}
+		const authorized = await DbService.verifyApiAuth(request, env);
+		if (!authorized) {
+			return new Response(JSON.stringify({ error: "Unauthorized" }), {
+				status: 401,
+				headers: { "Content-Type": "application/json; charset=utf-8" },
+			});
+		}
+		if (url.pathname === "/api/update-panel" && request.method === "POST") {
+			return new Response(JSON.stringify({ error: "بروزرسانی خودکار در این نسخه غیرفعال است." }), { status: 400, headers: { "Content-Type": "application/json" } });
+		}
+		if (url.pathname === "/api/change-password" && request.method === "POST") {
+			const { current_password, new_password } = await request.json();
+			if (!current_password || !new_password) {
+				return new Response(JSON.stringify({ error: "رمز عبور فعلی و جدید الزامی هستند" }), {
+					status: 400,
+					headers: { "Content-Type": "application/json; charset=utf-8" },
+				});
+			}
+			const currentHash = await DbService.sha256(current_password);
+			const storedHash = await DbService.getPanelPassword(env.DB);
+			if (storedHash && storedHash !== currentHash) {
+				return new Response(JSON.stringify({ error: "رمز عبور فعلی اشتباه است" }), {
+					status: 401,
+					headers: { "Content-Type": "application/json; charset=utf-8" },
+				});
+			}
+			if (new_password.length < 4) {
+				return new Response(JSON.stringify({ error: "رمز عبور جدید باید حداقل ۴ کاراکتر باشد" }), {
+					status: 400,
+					headers: { "Content-Type": "application/json; charset=utf-8" },
+				});
+			}
+			const newHash = await DbService.sha256(new_password);
+			await DbService.setPanelPassword(env.DB, newHash);
+			return new Response(JSON.stringify({ success: true }), {
+				headers: {
+					"Content-Type": "application/json; charset=utf-8",
+					"Set-Cookie": "panel_session=" + newHash + "; Path=/; HttpOnly; Secure; SameSite=Lax",
+				},
+			});
+		}
+		if (url.pathname === "/locations") {
+			try {
+				const response = await fetch("https://speed.cloudflare.com/locations", {
+					headers: { Referer: "https://speed.cloudflare.com/" },
+				});
+				const data = await response.json();
+				return new Response(JSON.stringify(data), {
+					headers: { "Content-Type": "application/json; charset=utf-8", "Access-Control-Allow-Origin": "*" },
+				});
+			} catch (e) {
+				return new Response(JSON.stringify({ error: e.message }), { status: 500, headers: { "Content-Type": "application/json" } });
+			}
+		}
+		if (url.pathname === "/api/proxy-ip") {
+			if (request.method === "POST") {
+				const { proxy_ip, iata, frag_len, frag_int } = await request.json();
+				if (proxy_ip) await env.DB.prepare("INSERT OR REPLACE INTO settings (key, value) VALUES ('proxy_ip', ?)").bind(proxy_ip).run();
+				if (iata !== undefined) await env.DB.prepare("INSERT OR REPLACE INTO settings (key, value) VALUES ('proxy_location_iata', ?)").bind(iata).run();
+				if (frag_len !== undefined) await env.DB.prepare("INSERT OR REPLACE INTO settings (key, value) VALUES ('frag_len', ?)").bind(frag_len).run();
+				if (frag_int !== undefined) await env.DB.prepare("INSERT OR REPLACE INTO settings (key, value) VALUES ('frag_int', ?)").bind(frag_int).run();
+				return new Response(JSON.stringify({ success: true }), { headers: { "Content-Type": "application/json" } });
+			}
+			if (request.method === "GET") {
+				const rowIp = await env.DB.prepare("SELECT value FROM settings WHERE key = 'proxy_ip'").first();
+				const rowIata = await env.DB.prepare("SELECT value FROM settings WHERE key = 'proxy_location_iata'").first();
+				const rowLen = await env.DB.prepare("SELECT value FROM settings WHERE key = 'frag_len'").first();
+				const rowInt = await env.DB.prepare("SELECT value FROM settings WHERE key = 'frag_int'").first();
+				return new Response(
+					JSON.stringify({
+						proxy_ip: rowIp ? rowIp.value : "proxyip.cmliussss.net",
+						iata: rowIata ? rowIata.value : "",
+						frag_len: rowLen ? rowLen.value : "20-30",
+						frag_int: rowInt ? rowInt.value : "1-2",
+					}),
+					{ headers: { "Content-Type": "application/json" } },
+				);
+			}
+		}
+		if (url.pathname.startsWith("/api/users")) {
+			const pathParts = url.pathname.split("/");
+			const isUserAction = pathParts.length > 3;
+			if (isUserAction) {
+				const username = decodeURIComponent(pathParts.pop());
+				if (request.method === "PUT") {
+					const body = await request.json();
+					if (body.toggle_only !== undefined) {
+						await env.DB.prepare("UPDATE users SET is_active = CASE WHEN is_active = 1 THEN 0 ELSE 1 END WHERE username = ?").bind(username).run();
+						return new Response(JSON.stringify({ success: true }), { headers: { "Content-Type": "application/json" } });
+					} else if (body.reset_action !== undefined) {
+						if (body.reset_action === "volume") {
+							await env.DB.prepare("UPDATE users SET used_gb = 0 WHERE username = ?").bind(username).run();
+							GLOBAL_TRAFFIC_CACHE.set(username, 0);
+						} else if (body.reset_action === "req") {
+							await env.DB.prepare("UPDATE users SET used_req = 0 WHERE username = ?").bind(username).run();
+							USER_REQ_CACHE.set(username, 0);
+						} else if (body.reset_action === "time") {
+							await env.DB.prepare("UPDATE users SET created_at = CURRENT_TIMESTAMP WHERE username = ?").bind(username).run();
+						}
+						return new Response(JSON.stringify({ success: true }), { headers: { "Content-Type": "application/json" } });
+					} else {
+						const { username: new_username, limit_gb, expiry_days, limit_req, ips, tls, port, fingerprint, ip_limit } = body;
+						if (new_username && new_username !== username) {
+							const existing = await env.DB.prepare("SELECT id FROM users WHERE username = ?").bind(new_username).first();
+							if (existing) {
+								return new Response(JSON.stringify({ error: "این نام کاربری از قبل وجود دارد" }), { status: 400, headers: { "Content-Type": "application/json" } });
+							}
+							if (GLOBAL_TRAFFIC_CACHE.has(username)) {
+								GLOBAL_TRAFFIC_CACHE.set(new_username, GLOBAL_TRAFFIC_CACHE.get(username));
+								GLOBAL_TRAFFIC_CACHE.delete(username);
+							}
+							if (USER_REQ_CACHE.has(username)) {
+								USER_REQ_CACHE.set(new_username, USER_REQ_CACHE.get(username));
+								USER_REQ_CACHE.delete(username);
+							}
+							if (ACTIVE_CONNECTIONS_COUNT.has(username)) {
+								ACTIVE_CONNECTIONS_COUNT.set(new_username, ACTIVE_CONNECTIONS_COUNT.get(username));
+								ACTIVE_CONNECTIONS_COUNT.delete(username);
+							}
+							if (GLOBAL_LAST_ACTIVE_WRITE.has(username)) {
+								GLOBAL_LAST_ACTIVE_WRITE.set(new_username, GLOBAL_LAST_ACTIVE_WRITE.get(username));
+								GLOBAL_LAST_ACTIVE_WRITE.delete(username);
+							}
+						}
+						await env.DB.prepare("UPDATE users SET username = ?, limit_gb = ?, expiry_days = ?, limit_req = ?, ips = ?, tls = ?, port = ?, fingerprint = ?, max_connections = ?, ip_limit = ? WHERE username = ?")
+							.bind(new_username || username, limit_gb ? parseFloat(limit_gb) : null, expiry_days ? parseInt(expiry_days) : null, limit_req ? parseInt(limit_req) : null, ips || null, tls, port, fingerprint || "chrome", ip_limit ? parseInt(ip_limit) : null, ip_limit ? parseInt(ip_limit) : null, username)
+							.run();
+						return new Response(JSON.stringify({ success: true }), { headers: { "Content-Type": "application/json" } });
+					}
+				}
+				if (request.method === "DELETE") {
+					await env.DB.prepare("DELETE FROM users WHERE username = ?").bind(username).run();
+					return new Response(JSON.stringify({ success: true }), { headers: { "Content-Type": "application/json" } });
+				}
+			} else {
+				if (request.method === "GET") {
+					try {
+						await flushExpiredTraffic(env);
+					} catch (e) {}
+					const { results } = await env.DB.prepare("SELECT * FROM users ORDER BY id DESC").all();
+					const now = Date.now();
+					const enrichedUsers = (results || []).map((user) => ({
+						...user,
+						is_online: user.last_active && now - user.last_active < 25000 ? 1 : 0,
+						online_count: getActiveIpCount(user.active_ips),
+					}));
+					let cfReqs = { today: 0, total: 0 };
+					try {
+						const liveCf = await getCfUsage(env);
+						const todayStr = new Date().toISOString().split("T")[0];
+						const dateRow = await env.DB.prepare("SELECT value FROM settings WHERE key = 'req_last_date'").first();
+						const totalRow = await env.DB.prepare("SELECT value FROM settings WHERE key = 'req_total'").first();
+						let dbTotal = totalRow ? parseInt(totalRow.value) || 0 : 0;
+						let dbToday = 0;
+						if (dateRow && dateRow.value === todayStr) {
+							const todayRow = await env.DB.prepare("SELECT value FROM settings WHERE key = 'req_today'").first();
+							dbToday = todayRow ? parseInt(todayRow.value) || 0 : 0;
+						}
+						if (liveCf.today > dbToday) {
+							dbToday = liveCf.today;
+							await env.DB.prepare("INSERT INTO settings (key, value) VALUES ('req_today', ?) ON CONFLICT(key) DO UPDATE SET value = ?").bind(String(dbToday), String(dbToday)).run();
+							await env.DB.prepare("INSERT INTO settings (key, value) VALUES ('req_last_date', ?) ON CONFLICT(key) DO UPDATE SET value = ?").bind(todayStr, todayStr).run();
+						}
+						if (liveCf.total > dbTotal) {
+							dbTotal = liveCf.total;
+							await env.DB.prepare("INSERT INTO settings (key, value) VALUES ('req_total', ?) ON CONFLICT(key) DO UPDATE SET value = ?").bind(String(dbTotal), String(dbTotal)).run();
+						}
+						cfReqs.today = dbToday + GLOBAL_REQ_COUNT;
+						cfReqs.total = dbTotal + GLOBAL_REQ_COUNT;
+					} catch (e) {}
+					return new Response(
+						JSON.stringify({
+							users: enrichedUsers,
+							serverTime: now,
+							cfRequestsToday: cfReqs.today,
+							cfRequestsTotal: cfReqs.total,
+						}),
+						{
+							headers: {
+								"Content-Type": "application/json",
+								"Cache-Control": "no-store, no-cache, must-revalidate, max-age=0",
+							},
+						},
+					);
+				}
+				if (request.method === "POST") {
+					const { username, uuid, limit_gb, expiry_days, limit_req, ips, tls, port, fingerprint, ip_limit, used_gb, used_req, created_at, is_active } = await request.json();
+					if (!username) {
+						return new Response(JSON.stringify({ error: "نام کاربری اجباری است" }), { status: 400, headers: { "Content-Type": "application/json" } });
+					}
+					const finalUuid = uuid || crypto.randomUUID();
+					const parsedUsedGb = parseFloat(used_gb);
+					const finalUsedGb = !isNaN(parsedUsedGb) ? parsedUsedGb : 0;
+					const parsedUsedReq = parseInt(used_req);
+					const finalUsedReq = !isNaN(parsedUsedReq) ? parsedUsedReq : 0;
+					const finalCreatedAt = created_at || new Date().toISOString();
+					const parsedIsActive = parseInt(is_active);
+					const finalIsActive = !isNaN(parsedIsActive) ? parsedIsActive : 1;
+					try {
+						await env.DB.prepare("INSERT INTO users (username, uuid, limit_gb, expiry_days, limit_req, ips, connection_type, tls, port, fingerprint, max_connections, ip_limit, used_gb, used_req, created_at, is_active) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)")
+							.bind(username, finalUuid, limit_gb ? parseFloat(limit_gb) : null, expiry_days ? parseInt(expiry_days) : null, limit_req ? parseInt(limit_req) : null, ips || null, atob("dmxlc3M="), tls, port, fingerprint || "chrome", ip_limit ? parseInt(ip_limit) : null, ip_limit ? parseInt(ip_limit) : null, finalUsedGb, finalUsedReq, finalCreatedAt, finalIsActive)
+							.run();
+						return new Response(JSON.stringify({ success: true }), { headers: { "Content-Type": "application/json" } });
+					} catch (err) {
+						return new Response(JSON.stringify({ error: err.message }), { status: 500, headers: { "Content-Type": "application/json" } });
+					}
+				}
+			}
+		}
+		return new Response(JSON.stringify({ error: "Not Found" }), { status: 404, headers: { "Content-Type": "application/json" } });
+	},
+};
+let schemaEnsured = false;
+let cachedPanelPassword = null;
+const DbService = {
+	async ensureSchema(db) {
+		if (schemaEnsured) return;
+		try {
+			await db
+				.prepare(
+					`
+        CREATE TABLE IF NOT EXISTS users (
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          username TEXT UNIQUE,
+          uuid TEXT,
+          limit_gb REAL,
+          expiry_days INTEGER,
+          ips TEXT,
+          connection_type TEXT,
+          tls TEXT,
+          port INTEGER,
+          used_gb REAL DEFAULT 0,
+          is_active INTEGER DEFAULT 1,
+          last_active INTEGER,
+          created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )
+      `,
+				)
+				.run();
+		} catch (e) {}
+		try {
+			await db.prepare("ALTER TABLE users ADD COLUMN is_active INTEGER DEFAULT 1").run();
+		} catch (e) {}
+		try {
+			await db.prepare("ALTER TABLE users ADD COLUMN last_active INTEGER").run();
+		} catch (e) {}
+		try {
+			await db.prepare("ALTER TABLE users ADD COLUMN fingerprint TEXT DEFAULT 'chrome'").run();
+		} catch (e) {}
+		try {
+			await db.prepare("ALTER TABLE users ADD COLUMN max_connections INTEGER").run();
+		} catch (e) {}
+		try {
+			await db.prepare("ALTER TABLE users ADD COLUMN limit_req INTEGER").run();
+		} catch (e) {}
+		try {
+			await db.prepare("ALTER TABLE users ADD COLUMN used_req INTEGER DEFAULT 0").run();
+		} catch (e) {}
+		try {
+			await db.prepare("ALTER TABLE users ADD COLUMN ip_limit INTEGER DEFAULT NULL").run();
+		} catch (e) {}
+		try {
+			await db.prepare("ALTER TABLE users ADD COLUMN active_ips TEXT DEFAULT NULL").run();
+		} catch (e) {}
+		try {
+			await db.prepare("UPDATE users SET ip_limit = max_connections WHERE ip_limit IS NULL AND max_connections IS NOT NULL").run();
+		} catch (e) {}
+		try {
+			await db.prepare("CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT)").run();
+		} catch (e) {}
+		schemaEnsured = true;
+	},
+	async getPanelPassword(db) {
+		if (cachedPanelPassword !== null) return cachedPanelPassword;
+		try {
+			const row = await db.prepare("SELECT value FROM settings WHERE key = 'panel_password'").first();
+			cachedPanelPassword = row ? row.value : "";
+			return cachedPanelPassword || null;
+		} catch (e) {
+			return null;
+		}
+	},
+	async setPanelPassword(db, password) {
+		await db.prepare("INSERT OR REPLACE INTO settings (key, value) VALUES ('panel_password', ?)").bind(password).run();
+		cachedPanelPassword = password;
+	},
+	async verifyApiAuth(request, env) {
+		const storedPasswordHash = await this.getPanelPassword(env.DB);
+		if (!storedPasswordHash) return true;
+		const cookies = request.headers.get("Cookie") || "";
+		const sessionCookie = cookies.split(";").find((c) => c.trim().startsWith("panel_session="));
+		if (!sessionCookie) return false;
+		const sessionToken = sessionCookie.split("=")[1].trim();
+		return sessionToken === storedPasswordHash;
+	},
+	async sha256(message) {
+		const msgBuffer = new TextEncoder().encode(message);
+		const hashBuffer = await crypto.subtle.digest("SHA-256", msgBuffer);
+		const hashArray = Array.from(new Uint8Array(hashBuffer));
+		return hashArray.map((b) => b.toString(16).padStart(2, "0")).join("");
+	},
+};
+function getActiveIpCount(activeIpsJson) {
+	if (!activeIpsJson) return 0;
+	try {
+		const activeIps = JSON.parse(activeIpsJson);
+		const now = Date.now();
+		let count = 0;
+		for (const [ip, data] of Object.entries(activeIps)) {
+			const lastSeen = (data && typeof data === 'object') ? data.timestamp : data;
+			if (now - lastSeen <= 30000) {
+				count++;
+			}
+		}
+		return count;
+	} catch (e) {
+		return 0;
+	}
 }
-
-function serveSubscriptionInfoPage(user, host, url, request) {
-    let idClean = user.id.replace(/-/g, '').toLowerCase();
-    let sysU = sysUsageCache?.users?.[idClean] || { reqs: 0, dReqs: 0, lastDay: '' };
-    let totalReqs = sysU.reqs || 0;
-
-    let todayDate = new Date().toISOString().split('T')[0];
-    let dailyReqs = sysU.lastDay === todayDate ? (sysU.dReqs || 0) : 0;
-
-    let limitTotal = user.limitTotalReq || 0;
-    let limitDaily = user.limitDailyReq || 0;
-
-    let totalGb = (totalReqs / 6000).toFixed(2);
-    let limitTotalGb = limitTotal ? (limitTotal / 6000).toFixed(2) : '9999';
-
-    let dailyGb = (dailyReqs / 6000).toFixed(2);
-    let limitDailyGb = limitDaily ? (limitDaily / 6000).toFixed(2) : '9999';
-
-    let totalPercent = limitTotal ? Math.min(100, (totalReqs / limitTotal) * 100).toFixed(1) : 0;
-    let dailyPercent = limitDaily ? Math.min(100, (dailyReqs / limitDaily) * 100).toFixed(1) : 0;
-
-    let expiryDateTxt = '2099-01-01';
-    let isExpired = false;
-    if (user.expiryMs) {
-        let exp = new Date(user.expiryMs);
-        expiryDateTxt = exp.toISOString().split('T')[0];
-        if (Date.now() > user.expiryMs) {
-            isExpired = true;
+const SubscriptionService = {
+	async generateText(user, host) {
+		let ips = [host];
+		if (user.ips) {
+			const parsedIps = user.ips
+				.split("\n")
+				.map((ip) => ip.trim())
+				.filter((ip) => ip.length > 0);
+			if (parsedIps.length > 0) ips = parsedIps;
+		}
+		const ports = String(user.port || "443")
+			.split(",")
+			.map((p) => p.trim())
+			.filter((p) => p.length > 0);
+		const fp = user.fingerprint || "chrome";
+		const links = [];
+		const m1 = decodeURIComponent("%E2%9A%A0%EF%B8%8F%D9%BE%D9%86%D9%84%20%D8%B1%D8%A7%DB%8C%DA%AF%D8%A7%D9%86%20%D9%88%20%D8%BA%DB%8C%D8%B1%20%D9%82%D8%A7%D8%A8%D9%84%20%D9%81%D8%B1%D9%88%D8%B4%E2%9A%A0%EF%B8%8F");
+		const m2 = decodeURIComponent("%F0%9F%9A%80%40IR_NETLIFY%20%D8%B3%D8%A7%D8%AE%D8%AA%20%D8%B1%D8%A7%DB%8C%DA%AF%D8%A7%D9%86%F0%9F%9A%80");
+		links.push(atob("dmxlc3M6Ly8=") + user.uuid + "@0.0.0.0:1?encryption=none&security=none&type=ws&host=" + host + "&path=%2FIn_Panel_Rayeghan_Ast_Va_Gheyre_Ghabele_Foroosh#" + encodeURIComponent(m1));
+		links.push(atob("dmxlc3M6Ly8=") + user.uuid + "@0.0.0.0:1?encryption=none&security=none&type=ws&host=" + host + "&path=%2FIn_Panel_Rayeghan_Ast_Va_Gheyre_Ghabele_Foroosh#" + encodeURIComponent(m2));
+		let remVol = "Unlimited";
+		if (user.limit_gb) {
+			let rem = user.limit_gb - (user.used_gb || 0);
+			remVol = rem > 0 ? rem.toFixed(2) + "GB" : "0GB";
+		}
+		let remTime = "Unlimited";
+		if (user.expiry_days && user.created_at) {
+			const created = new Date(user.created_at);
+			const expiryDate = new Date(created.getTime() + user.expiry_days * 24 * 60 * 60 * 1000);
+			const diffDays = Math.ceil((expiryDate.getTime() - Date.now()) / (1000 * 60 * 60 * 24));
+			remTime = diffDays > 0 ? diffDays + "Days" : "0Days";
+		}
+		let remReq = "Unlimited";
+		if (user.limit_req) {
+			let rem = user.limit_req - (user.used_req || 0);
+			remReq = rem > 0 ? rem.toLocaleString() + "Req" : "0Req";
+		}
+		const infoRemark = "📊 remaining | \u200E" + remVol + " | \u200E" + remTime + " | \u200E" + remReq;
+		links.push(atob("dmxlc3M6Ly8=") + user.uuid + "@" + host + ":80?path=%2FIn_Panel_Rayeghan_Ast_Va_Gheyre_Ghabele_Foroosh&security=none&encryption=none&host=" + host + "&fp=" + fp + "&type=ws#" + encodeURIComponent(infoRemark));
+		ips.forEach((ip) => {
+			ports.forEach((portStr) => {
+				const isTlsPort = ["443", "2053", "2083", "2087", "2096", "8443"].includes(portStr);
+				const tlsVal = isTlsPort ? "tls" : "none";
+				const remark = user.username + " | " + ip + " | " + portStr;
+				links.push(atob("dmxlc3M6Ly8=") + user.uuid + "@" + ip + ":" + portStr + "?path=%2FIn_Panel_Rayeghan_Ast_Va_Gheyre_Ghabele_Foroosh&security=" + tlsVal + "&encryption=none&insecure=0&host=" + host + "&fp=" + fp + "&type=ws&allowInsecure=0&sni=" + host + "#" + encodeURIComponent(remark));
+			});
+		});
+		const noise = ["# System Update Feed: OK", "# Sync Code: " + Math.random().toString(36).slice(2, 10), "# Version: 2.10.1", "# Description: Secure Node Configurations", ""].join("\n");
+		const plainContent = noise + links.join("\n");
+		const subContent = btoa(unescape(encodeURIComponent(plainContent)));
+		const downloadBytes = Math.floor((user.used_gb || 0) * 1073741824);
+		const totalBytes = user.limit_gb ? Math.floor(user.limit_gb * 1073741824) : 0;
+		let expireTimestamp = 0;
+		if (user.expiry_days && user.created_at) {
+			expireTimestamp = Math.floor((new Date(user.created_at).getTime() + user.expiry_days * 86400000) / 1000);
+		}
+		const subUserInfo = `upload=0; download=${downloadBytes}; total=${totalBytes}; expire=${expireTimestamp}`;
+		return new Response(subContent, {
+			headers: {
+				"Content-Type": "text/plain; charset=utf-8",
+				"Access-Control-Allow-Origin": "*",
+				"Cache-Control": "no-store",
+				"Subscription-Userinfo": subUserInfo,
+			},
+		});
+	},
+};
+async function flushExpiredTraffic(env) {
+	const now = Date.now();
+	for (const [uname, cachedBytes] of GLOBAL_TRAFFIC_CACHE.entries()) {
+		const cachedReqs = USER_REQ_CACHE.get(uname) || 0;
+		if (cachedBytes <= 0 && cachedReqs <= 0) continue;
+		if (GLOBAL_WRITE_LOCK.get(uname)) continue;
+		const lastActive = GLOBAL_LAST_ACTIVE_WRITE.get(uname) || 0;
+		const activeCount = ACTIVE_CONNECTIONS_COUNT.get(uname) || 0;
+		if (activeCount <= 0 || now - lastActive > 25000) {
+			GLOBAL_WRITE_LOCK.set(uname, true);
+			const deltaGb = cachedBytes / (1024 * 1024 * 1024);
+			try {
+				await env.DB.prepare("UPDATE users SET used_gb = used_gb + ?, used_req = used_req + ? WHERE username = ?").bind(deltaGb, cachedReqs, uname).run();
+			} catch (e) {
+				console.error(e.message);
+			} finally {
+				GLOBAL_WRITE_LOCK.delete(uname);
+				GLOBAL_TRAFFIC_CACHE.delete(uname);
+				USER_REQ_CACHE.delete(uname);
+				GLOBAL_LAST_ACTIVE_WRITE.delete(uname);
+			}
+		}
+	}
+}
+async function handleVLESS(env, storedData = null, ctx = null, request = null) {
+	const clientIP = request ? (request.headers.get("CF-Connecting-IP") || "unknown") : "unknown";
+	const socketPair = new WebSocketPair();
+	const [clientSock, serverSock] = Object.values(socketPair);
+	serverSock.accept();
+	serverSock.binaryType = "arraybuffer";
+	let username = null;
+	let tickCount = 0;
+	let validUUID = null;
+	let userIpLimit = null;
+	function addBytes(bytes) {
+		if (bytes <= 0) return;
+		if (!username) {
+			uncountedBytes += bytes;
+			return;
+		}
+		if (uncountedBytes > 0) {
+			bytes += uncountedBytes;
+			uncountedBytes = 0;
+		}
+		let current = GLOBAL_TRAFFIC_CACHE.get(username) || 0;
+		GLOBAL_TRAFFIC_CACHE.set(username, current + bytes);
+		GLOBAL_LAST_ACTIVE_WRITE.set(username, Date.now());
+		if (GLOBAL_WRITE_LOCK.get(username)) return;
+		let lastDbWrite = GLOBAL_LAST_DB_WRITE.get(username) || 0;
+		let now = Date.now();
+		let thresholdBytes = 10 * 1024 * 1024;
+		if (current >= thresholdBytes || (current > 0 && now - lastDbWrite > 60000)) {
+			GLOBAL_WRITE_LOCK.set(username, true);
+			let toCommit = GLOBAL_TRAFFIC_CACHE.get(username) || 0;
+			let toCommitReq = USER_REQ_CACHE.get(username) || 0;
+			if (toCommit <= 0 && toCommitReq <= 0) {
+				GLOBAL_WRITE_LOCK.set(username, false);
+				return;
+			}
+			GLOBAL_TRAFFIC_CACHE.set(username, 0);
+			USER_REQ_CACHE.set(username, 0);
+			GLOBAL_LAST_DB_WRITE.set(username, now);
+			let deltaGb = toCommit / (1024 * 1024 * 1024);
+			let writeTask = async () => {
+				try {
+					await env.DB.prepare("UPDATE users SET used_gb = used_gb + ?, used_req = used_req + ? WHERE username = ?").bind(deltaGb, toCommitReq, username).run();
+				} catch (e) {
+					console.error(e.message);
+				} finally {
+					GLOBAL_WRITE_LOCK.set(username, false);
+				}
+			};
+			if (ctx) ctx.waitUntil(writeTask());
+			else writeTask();
+		}
+	}
+	let isOfflineSet = false;
+	const setOffline = () => {
+		if (isOfflineSet) return;
+		isOfflineSet = true;
+		const uname = username;
+		if (!uname) return;
+		if (clientIP && clientIP !== "unknown" && validUUID) {
+			const removeIpTask = async () => {
+				try {
+					const user = await env.DB.prepare("SELECT active_ips FROM users WHERE uuid = ?").bind(validUUID).first();
+					if (user) {
+						console.log(`[setOffline Task] DB active_ips for ${uname}: ${user.active_ips}`);
+						let activeIps = JSON.parse(user.active_ips || '{}');
+						if (activeIps[clientIP]) {
+							if (typeof activeIps[clientIP] === 'object') {
+								activeIps[clientIP].count = (activeIps[clientIP].count || 1) - 1;
+								if (activeIps[clientIP].count <= 0) {
+									delete activeIps[clientIP];
+								}
+							} else {
+								delete activeIps[clientIP];
+							}
+							await env.DB.prepare("UPDATE users SET active_ips = ? WHERE uuid = ?")
+								.bind(JSON.stringify(activeIps), validUUID).run();
+							console.log(`[setOffline Task] Updated active_ips in DB to: ${JSON.stringify(activeIps)}`);
+						} else {
+							console.log(`[setOffline Task] IP ${clientIP} not found in user's active_ips`);
+						}
+					}
+				} catch (e) {
+					console.error(`[setOffline Task] Error: ${e.message}`);
+				}
+			};
+			if (ctx) ctx.waitUntil(removeIpTask());
+			else removeIpTask();
+		}
+		let activeCount = ACTIVE_CONNECTIONS_COUNT.get(uname) || 1;
+		activeCount = activeCount - 1;
+		if (activeCount <= 0) {
+			ACTIVE_CONNECTIONS_COUNT.delete(uname);
+			let cachedBytes = GLOBAL_TRAFFIC_CACHE.get(uname) || 0;
+			let cachedReqs = USER_REQ_CACHE.get(uname) || 0;
+			if ((cachedBytes > 0 || cachedReqs > 0) && !GLOBAL_WRITE_LOCK.get(uname)) {
+				GLOBAL_WRITE_LOCK.set(uname, true);
+				const deltaGb = cachedBytes / (1024 * 1024 * 1024);
+				const writeTask = async () => {
+					try {
+						await env.DB.prepare("UPDATE users SET used_gb = used_gb + ?, used_req = used_req + ? WHERE username = ?").bind(deltaGb, cachedReqs, uname).run();
+					} catch (e) {
+						console.error(e.message);
+					} finally {
+						GLOBAL_WRITE_LOCK.delete(uname);
+						GLOBAL_TRAFFIC_CACHE.delete(uname);
+						USER_REQ_CACHE.delete(uname);
+						GLOBAL_LAST_ACTIVE_WRITE.delete(uname);
+					}
+				};
+				if (ctx) {
+					ctx.waitUntil(writeTask());
+				} else {
+					writeTask();
+				}
+			} else {
+				GLOBAL_TRAFFIC_CACHE.delete(uname);
+				USER_REQ_CACHE.delete(uname);
+				GLOBAL_LAST_ACTIVE_WRITE.delete(uname);
+				GLOBAL_WRITE_LOCK.delete(uname);
+			}
+		} else {
+			ACTIVE_CONNECTIONS_COUNT.set(uname, activeCount);
+		}
+	};
+	const heartbeat = setInterval(async () => {
+		if (serverSock.readyState === WebSocket.OPEN) {
+			try {
+				serverSock.send(new Uint8Array(0));
+				if (!validUUID) return;
+				tickCount++;
+				if (tickCount >= 1) {
+					tickCount = 0;
+					const user = await env.DB.prepare("SELECT is_active, limit_gb, used_gb, limit_req, used_req, expiry_days, created_at, ip_limit, active_ips FROM users WHERE uuid = ?").bind(validUUID).first();
+					if (user) {
+						userIpLimit = user.ip_limit;
+					}
+					let isExpired = false;
+					let isIpLimitExpired = false;
+					let updatedActiveIps = null;
+					if (!user || user.is_active === 0) {
+						isExpired = true;
+					} else {
+						if (user.limit_gb && user.used_gb >= user.limit_gb) {
+							isExpired = true;
+						}
+						if (user.limit_req && user.used_req + (USER_REQ_CACHE.get(username) || 0) >= user.limit_req) {
+							isExpired = true;
+						}
+						if (user.expiry_days && user.created_at) {
+							const created = new Date(user.created_at);
+							const expiryDate = new Date(created.getTime() + user.expiry_days * 24 * 60 * 60 * 1000);
+							if (new Date() > expiryDate) {
+								isExpired = true;
+							}
+						}
+						if (!isExpired && clientIP && clientIP !== "unknown") {
+							let activeIps = {};
+							try {
+								activeIps = JSON.parse(user.active_ips || '{}');
+							} catch (e) {}
+							const nowTime = Date.now();
+							let hasChanges = false;
+							for (const [ip, data] of Object.entries(activeIps)) {
+								const lastSeen = (data && typeof data === 'object') ? data.timestamp : data;
+								if (nowTime - lastSeen > 30000) {
+									delete activeIps[ip];
+									hasChanges = true;
+								}
+							}
+							if (!activeIps[clientIP]) {
+								isIpLimitExpired = true;
+								console.log(`[Heartbeat] IP ${clientIP} expired from active_ips due to inactivity.`);
+							} else {
+								const sortedIps = Object.keys(activeIps).sort((a, b) => {
+									const tA = (activeIps[a] && typeof activeIps[a] === 'object') ? activeIps[a].timestamp : activeIps[a];
+									const tB = (activeIps[b] && typeof activeIps[b] === 'object') ? activeIps[b].timestamp : activeIps[b];
+									return tB - tA;
+								});
+								const clientIpIndex = sortedIps.indexOf(clientIP);
+								if (user.ip_limit && user.ip_limit > 0 && clientIpIndex >= user.ip_limit) {
+									isIpLimitExpired = true;
+									console.log(`[Heartbeat] IP Limit Exceeded. Client IP index ${clientIpIndex} >= limit ${user.ip_limit}.`);
+								}
+							}
+							if (hasChanges || isIpLimitExpired) {
+								updatedActiveIps = JSON.stringify(activeIps);
+							}
+						}
+					}
+					if (isExpired) {
+						await env.DB.prepare("UPDATE users SET is_active = 0, last_active = 0 WHERE uuid = ?").bind(validUUID).run();
+						clearInterval(heartbeat);
+						closeSocketQuietly(serverSock);
+						return;
+					}
+					if (isIpLimitExpired) {
+						console.log(`[Heartbeat] Terminating socket for user ${username}.`);
+						clearInterval(heartbeat);
+						closeSocketQuietly(serverSock);
+						return;
+					}
+					const now = Date.now();
+					const lastRecorded = GLOBAL_LAST_ACTIVE_WRITE.get(username) || 0;
+					if (now - lastRecorded > 15000 || updatedActiveIps !== null) {
+						GLOBAL_LAST_ACTIVE_WRITE.set(username, now);
+						if (updatedActiveIps !== null) {
+							await env.DB.prepare("UPDATE users SET last_active = ?, active_ips = ? WHERE username = ?").bind(now, updatedActiveIps, username).run();
+						} else {
+							await env.DB.prepare("UPDATE users SET last_active = ? WHERE username = ?").bind(now, username).run();
+						}
+					}
+				}
+			} catch (e) {}
+		} else {
+			clearInterval(heartbeat);
+		}
+	}, 15000);
+	let remoteConnWrapper = { socket: null, connectingPromise: null, retryConnect: null };
+	let reqUUID = null;
+	let isHeaderParsed = false;
+	let isHeaderParsing = false;
+	let isDnsQuery = false;
+	let chunkBuffer = new Uint8Array(0);
+	let uncountedBytes = 0;
+	const proxyIP = storedData?.proxy_ip || "proxyip.cmliussss.net";
+	let wsChain = Promise.resolve();
+	let wsStopped = false,
+		wsFailed = false,
+		wsFinished = false;
+	let wsQueueBytes = 0,
+		wsQueueItems = 0;
+	let currentSocketWriter = null,
+		activeRemoteWriter = null;
+	const releaseRemoteWriter = () => {
+		if (activeRemoteWriter) {
+			try {
+				activeRemoteWriter.releaseLock();
+			} catch (e) {}
+			activeRemoteWriter = null;
+		}
+		currentSocketWriter = null;
+	};
+	const getRemoteWriter = () => {
+		const s = remoteConnWrapper.socket;
+		if (!s) return null;
+		if (s !== currentSocketWriter) {
+			releaseRemoteWriter();
+			currentSocketWriter = s;
+			activeRemoteWriter = s.writable.getWriter();
+		}
+		return activeRemoteWriter;
+	};
+	const upstreamQueue = createUpstreamQueue({
+		getWriter: getRemoteWriter,
+		releaseWriter: releaseRemoteWriter,
+		retryConnect: async () => {
+			if (typeof remoteConnWrapper.retryConnect === "function") {
+				await remoteConnWrapper.retryConnect();
+			}
+		},
+		closeConnection: () => {
+			try {
+				remoteConnWrapper.socket?.close();
+			} catch (e) {}
+			closeSocketQuietly(serverSock);
+		},
+		name: "VlessWSQueue",
+	});
+	const writeToRemote = async (chunk, allowRetry = true) => {
+		return upstreamQueue.writeAndAwait(chunk, allowRetry);
+	};
+	const processWsMessage = async (chunk) => {
+		const bytes = chunk.byteLength || 0;
+		await addBytes(bytes);
+		if (isDnsQuery) {
+			await forwardVlessUDP(chunk, serverSock, null, addBytes);
+			return;
+		}
+		if (await writeToRemote(chunk)) return;
+		if (!isHeaderParsed) {
+			chunkBuffer = concatBytes(chunkBuffer, chunk);
+			if (chunkBuffer.byteLength < 24) return;
+			if (isHeaderParsing) return;
+			isHeaderParsing = true;
+			reqUUID = extractUUIDFromVless(chunkBuffer);
+			if (!reqUUID) {
+				serverSock.close();
+				return;
+			}
+			let user = null;
+			try {
+				user = await env.DB.prepare("SELECT * FROM users WHERE uuid = ?").bind(reqUUID).first();
+			} catch (e) {}
+			if (isOfflineSet || serverSock.readyState !== WebSocket.OPEN) {
+				return;
+			}
+			if (!user || user.is_active === 0) {
+				serverSock.close();
+				return;
+			}
+			if (user.limit_gb && user.used_gb >= user.limit_gb) {
+				serverSock.close();
+				return;
+			}
+			if (user.limit_req && user.used_req + (USER_REQ_CACHE.get(user.username) || 0) >= user.limit_req) {
+				serverSock.close();
+				return;
+			}
+			if (user.expiry_days && user.created_at) {
+				const created = new Date(user.created_at);
+				const expiryDate = new Date(created.getTime() + user.expiry_days * 24 * 60 * 60 * 1000);
+				if (new Date() > expiryDate) {
+					try {
+						await env.DB.prepare("UPDATE users SET is_active = 0, last_active = 0 WHERE uuid = ?").bind(reqUUID).run();
+					} catch (e) {}
+					serverSock.close();
+					return;
+				}
+			}
+			userIpLimit = user.ip_limit;
+			if (clientIP && clientIP !== "unknown") {
+				console.log(`[VLESS Handshake] User: ${user.username}, clientIP: ${clientIP}, active_ips in DB: ${user.active_ips}`);
+				let activeIps = {};
+				try {
+					activeIps = JSON.parse(user.active_ips || '{}');
+				} catch (e) {}
+				const now = Date.now();
+				for (const [ip, data] of Object.entries(activeIps)) {
+					const lastSeen = (data && typeof data === 'object') ? data.timestamp : data;
+					if (now - lastSeen > 30000) {
+						delete activeIps[ip];
+					}
+				}
+				if (!activeIps[clientIP]) {
+					const sortedIps = Object.keys(activeIps).sort((a, b) => {
+						const tA = (activeIps[a] && typeof activeIps[a] === 'object') ? activeIps[a].timestamp : activeIps[a];
+						const tB = (activeIps[b] && typeof activeIps[b] === 'object') ? activeIps[b].timestamp : activeIps[b];
+						return tB - tA;
+					});
+					console.log(`[VLESS Handshake] Non-expired active IPs: ${JSON.stringify(activeIps)}, count: ${sortedIps.length}, limit: ${user.ip_limit}`);
+					if (user.ip_limit && user.ip_limit > 0 && sortedIps.length >= user.ip_limit) {
+						console.log(`[VLESS Handshake] BLOCKED user ${user.username} because sortedIps.length (${sortedIps.length}) >= limit (${user.ip_limit})`);
+						serverSock.close();
+						return;
+					}
+					activeIps[clientIP] = { timestamp: now, count: 1 };
+				} else {
+					if (typeof activeIps[clientIP] === 'object') {
+						activeIps[clientIP].timestamp = now;
+						activeIps[clientIP].count = (activeIps[clientIP].count || 0) + 1;
+					} else {
+						activeIps[clientIP] = { timestamp: now, count: 1 };
+					}
+					console.log(`[VLESS Handshake] Reconnected from same IP: ${clientIP}, count: ${activeIps[clientIP].count}`);
+				}
+				try {
+					await env.DB.prepare("UPDATE users SET active_ips = ?, last_active = ? WHERE uuid = ?")
+						.bind(JSON.stringify(activeIps), now, reqUUID).run();
+					console.log(`[VLESS Handshake] Successfully updated active_ips to: ${JSON.stringify(activeIps)}`);
+				} catch (e) {
+					console.error(`[VLESS Handshake] DB Update Error: ${e.message}`);
+				}
+			}
+			validUUID = reqUUID;
+			username = user.username;
+			isHeaderParsed = true;
+			let currentReqs = USER_REQ_CACHE.get(username) || 0;
+			USER_REQ_CACHE.set(username, currentReqs + 1);
+			let activeCount = ACTIVE_CONNECTIONS_COUNT.get(username) || 0;
+			ACTIVE_CONNECTIONS_COUNT.set(username, activeCount + 1);
+			if (activeCount === 0) {
+				const setOnlineTask = async () => {
+					try {
+						const now = Date.now();
+						GLOBAL_LAST_ACTIVE_WRITE.set(username, now);
+						await env.DB.prepare("UPDATE users SET last_active = ? WHERE username = ?").bind(now, username).run();
+					} catch (e) {}
+				};
+				if (ctx) ctx.waitUntil(setOnlineTask());
+				else setOnlineTask();
+			}
+			try {
+				let offset = 17;
+				const optLen = chunkBuffer[offset++];
+				offset += optLen;
+				const cmd = chunkBuffer[offset++];
+				const port = (chunkBuffer[offset++] << 8) | chunkBuffer[offset++];
+				const addrType = chunkBuffer[offset++];
+				let addr = "";
+				if (addrType === 1) {
+					addr = `${chunkBuffer[offset++]}.${chunkBuffer[offset++]}.${chunkBuffer[offset++]}.${chunkBuffer[offset++]}`;
+				} else if (addrType === 2) {
+					const domainLen = chunkBuffer[offset++];
+					addr = new TextDecoder().decode(chunkBuffer.slice(offset, offset + domainLen));
+					offset += domainLen;
+				} else if (addrType === 3) {
+					offset += 16;
+					addr = "ipv6-unsupported";
+				}
+				const rawData = chunkBuffer.slice(offset);
+				const respHeader = new Uint8Array([chunkBuffer[0], 0]);
+				if (cmd === 2) {
+					if (port === 53) {
+						isDnsQuery = true;
+						await forwardVlessUDP(rawData, serverSock, respHeader, addBytes);
+					} else {
+						serverSock.close();
+					}
+					return;
+				}
+				const connectTCP = async (dataPayload = null, useFallback = true) => {
+					if (remoteConnWrapper.connectingPromise) {
+						await remoteConnWrapper.connectingPromise;
+						return;
+					}
+					const task = (async () => {
+						let s = null;
+						try {
+							s = await connectDirect(addr, port, dataPayload);
+						} catch (err) {
+							if (useFallback && proxyIP) {
+								s = await connectDirect(proxyIP, port, dataPayload);
+							} else {
+								throw err;
+							}
+						}
+						remoteConnWrapper.socket = s;
+						s.closed.catch(() => {}).finally(() => closeSocketQuietly(serverSock));
+						connectStreams(s, serverSock, respHeader, null, (b) => {
+							addBytes(b);
+						});
+					})();
+					remoteConnWrapper.connectingPromise = task;
+					try {
+						await task;
+					} finally {
+						if (remoteConnWrapper.connectingPromise === task) {
+							remoteConnWrapper.connectingPromise = null;
+						}
+					}
+				};
+				remoteConnWrapper.retryConnect = async () => connectTCP(null, false);
+				await connectTCP(rawData, true);
+			} catch (e) {
+				serverSock.close();
+			}
+		}
+	};
+	const handleWsError = (err) => {
+		if (wsFailed) return;
+		wsFailed = true;
+		wsStopped = true;
+		wsQueueBytes = 0;
+		wsQueueItems = 0;
+		upstreamQueue.clear();
+		releaseRemoteWriter();
+		closeSocketQuietly(serverSock);
+		setOffline();
+	};
+	const pushToChain = (task) => {
+		wsChain = wsChain.then(task).catch(handleWsError);
+	};
+	serverSock.addEventListener("message", (event) => {
+		if (wsStopped || wsFailed) return;
+		const size = event.data.byteLength || 0;
+		const nextBytes = wsQueueBytes + size;
+		const nextItems = wsQueueItems + 1;
+		if (nextBytes > UPSTREAM_QUEUE_MAX_BYTES || nextItems > UPSTREAM_QUEUE_MAX_ITEMS) {
+			handleWsError(new Error("ws queue overflow"));
+			return;
+		}
+		wsQueueBytes = nextBytes;
+		wsQueueItems = nextItems;
+		pushToChain(async () => {
+			wsQueueBytes = Math.max(0, wsQueueBytes - size);
+			wsQueueItems = Math.max(0, wsQueueItems - 1);
+			if (wsFailed) return;
+			await processWsMessage(event.data);
+		});
+	});
+	serverSock.addEventListener("close", () => {
+		clearInterval(heartbeat);
+		closeSocketQuietly(serverSock);
+		setOffline();
+		if (wsFinished) return;
+		wsFinished = true;
+		wsStopped = true;
+		pushToChain(async () => {
+			if (wsFailed) return;
+			await upstreamQueue.awaitEmpty();
+			releaseRemoteWriter();
+		});
+	});
+	serverSock.addEventListener("error", (err) => {
+		handleWsError(err);
+	});
+	return new Response(null, { status: 101, webSocket: clientSock });
+}
+async function getCfUsage(env) {
+	if (!env.CF_API_TOKEN || !env.CF_ACCOUNT_ID) return { today: 0, total: 0 };
+	try {
+		const now = new Date();
+		const startOfDay = new Date(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate()).toISOString();
+		const thirtyDaysAgo = new Date(now.getTime() - 30 * 24 * 60 * 60 * 1000).toISOString();
+		const q = `query {
+      viewer {
+        accounts(filter: {accountTag: "${env.CF_ACCOUNT_ID}"}) {
+          today: workersInvocationsAdaptive(limit: 10, filter: {datetime_geq: "${startOfDay}"}) {
+            sum { requests }
+          }
+          total: workersInvocationsAdaptive(limit: 10, filter: {datetime_geq: "${thirtyDaysAgo}"}) {
+            sum { requests }
+          }
         }
-    }
-
-    let statusCode = 'active';
-    if (user.isPaused) statusCode = 'paused';
-    else if (isExpired) statusCode = 'expired';
-    else if (limitTotal && totalReqs >= limitTotal) statusCode = 'limit';
-    else if (limitDaily && dailyReqs >= limitDaily) statusCode = 'dailyLimit';
-
-    let cleanUrl = new URL(url.href);
-    let panelUrlToUse = sysConfig.customPanelUrl;
-    if (user.userPanelUrl && user.userPanelUrl.trim()) {
-        panelUrlToUse = user.userPanelUrl.trim();
-    }
-    if (panelUrlToUse) {
-        let customUrlStr = panelUrlToUse;
-        if (!customUrlStr.startsWith('http://') && !customUrlStr.startsWith('https://')) {
-            customUrlStr = 'https://' + customUrlStr;
-        }
-        try {
-            const customUrl = new URL(customUrlStr);
-            cleanUrl.protocol = customUrl.protocol;
-            cleanUrl.host = customUrl.host;
-        } catch(e) {}
-    }
-    cleanUrl.searchParams.delete("flag");
-    cleanUrl.searchParams.delete("format");
-    cleanUrl.searchParams.delete("type");
-    cleanUrl.searchParams.delete("output");
-    cleanUrl.searchParams.delete("raw");
-
-    let syncNormal = cleanUrl.href;
-    let syncRaw = cleanUrl.href + (cleanUrl.href.includes('?') ? '&flag=a' : '?flag=a');
-
-    const html = `<!DOCTYPE html>
-<html lang="en" dir="ltr">
+      }
+    }`;
+		const res = await fetch("https://api.cloudflare.com/client/v4/graphql", {
+			method: "POST",
+			headers: { Authorization: "Bearer " + env.CF_API_TOKEN, "Content-Type": "application/json" },
+			body: JSON.stringify({ query: q }),
+		});
+		const j = await res.json();
+		const acc = j?.data?.viewer?.accounts?.[0];
+		const todayReqs = acc?.today?.[0]?.sum?.requests || 0;
+		const totalReqs = acc?.total?.[0]?.sum?.requests || todayReqs;
+		return { today: todayReqs, total: totalReqs };
+	} catch (e) {
+		return { today: 0, total: 0 };
+	}
+}
+function isIPv4(value) {
+	const parts = String(value || "").split(".");
+	return parts.length === 4 && parts.every((part) => /^\d{1,3}$/.test(part) && Number(part) >= 0 && Number(part) <= 255);
+}
+function stripIPv6Brackets(hostname = "") {
+	const host = String(hostname || "").trim();
+	return host.startsWith("[") && host.endsWith("]") ? host.slice(1, -1) : host;
+}
+function isIPHostname(hostname = "") {
+	const host = stripIPv6Brackets(hostname);
+	if (isIPv4(host)) return true;
+	if (!host.includes(":")) return false;
+	try {
+		new URL(`http://[${host}]/`);
+		return true;
+	} catch (e) {
+		return false;
+	}
+}
+function convertToUint8Array(data) {
+	if (data instanceof Uint8Array) return data;
+	if (data instanceof ArrayBuffer) return new Uint8Array(data);
+	if (ArrayBuffer.isView(data)) return new Uint8Array(data.buffer, data.byteOffset, data.byteLength);
+	return new Uint8Array(data || 0);
+}
+function concatBytes(...chunkList) {
+	const chunks = chunkList.map(convertToUint8Array);
+	const total = chunks.reduce((sum, c) => sum + c.byteLength, 0);
+	const result = new Uint8Array(total);
+	let offset = 0;
+	for (const c of chunks) {
+		result.set(c, offset);
+		offset += c.byteLength;
+	}
+	return result;
+}
+function closeSocketQuietly(socket) {
+	try {
+		if (socket.readyState === WebSocket.OPEN || socket.readyState === WebSocket.CLOSING) {
+			socket.close();
+		}
+	} catch (e) {}
+}
+async function dohQuery(domain, recordType) {
+	const cacheKey = `${domain}:${recordType}`;
+	if (DNS_CACHE.has(cacheKey)) {
+		const cached = DNS_CACHE.get(cacheKey);
+		if (Date.now() < cached.expires) return cached.data;
+		DNS_CACHE.delete(cacheKey);
+	}
+	try {
+		const typeMap = { A: 1, AAAA: 28 };
+		const qtype = typeMap[recordType.toUpperCase()] || 1;
+		const encodeDomain = (name) => {
+			const parts = name.endsWith(".") ? name.slice(0, -1).split(".") : name.split(".");
+			const bufs = [];
+			for (const label of parts) {
+				const enc = new TextEncoder().encode(label);
+				bufs.push(new Uint8Array([enc.length]), enc);
+			}
+			bufs.push(new Uint8Array([0]));
+			return concatBytes(...bufs);
+		};
+		const qname = encodeDomain(domain);
+		const query = new Uint8Array(12 + qname.length + 4);
+		const qview = new DataView(query.buffer);
+		qview.setUint16(0, crypto.getRandomValues(new Uint16Array(1))[0]);
+		qview.setUint16(2, 0x0100);
+		qview.setUint16(4, 1);
+		query.set(qname, 12);
+		qview.setUint16(12 + qname.length, qtype);
+		qview.setUint16(12 + qname.length + 2, 1);
+		const response = await fetch(DOH_RESOLVER, {
+			method: "POST",
+			headers: {
+				"Content-Type": "application/dns-message",
+				Accept: "application/dns-message",
+			},
+			body: query,
+		});
+		if (!response.ok) return [];
+		const buf = new Uint8Array(await response.arrayBuffer());
+		const dv = new DataView(buf.buffer);
+		const qdcount = dv.getUint16(4);
+		const ancount = dv.getUint16(6);
+		const parseName = (pos) => {
+			const labels = [];
+			let p = pos,
+				jumped = false,
+				endPos = -1,
+				safe = 128;
+			while (p < buf.length && safe-- > 0) {
+				const len = buf[p];
+				if (len === 0) {
+					if (!jumped) endPos = p + 1;
+					break;
+				}
+				if ((len & 0xc0) === 0xc0) {
+					if (!jumped) endPos = p + 2;
+					p = ((len & 0x3f) << 8) | buf[p + 1];
+					jumped = true;
+					continue;
+				}
+				labels.push(new TextDecoder().decode(buf.slice(p + 1, p + 1 + len)));
+				p += len + 1;
+			}
+			if (endPos === -1) endPos = p + 1;
+			return [labels.join("."), endPos];
+		};
+		let offset = 12;
+		for (let i = 0; i < qdcount; i++) {
+			const [, end] = parseName(offset);
+			offset = Number(end) + 4;
+		}
+		const answers = [];
+		for (let i = 0; i < ancount && offset < buf.length; i++) {
+			const [name, nameEnd] = parseName(offset);
+			offset = Number(nameEnd);
+			const type = dv.getUint16(offset);
+			offset += 2;
+			offset += 2;
+			const ttl = dv.getUint32(offset);
+			offset += 4;
+			const rdlen = dv.getUint16(offset);
+			offset += 2;
+			const rdata = buf.slice(offset, offset + rdlen);
+			offset += rdlen;
+			let data;
+			if (type === 1 && rdlen === 4) {
+				data = `${rdata[0]}.${rdata[1]}.${rdata[2]}.${rdata[3]}`;
+			} else if (type === 28 && rdlen === 16) {
+				const segs = [];
+				for (let j = 0; j < 16; j += 2) segs.push(((rdata[j] << 8) | rdata[j + 1]).toString(16));
+				data = segs.join(":");
+			} else {
+				data = Array.from(rdata)
+					.map((b) => b.toString(16).padStart(2, "0"))
+					.join("");
+			}
+			answers.push({ name, type, TTL: ttl, data });
+		}
+		DNS_CACHE.set(cacheKey, { data: answers, expires: Date.now() + DNS_CACHE_TTL });
+		return answers;
+	} catch (e) {
+		return [];
+	}
+}
+function createUpstreamQueue({ getWriter, releaseWriter, retryConnect, closeConnection, name = "UpstreamQueue" }) {
+	let chunks = [];
+	let head = 0;
+	let queuedBytes = 0;
+	let draining = false;
+	let closed = false;
+	let bundleBuffer = null;
+	let idleResolvers = [];
+	let activeCompletions = null;
+	const settleCompletions = (completions, err = null) => {
+		if (!completions) return;
+		for (const comp of completions) {
+			if (comp) {
+				if (err) comp.reject(err);
+				else comp.resolve();
+			}
+		}
+	};
+	const rejectQueued = (err) => {
+		for (let i = head; i < chunks.length; i++) {
+			const item = chunks[i];
+			if (item && item.completions) settleCompletions(item.completions, err);
+		}
+	};
+	const compact = () => {
+		if (head > 32 && head * 2 >= chunks.length) {
+			chunks = chunks.slice(head);
+			head = 0;
+		}
+	};
+	const resolveIdle = () => {
+		if (queuedBytes || draining || !idleResolvers.length) return;
+		const resolvers = idleResolvers;
+		idleResolvers = [];
+		for (const resolve of resolvers) resolve();
+	};
+	const clear = (err = null) => {
+		const closeErr = err || (closed ? new Error(`${name}: queue closed`) : null);
+		if (closeErr) {
+			rejectQueued(closeErr);
+			settleCompletions(activeCompletions, closeErr);
+			activeCompletions = null;
+		}
+		chunks = [];
+		head = 0;
+		queuedBytes = 0;
+		resolveIdle();
+	};
+	const shift = () => {
+		if (head >= chunks.length) return null;
+		const item = chunks[head];
+		chunks[head++] = undefined;
+		queuedBytes -= item.chunk.byteLength;
+		compact();
+		return item;
+	};
+	const bundle = () => {
+		const first = shift();
+		if (!first) return null;
+		if (head >= chunks.length || first.chunk.byteLength >= UPSTREAM_BUNDLE_TARGET_BYTES) return first;
+		let byteLength = first.chunk.byteLength;
+		let end = head;
+		let allowRetry = first.allowRetry;
+		let completions = first.completions || null;
+		while (end < chunks.length) {
+			const next = chunks[end];
+			const nextLength = byteLength + next.chunk.byteLength;
+			if (nextLength > UPSTREAM_BUNDLE_TARGET_BYTES) break;
+			byteLength = nextLength;
+			allowRetry = allowRetry && next.allowRetry;
+			if (next.completions) completions = completions ? completions.concat(next.completions) : next.completions;
+			end++;
+		}
+		if (end === head) return first;
+		const output = (bundleBuffer ||= new Uint8Array(UPSTREAM_BUNDLE_TARGET_BYTES));
+		output.set(first.chunk);
+		let offset = first.chunk.byteLength;
+		while (head < end) {
+			const next = chunks[head];
+			chunks[head++] = undefined;
+			queuedBytes -= next.chunk.byteLength;
+			output.set(next.chunk, offset);
+			offset += next.chunk.byteLength;
+		}
+		compact();
+		return { chunk: output.subarray(0, byteLength), allowRetry, completions };
+	};
+	const drain = async () => {
+		if (draining || closed) return;
+		draining = true;
+		try {
+			for (;;) {
+				if (closed) break;
+				const item = bundle();
+				if (!item) break;
+				let writer = getWriter();
+				if (!writer) throw new Error(`${name}: remote writer unavailable`);
+				const completions = item.completions || null;
+				activeCompletions = completions;
+				try {
+					try {
+						await writer.write(item.chunk);
+					} catch (err) {
+						releaseWriter?.();
+						if (!item.allowRetry || typeof retryConnect !== "function") throw err;
+						await retryConnect();
+						writer = getWriter();
+						if (!writer) throw err;
+						await writer.write(item.chunk);
+					}
+					settleCompletions(completions);
+				} catch (err) {
+					settleCompletions(completions, err);
+					throw err;
+				} finally {
+					if (activeCompletions === completions) activeCompletions = null;
+				}
+			}
+		} catch (err) {
+			closed = true;
+			clear(err);
+			try {
+				closeConnection?.(err);
+			} catch (_) {}
+		} finally {
+			draining = false;
+			if (!closed && head < chunks.length) queueMicrotask(drain);
+			else resolveIdle();
+		}
+	};
+	const enqueue = (data, allowRetry = true, waitForFlush = false) => {
+		if (closed) return false;
+		if (!getWriter()) return false;
+		const chunk = convertToUint8Array(data);
+		if (!chunk.byteLength) return true;
+		const nextBytes = queuedBytes + chunk.byteLength;
+		const nextItems = chunks.length - head + 1;
+		if (nextBytes > UPSTREAM_QUEUE_MAX_BYTES || nextItems > UPSTREAM_QUEUE_MAX_ITEMS) {
+			closed = true;
+			const err = Object.assign(new Error(`${name}: upload queue overflow (${nextBytes}B/${nextItems})`), { isQueueOverflow: true });
+			clear(err);
+			try {
+				closeConnection?.(err);
+			} catch (_) {}
+			throw err;
+		}
+		let completionPromise = null;
+		let completions = null;
+		if (waitForFlush) {
+			completions = [];
+			completionPromise = new Promise((resolve, reject) => completions.push({ resolve, reject }));
+		}
+		chunks.push({ chunk, allowRetry, completions });
+		queuedBytes = nextBytes;
+		if (!draining) queueMicrotask(drain);
+		return waitForFlush ? completionPromise.then(() => true) : true;
+	};
+	return {
+		writeAndAwait(data, allowRetry = true) {
+			return enqueue(data, allowRetry, true);
+		},
+		async awaitEmpty() {
+			if (!queuedBytes && !draining) return;
+			await new Promise((resolve) => idleResolvers.push(resolve));
+		},
+		clear() {
+			closed = true;
+			clear();
+		},
+	};
+}
+function createDownstreamSender(webSocket, headerData = null) {
+	const packetCap = DOWNSTREAM_GRAIN_BYTES;
+	const tailBytes = DOWNSTREAM_GRAIN_TAIL_THRESHOLD;
+	const lowWaterBytes = Math.max(4096, tailBytes << 3);
+	let header = headerData;
+	let pendingBuffer = new Uint8Array(packetCap);
+	let pendingBytes = 0;
+	let flushTimer = null;
+	let microtaskQueued = false;
+	let generation = 0;
+	let scheduledGeneration = 0;
+	let waitRounds = 0;
+	let flushPromise = null;
+	const sendRawChunk = async (chunk) => {
+		if (webSocket.readyState !== WebSocket.OPEN) throw new Error("ws.readyState is not open");
+		webSocket.send(chunk);
+	};
+	const attachResponseHeader = (chunk) => {
+		if (!header) return chunk;
+		const merged = new Uint8Array(header.length + chunk.byteLength);
+		merged.set(header, 0);
+		merged.set(chunk, header.length);
+		header = null;
+		return merged;
+	};
+	const flush = async () => {
+		while (flushPromise) await flushPromise;
+		if (flushTimer) clearTimeout(flushTimer);
+		flushTimer = null;
+		microtaskQueued = false;
+		if (!pendingBytes) return;
+		const output = pendingBuffer.subarray(0, pendingBytes).slice();
+		pendingBuffer = new Uint8Array(packetCap);
+		pendingBytes = 0;
+		waitRounds = 0;
+		flushPromise = sendRawChunk(output).finally(() => {
+			flushPromise = null;
+		});
+		return flushPromise;
+	};
+	const scheduleFlush = () => {
+		if (flushTimer || microtaskQueued) return;
+		microtaskQueued = true;
+		scheduledGeneration = generation;
+		queueMicrotask(() => {
+			microtaskQueued = false;
+			if (!pendingBytes || flushTimer) return;
+			if (packetCap - pendingBytes < tailBytes) {
+				flush().catch(() => closeSocketQuietly(webSocket));
+				return;
+			}
+			flushTimer = setTimeout(
+				() => {
+					flushTimer = null;
+					if (!pendingBytes) return;
+					if (packetCap - pendingBytes < tailBytes) {
+						flush().catch(() => closeSocketQuietly(webSocket));
+						return;
+					}
+					if (waitRounds < 2 && (generation !== scheduledGeneration || pendingBytes < lowWaterBytes)) {
+						waitRounds++;
+						scheduledGeneration = generation;
+						scheduleFlush();
+						return;
+					}
+					flush().catch(() => closeSocketQuietly(webSocket));
+				},
+				Math.max(DOWNSTREAM_GRAIN_SILENT_MS, 1),
+			);
+		});
+	};
+	return {
+		async sendDirect(data) {
+			let chunk = convertToUint8Array(data);
+			if (!chunk.byteLength) return;
+			chunk = attachResponseHeader(chunk);
+			await sendRawChunk(chunk);
+		},
+		async send(data) {
+			let chunk = convertToUint8Array(data);
+			if (!chunk.byteLength) return;
+			chunk = attachResponseHeader(chunk);
+			let offset = 0;
+			const totalBytes = chunk.byteLength;
+			while (offset < totalBytes) {
+				if (!pendingBytes && totalBytes - offset >= packetCap) {
+					const sendBytes = Math.min(packetCap, totalBytes - offset);
+					const view = offset || sendBytes !== totalBytes ? chunk.subarray(offset, offset + sendBytes) : chunk;
+					await sendRawChunk(view);
+					offset += sendBytes;
+					continue;
+				}
+				const copyBytes = Math.min(packetCap - pendingBytes, totalBytes - offset);
+				pendingBuffer.set(chunk.subarray(offset, offset + copyBytes), pendingBytes);
+				pendingBytes += copyBytes;
+				offset += copyBytes;
+				generation++;
+				if (pendingBytes === packetCap || packetCap - pendingBytes < tailBytes) await flush();
+				else scheduleFlush();
+			}
+		},
+		flush,
+	};
+}
+async function waitForBackpressure(ws) {
+	if (typeof ws.bufferedAmount === "number") {
+		while (ws.bufferedAmount > 256 * 1024) {
+			await new Promise((r) => setTimeout(r, 100));
+		}
+	}
+}
+async function connectStreams(remoteSocket, webSocket, headerData, retryFunc, onBytes) {
+	let header = headerData,
+		hasData = false,
+		reader,
+		useBYOB = false;
+	const BYOB_LIMIT = 64 * 1024;
+	const downstreamSender = createDownstreamSender(webSocket, header);
+	header = null;
+	try {
+		reader = remoteSocket.readable.getReader({ mode: "byob" });
+		useBYOB = true;
+	} catch (e) {
+		reader = remoteSocket.readable.getReader();
+	}
+	try {
+		if (!useBYOB) {
+			while (true) {
+				await waitForBackpressure(webSocket);
+				const { done, value } = await reader.read();
+				if (done) break;
+				if (!value || value.byteLength === 0) continue;
+				hasData = true;
+				if (typeof onBytes === "function") onBytes(value.byteLength);
+				await downstreamSender.send(value);
+			}
+		} else {
+			let readBuffer = new ArrayBuffer(BYOB_LIMIT);
+			while (true) {
+				await waitForBackpressure(webSocket);
+				const { done, value } = await reader.read(new Uint8Array(readBuffer, 0, BYOB_LIMIT));
+				if (done) break;
+				if (!value || value.byteLength === 0) continue;
+				hasData = true;
+				if (typeof onBytes === "function") onBytes(value.byteLength);
+				if (value.byteLength >= DOWNSTREAM_GRAIN_BYTES) {
+					await downstreamSender.flush();
+					await downstreamSender.sendDirect(value);
+					readBuffer = new ArrayBuffer(BYOB_LIMIT);
+				} else {
+					await downstreamSender.send(value);
+					readBuffer = value.buffer.byteLength >= BYOB_LIMIT ? value.buffer : new ArrayBuffer(BYOB_LIMIT);
+				}
+			}
+		}
+		await downstreamSender.flush();
+	} catch (err) {
+		closeSocketQuietly(webSocket);
+	} finally {
+		try {
+			reader.cancel();
+		} catch (e) {}
+		try {
+			reader.releaseLock();
+		} catch (e) {}
+	}
+	if (!hasData && retryFunc) await retryFunc();
+}
+async function buildRaceCandidates(address, port) {
+	if (!PRELOAD_RACE_DIAL || isIPHostname(address)) return null;
+	const [aRecords, aaaaRecords] = await Promise.all([dohQuery(address, "A"), dohQuery(address, "AAAA")]);
+	const ipv4List = [
+		...new Set(
+			aRecords.flatMap((r) => {
+				return r.type === 1 && typeof r.data === "string" && isIPv4(r.data) ? [r.data] : [];
+			}),
+		),
+	];
+	const ipv6List = [
+		...new Set(
+			aaaaRecords.flatMap((r) => {
+				return r.type === 28 && typeof r.data === "string" && isIPHostname(r.data) ? [r.data] : [];
+			}),
+		),
+	];
+	const limit = Math.max(1, TCP_CONCURRENCY | 0);
+	const ipList = ipv4List.length >= limit ? ipv4List.slice(0, limit) : ipv4List.concat(ipv6List.slice(0, limit - ipv4List.length));
+	if (ipList.length === 0) return null;
+	return ipList.map((hostname, attempt) => ({ hostname, port, attempt, resolvedFrom: address }));
+}
+async function connectDirect(address, port, initialData = null) {
+	const raceCandidates = await buildRaceCandidates(address, port);
+	const candidates = raceCandidates || Array.from({ length: TCP_CONCURRENCY }, () => ({ hostname: address, port }));
+	const openConnection = async (host, prt) => {
+		const socket = connect({ hostname: host, port: prt });
+		await Promise.race([socket.opened, new Promise((_, reject) => setTimeout(() => reject(new Error("timeout")), 1000))]);
+		return socket;
+	};
+	if (candidates.length === 1) {
+		const s = await openConnection(candidates[0].hostname, candidates[0].port);
+		if (initialData && initialData.byteLength > 0) {
+			const w = s.writable.getWriter();
+			await w.write(convertToUint8Array(initialData));
+			w.releaseLock();
+		}
+		return s;
+	}
+	const attempts = candidates.map((c) => openConnection(c.hostname, c.port).then((socket) => ({ socket, candidate: c })));
+	let winner = null;
+	try {
+		winner = await Promise.any(attempts);
+		if (initialData && initialData.byteLength > 0) {
+			const w = winner.socket.writable.getWriter();
+			await w.write(convertToUint8Array(initialData));
+			w.releaseLock();
+		}
+		return winner.socket;
+	} finally {
+		if (winner) {
+			for (const attempt of attempts) {
+				attempt
+					.then(({ socket }) => {
+						if (socket !== winner.socket) {
+							try {
+								socket.close();
+							} catch (e) {}
+						}
+					})
+					.catch(() => {});
+			}
+		}
+	}
+}
+async function forwardVlessUDP(udpChunk, webSocket, respHeader, onBytes) {
+	const requestData = convertToUint8Array(udpChunk);
+	try {
+		const tcpSocket = connect({ hostname: "8.8.4.4", port: 53 });
+		let vlessHeader = respHeader;
+		const writer = tcpSocket.writable.getWriter();
+		await writer.write(requestData);
+		writer.releaseLock();
+		await tcpSocket.readable.pipeTo(
+			new WritableStream({
+				async write(chunk) {
+					const response = convertToUint8Array(chunk);
+					if (typeof onBytes === "function") onBytes(response.byteLength);
+					if (webSocket.readyState !== WebSocket.OPEN) return;
+					if (vlessHeader) {
+						const merged = new Uint8Array(vlessHeader.length + response.byteLength);
+						merged.set(vlessHeader, 0);
+						merged.set(response, vlessHeader.length);
+						webSocket.send(merged.buffer);
+						vlessHeader = null;
+					} else {
+						webSocket.send(response);
+					}
+				},
+			}),
+		);
+	} catch (e) {}
+}
+function extractUUIDFromVless(data) {
+	if (data.byteLength < 17) return null;
+	const hex = [...data.slice(1, 17)].map((b) => b.toString(16).padStart(2, "0")).join("");
+	return `${hex.substring(0, 8)}-${hex.substring(8, 12)}-${hex.substring(12, 16)}-${hex.substring(16, 20)}-${hex.substring(20)}`;
+}
+function trackRequest(env, ctx) {
+	GLOBAL_REQ_COUNT++;
+	const now = Date.now();
+	if (now - GLOBAL_LAST_REQ_WRITE > 15000 && GLOBAL_REQ_COUNT > 0) {
+		GLOBAL_LAST_REQ_WRITE = now;
+		const countToSave = GLOBAL_REQ_COUNT;
+		GLOBAL_REQ_COUNT = 0;
+		const task = async () => {
+			try {
+				const today = new Date().toISOString().split("T")[0];
+				await env.DB.prepare("INSERT INTO settings (key, value) VALUES ('req_total', ?) ON CONFLICT(key) DO UPDATE SET value = CAST(value AS INTEGER) + ?").bind(String(countToSave), String(countToSave)).run();
+				const lastDateRow = await env.DB.prepare("SELECT value FROM settings WHERE key = 'req_last_date'").first();
+				if (!lastDateRow || lastDateRow.value !== today) {
+					await env.DB.prepare("INSERT INTO settings (key, value) VALUES ('req_last_date', ?) ON CONFLICT(key) DO UPDATE SET value = ?").bind(today, today).run();
+					await env.DB.prepare("INSERT INTO settings (key, value) VALUES ('req_today', ?) ON CONFLICT(key) DO UPDATE SET value = ?").bind(String(countToSave), String(countToSave)).run();
+				} else {
+					await env.DB.prepare("INSERT INTO settings (key, value) VALUES ('req_today', ?) ON CONFLICT(key) DO UPDATE SET value = CAST(value AS INTEGER) + ?").bind(String(countToSave), String(countToSave)).run();
+				}
+			} catch (e) {}
+		};
+		if (ctx) ctx.waitUntil(task());
+		else task();
+	}
+}
+const HTML_TEMPLATES = {
+	nginx: `<!DOCTYPE html>
+<html lang="fa" dir="rtl" class="dark">
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>${user.name} - Subscriber Portal</title>
-    <link href="https://fonts.googleapis.com/css2?family=Vazirmatn:wght@400;500;600;700;800;900&family=Inter:wght@400;500;600;700;800;900&display=swap" rel="stylesheet">
-    <script src="https://cdn.tailwindcss.com"><\/script>
+    <title>دسترسی به پنل</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <link href="https://cdn.jsdelivr.net/gh/rastikerdar/vazirmatn@v33.003/Vazirmatn-font-face.css" rel="stylesheet" type="text/css" />
     <script>
         tailwind.config = {
             darkMode: 'class',
             theme: {
                 extend: {
-                    fontFamily: {
-                        fa: ['Vazirmatn', 'sans-serif'],
-                        en: ['Inter', 'sans-serif'],
-                    }
+                    fontFamily: { sans: ['Vazirmatn', 'sans-serif'] },
+                    colors: { amoled: { bg: '#000000', card: '#080b0f', input: '#0d1117', border: '#1c2330' } }
                 }
             }
         }
-    <\/script>
+    </script>
+</head>
+<body class="bg-gray-50 text-gray-900 dark:bg-amoled-bg dark:text-zinc-100 min-h-screen flex items-center justify-center p-4">
+    <div class="w-full max-w-md bg-white dark:bg-amoled-card border border-gray-200 dark:border-amoled-border rounded-2xl shadow-xl p-8 text-center flex flex-col items-center gap-4">
+        <div class="p-4 bg-blue-50 dark:bg-blue-900/20 text-blue-500 rounded-full mb-2">
+            <svg class="w-8 h-8" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M13 16h-1v-4h-1m1-4h.01M21 12a9 9 0 11-18 0 9 9 0 0118 0z"></path></svg>
+        </div>
+        <h2 class="text-xl font-bold text-gray-900 dark:text-white">ورود به پنل مدیریت</h2>
+        <p class="text-sm text-gray-600 dark:text-gray-400 leading-relaxed mt-2">
+            برای ورود به پنل، لطفاً عبارت 
+            <span class="inline-block px-2 py-1 bg-gray-100 dark:bg-amoled-input border border-gray-200 dark:border-zinc-800 rounded-md font-mono text-blue-500 font-bold mx-1 shadow-sm" dir="ltr">/panel</span> 
+            را به انتهای آدرس مرورگر خود اضافه کنید.
+        </p>
+        <button onclick="window.location.href='/panel'" class="mt-4 w-full py-2.5 bg-blue-600 hover:bg-blue-700 text-white font-medium rounded-xl text-sm transition-colors duration-200 shadow-lg shadow-blue-600/20 font-bold">
+            ورود به پنل
+        </button>
+    </div>
+</body>
+</html>`,
+	setup: `<!DOCTYPE html>
+<html lang="fa" dir="rtl" class="dark">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>تعریف رمز عبور پنل</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <link href="https://cdn.jsdelivr.net/gh/rastikerdar/vazirmatn@v33.003/Vazirmatn-font-face.css" rel="stylesheet" type="text/css" />
+    <script>
+        tailwind.config = {
+            darkMode: 'class',
+            theme: {
+                extend: {
+                    fontFamily: { sans: ['Vazirmatn', 'sans-serif'] },
+                    colors: { amoled: { bg: '#000000', card: '#080b0f', input: '#0d1117', border: '#1c2330' } }
+                }
+            }
+        }
+    </script>
+</head>
+<body class="bg-gray-50 text-gray-900 dark:bg-amoled-bg dark:text-zinc-100 min-h-screen flex items-center justify-center p-4">
+    <div class="w-full max-w-md bg-white dark:bg-amoled-card border border-gray-200 dark:border-amoled-border rounded-2xl shadow-xl p-6">
+        <h2 class="text-xl font-bold mb-2 text-center text-blue-600 dark:text-blue-400">تنظیم رمز عبور جدید</h2>
+        <p class="text-sm text-gray-500 dark:text-gray-400 text-center mb-6">این اولین ورود شما به پنل مدیریت است. لطفاً رمز عبور خود را تعیین کنید.</p>
+        <form onsubmit="handleSetup(event)" class="space-y-4">
+            <div>
+                <label class="block text-sm font-medium mb-1.5">رمز عبور</label>
+                <input type="password" id="password" class="w-full px-3 py-2 bg-gray-50 dark:bg-amoled-input border border-gray-300 dark:border-amoled-border rounded-lg focus:outline-none focus:ring-2 focus:ring-blue-500 text-sm text-center font-mono" required minlength="4">
+            </div>
+            <div>
+                <label class="block text-sm font-medium mb-1.5">تکرار رمز عبور</label>
+                <input type="password" id="confirm-password" class="w-full px-3 py-2 bg-gray-50 dark:bg-amoled-input border border-gray-300 dark:border-amoled-border rounded-lg focus:outline-none focus:ring-2 focus:ring-blue-500 text-sm text-center font-mono" required minlength="4">
+            </div>
+            <button type="submit" id="submit-btn" class="w-full py-2.5 bg-blue-600 hover:bg-blue-700 text-white font-medium rounded-lg text-sm transition font-bold">ثبت و ورود</button>
+        </form>
+    </div>
+    <script>
+        async function handleSetup(event) {
+            event.preventDefault();
+            const password = document.getElementById('password').value;
+            const confirmPassword = document.getElementById('confirm-password').value;
+            const btn = document.getElementById('submit-btn');
+            if (password !== confirmPassword) {
+                alert('⚠️ رمز عبور و تکرار آن مطابقت ندارند!');
+                return;
+            }
+            btn.disabled = true;
+            btn.innerText = 'در حال ثبت...';
+            try {
+                const res = await fetch('/api/setup-password', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ password })
+                });
+                const data = await res.json();
+                if (res.ok && data.success) {
+                    alert('✅ رمز عبور با موفقیت تنظیم شد. در حال ورود...');
+                    window.location.reload();
+                } else {
+                    alert('خطا: ' + (data.error || 'عملیات ناموفق بود'));
+                }
+            } catch (err) {
+                alert('خطا در ارتباط با سرور');
+            } finally {
+                btn.disabled = false;
+                btn.innerText = 'ثبت و ورود';
+            }
+        }
+    </script>
+</body>
+</html>`,
+
+login: `<!DOCTYPE html>
+<html lang="fa" dir="rtl" class="dark">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>ورود به پنل مدیریت</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <link href="https://cdn.jsdelivr.net/gh/rastikerdar/vazirmatn@v33.003/Vazirmatn-font-face.css" rel="stylesheet" type="text/css" />
+    <script>
+        tailwind.config = {
+            darkMode: 'class',
+            theme: {
+                extend: {
+                    fontFamily: { sans: ['Vazirmatn', 'sans-serif'] },
+                    colors: { amoled: { bg: '#000000', card: '#080b0f', input: '#0d1117', border: '#1c2330' } }
+                }
+            }
+        }
+    </script>
+</head>
+<body class="bg-gray-50 text-gray-900 dark:bg-amoled-bg dark:text-zinc-100 min-h-screen flex items-center justify-center p-4">
+    <div class="w-full max-w-md bg-white dark:bg-amoled-card border border-gray-200 dark:border-amoled-border rounded-2xl shadow-xl p-6">
+        <div id="login-section">
+            <h2 class="text-xl font-bold mb-6 text-center text-blue-600 dark:text-blue-400">ورود به پنل مدیریت</h2>
+            <form onsubmit="handleLogin(event)" class="space-y-4">
+                <div>
+                    <label class="block text-sm font-medium mb-1.5">رمز عبور</label>
+                    <input type="password" id="password" class="w-full px-3 py-2 bg-gray-50 dark:bg-amoled-input border border-gray-300 dark:border-amoled-border rounded-lg focus:outline-none focus:ring-2 focus:ring-blue-500 text-sm text-center font-mono" required>
+                </div>
+                <button type="submit" id="submit-btn" class="w-full py-2.5 bg-blue-600 hover:bg-blue-700 text-white font-medium rounded-lg text-sm transition font-bold">ورود</button>
+            </form>
+            <div class="mt-4 text-center">
+                <button onclick="toggleRecovery(true)" class="text-xs text-blue-500 hover:text-blue-600 transition font-medium">بازیابی رمز پنل</button>
+            </div>
+        </div>
+        <div id="recovery-section" class="hidden">
+            <h2 class="text-xl font-bold mb-4 text-center text-orange-600 dark:text-orange-400">بازیابی رمز پنل</h2>
+            
+            <div class="mb-5 p-3 bg-orange-50 dark:bg-orange-900/20 border border-orange-200 dark:border-orange-800/50 rounded-xl text-xs leading-relaxed text-orange-800 dark:text-orange-300">
+                برای احراز هویت و اثبات مالکیت پنل، از طریق دکمه زیر وارد کلودفلر شوید و توکن دریافتی را کپی کرده و در کادر زیر وارد کنید.
+                <a href="https://dash.cloudflare.com/profile/api-tokens?permissionGroupKeys=%5B%7B%22key%22%3A%22workers_scripts%22%2C%22type%22%3A%22edit%22%7D%2C%7B%22key%22%3A%22workers_kv_storage%22%2C%22type%22%3A%22edit%22%7D%2C%7B%22key%22%3A%22d1%22%2C%22type%22%3A%22edit%22%7D%2C%7B%22key%22%3A%22account_settings%22%2C%22type%22%3A%22read%22%7D%2C%7B%22key%22%3A%22workers_subdomain%22%2C%22type%22%3A%22edit%22%7D%2C%7B%22key%22%3A%22account_analytics%22%2C%22type%22%3A%22read%22%7D%5D&accountId=*&zoneId=all&name=lowkey-Deployer-Token" target="_blank" class="mt-3 w-full flex items-center justify-center gap-2 py-2 bg-orange-500 hover:bg-orange-600 text-white rounded-lg font-bold transition shadow-md shadow-orange-500/20">
+                    <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M10 6H6a2 2 0 00-2 2v10a2 2 0 002 2h10a2 2 0 002-2v-4M14 4h6m0 0v6m0-6L10 14"></path></svg>
+                    دریافت توکن
+                </a>
+            </div>
+
+            <form onsubmit="handleRecovery(event)" class="space-y-4">
+                <div>
+                    <input type="password" id="api-token" placeholder="توکن را وارد کنید" class="w-full px-3 py-2 bg-gray-50 dark:bg-amoled-input border border-gray-300 dark:border-amoled-border rounded-lg focus:outline-none focus:ring-2 focus:ring-orange-500 text-xs text-center font-mono" required>
+                </div>
+                <div class="flex gap-2 pt-2">
+                    <button type="button" onclick="toggleRecovery(false)" class="w-1/3 py-2.5 bg-gray-200 dark:bg-zinc-800 hover:bg-gray-300 dark:hover:bg-zinc-700 text-gray-700 dark:text-zinc-300 font-medium rounded-lg text-sm transition">انصراف</button>
+                    <button type="submit" id="recover-btn" class="w-2/3 py-2.5 bg-orange-600 hover:bg-orange-700 text-white font-medium rounded-lg text-sm transition font-bold">بازیابی رمز پنل</button>
+                </div>
+            </form>
+        </div>
+    </div>
+    <script>
+        async function handleLogin(event) {
+            event.preventDefault();
+            const password = document.getElementById('password').value;
+            const btn = document.getElementById('submit-btn');
+            btn.disabled = true;
+            try {
+                const res = await fetch('/api/login', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ password })
+                });
+                const data = await res.json();
+                if (res.ok && data.success) {
+                    window.location.reload();
+                } else {
+                    alert('رمز عبور اشتباه است');
+                }
+            } catch (err) {
+                alert('خطا در ارتباط با سرور');
+            } finally {
+                btn.disabled = false;
+            }
+        }
+        function toggleRecovery(show) {
+            document.getElementById('login-section').classList.toggle('hidden', show);
+            document.getElementById('recovery-section').classList.toggle('hidden', !show);
+        }
+        async function handleRecovery(event) {
+            event.preventDefault();
+            const apiToken = document.getElementById('api-token').value;
+            const btn = document.getElementById('recover-btn');
+            btn.disabled = true;
+            try {
+                const res = await fetch('/api/recover', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ api_token: apiToken })
+                });
+                const data = await res.json();
+                if (res.ok && data.success) {
+                    alert('رمز عبور با موفقیت حذف شد. در حال انتقال به صفحه تنظیمات اولیه...');
+                    window.location.reload();
+                } else {
+                    alert(data.error || 'خطا در تایید اطلاعات');
+                }
+            } catch (err) {
+                alert('خطا در ارتباط با سرور');
+            } finally {
+                btn.disabled = false;
+            }
+        }
+    </script>
+</body>
+</html>`,
+
+	panel: `
+<!DOCTYPE html>
+<html lang="fa" dir="rtl">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>lowkey Panel</title>
+    <script>
+        const originalWarn = console.warn;
+        console.warn = (...args) => {
+            if (typeof args[0] === 'string' && args[0].includes('cdn.tailwindcss.com')) return;
+            originalWarn(...args);
+        };
+    </script>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/qrcodejs/1.0.0/qrcode.min.js"></script>
+    <link href="https://cdn.jsdelivr.net/gh/rastikerdar/vazirmatn@v33.003/Vazirmatn-font-face.css" rel="stylesheet" type="text/css" />
+    <script>
+        tailwind.config = {
+            darkMode: 'class',
+            theme: {
+                extend: {
+                    fontFamily: { sans: ['Vazirmatn', 'sans-serif'] },
+                    colors: { amoled: { bg: '#000000', card: '#080b0f', input: '#0d1117', border: '#1c2330' } }
+                }
+            }
+        }
+    </script>
     <style>
-        :root {
-            --bg-primary: #f8fafc;
-            --bg-card: #ffffff;
-            --bg-card-inner: #f1f5f9;
-            --bg-input: #f1f5f9;
-            --border-card: #e2e8f0;
-            --border-inner: #e2e8f0;
-            --text-primary: #0f172a;
-            --text-secondary: #475569;
-            --text-muted: #94a3b8;
-            --accent: #FF006E;
-            --accent-light: #eef2ff;
-            --accent-border: #c7d2fe;
-            --accent-hover: #4f46e5;
-            --green-bg: #ecfdf5;
-            --green-border: #a7f3d0;
-            --green-text: #059669;
-            --amber-bg: #fffbeb;
-            --amber-border: #fde68a;
-            --amber-text: #d97706;
-            --red-bg: #fef2f2;
-            --red-border: #fecaca;
-            --red-text: #dc2626;
-            --progress-bg: #e2e8f0;
-            --shadow-card: 0 4px 24px rgba(0,0,0,0.06);
-            --btn-primary-bg: #FF006E;
-            --btn-primary-hover: #4f46e5;
-            --btn-secondary-bg: #f1f5f9;
-            --btn-secondary-hover: #e2e8f0;
-            --modal-bg: rgba(0,0,0,0.4);
-            --modal-card: #ffffff;
+        body { font-family: 'Vazirmatn', sans-serif; }
+        ::-webkit-scrollbar {
+            width: 8px;
+            height: 8px;
         }
-        .dark {
-            --bg-primary: #0d1117;
-            --bg-card: rgba(15, 20, 40, 0.8);
-            --bg-card-inner: rgba(15, 23, 42, 0.6);
-            --bg-input: #020617;
-            --border-card: rgba(255, 0, 110, 0.25);
-            --border-inner: rgba(255, 0, 110, 0.08);
-            --text-primary: #f1f5f9;
-            --text-secondary: #94a3b8;
-            --text-muted: #475569;
-            --accent: #00D9FF;
-            --accent-light: rgba(255, 0, 110, 0.15);
-            --accent-border: rgba(255, 0, 110, 0.3);
-            --accent-hover: #FF006E;
-            --green-bg: rgba(16, 185, 129, 0.1);
-            --green-border: rgba(16, 185, 129, 0.25);
-            --green-text: #34d399;
-            --amber-bg: rgba(245, 158, 11, 0.1);
-            --amber-border: rgba(245, 158, 11, 0.25);
-            --amber-text: #fbbf24;
-            --red-bg: rgba(239, 68, 68, 0.1);
-            --red-border: rgba(239, 68, 68, 0.25);
-            --red-text: #f87171;
-            --progress-bg: rgba(30, 41, 59, 0.8);
-            --btn-primary-bg: #FF006E;
-            --btn-primary-hover: #4f46e5;
-            --btn-secondary-bg: rgba(30, 41, 59, 0.6);
-            --btn-secondary-hover: rgba(30, 41, 59, 0.9);
-            --modal-bg: rgba(0,0,0,0.7);
-            --modal-card: #0f172a;
+        ::-webkit-scrollbar-track {
+            background: #f3f4f6; 
+            border-radius: 4px;
         }
-        body {
-            font-family: 'Inter', 'Vazirmatn', sans-serif;
-            background: var(--bg-primary) !important;
-            color: var(--text-primary);
-            transition: background 0.3s, color 0.3s;
+        ::-webkit-scrollbar-thumb {
+            background: #d1d5db; 
+            border-radius: 4px;
         }
-        [lang="fa"] body { font-family: 'Vazirmatn', sans-serif; }
-        .card-main {
-            background: var(--bg-card) !important;
-            border: 1px solid var(--border-card) !important;
-            box-shadow: var(--shadow-card) !important;
-            transition: all 0.3s;
+        ::-webkit-scrollbar-thumb:hover {
+            background: #9ca3af;
         }
-        .card-inner {
-            background: var(--bg-card-inner);
-            border: 1px solid var(--border-inner);
-            transition: all 0.3s;
+        .dark ::-webkit-scrollbar-track {
+            background: #080b0f; 
         }
-        .input-field {
-            background: var(--bg-input);
-            border: 1px solid var(--border-inner);
-            color: var(--text-primary);
+        .dark ::-webkit-scrollbar-thumb {
+            background: #1c2330; 
         }
-        ::-webkit-scrollbar { width: 6px; }
-        ::-webkit-scrollbar-thumb { background: var(--accent); border-radius: 10px; }
-        .btn-primary {
-            background: var(--btn-primary-bg);
-            color: white;
+        .dark ::-webkit-scrollbar-thumb:hover {
+            background: #2d3748;
         }
-        .btn-primary:hover { background: var(--btn-primary-hover); }
-        .btn-secondary {
-            background: var(--btn-secondary-bg);
-            color: var(--text-primary);
-            border: 1px solid var(--border-inner);
+        /* استایل اسکرول‌بار برای مرورگر فایرفاکس */
+        * {
+            scrollbar-width: thin;
+            scrollbar-color: #d1d5db #f3f4f6;
         }
-        .btn-secondary:hover { background: var(--btn-secondary-hover); }
-        .text-secondary { color: var(--text-secondary); }
-        .text-muted { color: var(--text-muted); }
-        .border-card-main { border-color: var(--border-card) !important; }
-        .progress-bar-bg { background: var(--progress-bg); }
-        @keyframes fadeIn { from { opacity: 0; transform: translateY(10px); } to { opacity: 1; transform: translateY(0); } }
-        .fade-in { animation: fadeIn 0.4s ease-out; }
-        .modal-overlay { background: var(--modal-bg); }
-        .modal-card { background: var(--modal-card); border: 1px solid var(--border-card); }
+        .dark * {
+            scrollbar-color: #1c2330 #080b0f;
+        }
     </style>
 </head>
-<body class="min-h-screen py-6 px-4 flex flex-col items-center justify-center fade-in">
-
-    <!-- Theme & Language Toggle -->
-    <div class="fixed top-4 left-4 right-4 flex justify-between items-center z-50 max-w-2xl mx-auto">
-        <div class="flex gap-2">
-            <button onclick="toggleTheme()" id="theme-toggle" class="btn-secondary px-3 py-2 rounded-xl text-xs font-semibold transition-all flex items-center gap-1.5" title="Toggle Theme">
-                <span id="theme-icon">\u2600\ufe0f</span>
-                <span id="theme-label"></span>
-            </button>
-            <button onclick="toggleLang()" id="lang-toggle" class="btn-secondary px-3 py-2 rounded-xl text-xs font-semibold transition-all flex items-center gap-1.5" title="Toggle Language">
-                <span id="lang-icon">🇺🇸</span>
-                <span id="lang-label">EN</span>
-            </button>
+<body class="bg-gray-50 text-gray-900 dark:bg-amoled-bg dark:text-zinc-100 min-h-screen transition-colors duration-200">
+    <header class="border-b border-gray-200 dark:border-amoled-border bg-white dark:bg-amoled-card px-4 py-4">
+        <div class="max-w-6xl mx-auto flex flex-col md:flex-row justify-between items-center gap-4">
+            <div class="flex flex-row flex-wrap justify-center items-center gap-3 w-full md:w-auto">
+                <h1 class="text-lg font-bold flex items-center gap-2" dir="ltr">
+                    lowkey Panel 
+                    <span id="panel-version" class="text-xs px-2 py-0.5 font-semibold bg-blue-100 text-blue-800 dark:bg-blue-900/30 dark:text-blue-400 rounded-full">v1.4.10</span>
+                </h1>
+                <div class="flex items-center gap-3 bg-gray-100 dark:bg-zinc-800/60 px-3 py-1.5 rounded-full border border-gray-200 dark:border-zinc-800/80 shadow-sm flex-shrink-0 w-fit">
+                    <a href="https://t.me/lowkey878" target="_blank" rel="noopener noreferrer" class="text-sky-500 hover:text-sky-600 dark:hover:text-sky-400 transition-all transform hover:scale-125 duration-200 flex-shrink-0" title="Telegram">
+                        <svg class="w-[22px] h-[22px] flex-shrink-0" viewBox="0 0 24 24" fill="currentColor">
+                            <path d="M12 2C6.48 2 2 6.48 2 12s4.48 10 10 10 10-4.48 10-10S17.52 2 12 2zm4.64 6.8c-.15 1.58-.8 5.42-1.13 7.19-.14.75-.42 1-.68 1.03-.58.05-1.02-.38-1.58-.75-.88-.58-1.38-.94-2.23-1.5-.99-.65-.35-1.01.22-1.59.15-.15 2.71-2.48 2.76-2.69a.2.2 0 00-.05-.18c-.06-.05-.14-.03-.21-.02-.09.02-1.49.94-4.22 2.79-.4.27-.76.41-1.08.4-.36-.01-1.04-.2-1.55-.37-.63-.2-1.12-.31-1.08-.66.02-.18.27-.36.74-.55 2.92-1.27 4.86-2.11 5.83-2.51 2.78-1.16 3.35-1.36 3.73-1.37.08 0 .27.02.39.12.1.08.13.19.14.27-.01.06.01.24 0 .24z"/>
+                        </svg>
+                    </a>
+                    <a href="https://www.instagram.com/shayan.sheykhi.87?igsh=MTc3YjlxazRxbHA0Yw==" target="_blank" rel="noopener noreferrer" class="text-pink-500 hover:text-pink-600 dark:hover:text-pink-400 transition-all transform hover:scale-125 duration-200 flex-shrink-0" title="Instagram">
+                        <svg class="w-[22px] h-[22px] flex-shrink-0" viewBox="0 0 24 24" fill="currentColor">
+                            <path d="M12 2.163c3.204 0 3.584.012 4.85.07 3.252.148 4.771 1.691 4.919 4.919.058 1.265.069 1.645.069 4.849 0 3.205-.012 3.584-.069 4.849-.149 3.225-1.664 4.771-4.919 4.919-1.266.058-1.644.07-4.85.07-3.204 0-3.584-.012-4.849-.07-3.26-.149-4.771-1.699-4.919-4.92-.058-1.265-.07-1.644-.07-4.849 0-3.204.013-3.583.07-4.849.149-3.227 1.664-4.771 4.919-4.919 1.266-.057 1.645-.069 4.849-.069zm0-2.163c-3.259 0-3.667.014-4.947.072-4.358.2-6.78 2.618-6.98 6.98-.059 1.281-.073 1.689-.073 4.948 0 3.259.014 3.668.072 4.948.2 4.358 2.618 6.78 6.98 6.98 1.281.058 1.689.072 4.948.072 3.259 0 3.668-.014 4.948-.072 4.354-.2 6.782-2.618 6.979-6.98.059-1.28.073-1.689.073-4.948 0-3.259-.014-3.667-.072-4.947-.196-4.354-2.617-6.78-6.979-6.98-1.281-.059-1.69-.073-4.949-.073zm0 5.838c-3.403 0-6.162 2.759-6.162 6.162s2.759 6.163 6.162 6.163 6.162-2.759 6.162-6.163c0-3.403-2.759-6.162-6.162-6.162zm0 10.162c-2.209 0-4-1.79-4-4 0-2.209 1.791-4 4-4s4 1.791 4 4c0 2.21-1.791 4-4 4zm6.406-11.845c-.796 0-1.441.645-1.441 1.44s.645 1.44 1.441 1.44c.795 0 1.439-.645 1.439-1.44s-.644-1.44-1.439-1.44z"/>
+                        </svg>
+                    </a>
+                </div>
+            </div>
+            <div class="flex items-center justify-center gap-3 w-full md:w-auto mt-2 md:mt-0">
+                <button id="theme-toggle" class="p-2 rounded-lg bg-gray-100 dark:bg-amoled-input border border-gray-200 dark:border-amoled-border hover:bg-gray-200 dark:hover:bg-zinc-800 transition">
+                    <svg id="sun-icon" class="w-5 h-5 hidden dark:block text-yellow-500" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 3v1m0 16v1m9-9h-1M4 12H3m15.364-6.364l-.707.707M6.343 17.657l-.707.707m12.728 0l-.707-.707M6.343 6.343l-.707-.707M14 12a2 2 0 11-4 0 2 2 0 014 0z"></path></svg>
+                    <svg id="moon-icon" class="w-5 h-5 block dark:hidden text-gray-600" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M20.354 15.354A9 9 0 018.646 3.646 9.003 9.003 0 0012 21a9.003 9.003 0 008.354-5.646z"></path></svg>
+                </button>
+                <button onclick="toggleSettingsModal(true)" class="p-2 rounded-lg bg-gray-100 dark:bg-amoled-input border border-gray-200 dark:border-amoled-border hover:bg-gray-200 dark:hover:bg-zinc-800 transition text-gray-600 dark:text-gray-300 shadow-sm" title="Settings">
+                    <svg class="w-6 h-6" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M10.325 4.317c.426-1.756 2.924-1.756 3.35 0a1.724 1.724 0 002.573 1.066c1.543-.94 3.31.826 2.37 2.37a1.724 1.724 0 001.065 2.572c1.756.426 1.756 2.924 0 3.35a1.724 1.724 0 00-1.066 2.573c.94 1.543-.826 3.31-2.37 2.37a1.724 1.724 0 00-2.572 1.065c-.426 1.756-2.924 1.756-3.35 0a1.724 1.724 0 00-2.573-1.066c-1.543.94-3.31-.826-2.37-2.37a1.724 1.724 0 00-1.065-2.572c-1.756-.426-1.756-2.924 0-3.35a1.724 1.724 0 001.066-2.573c-.94-1.543.826-3.31 2.37-2.37.996.608 2.296.07 2.572-1.065z"></path><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M15 12a3 3 0 11-6 0 3 3 0 016 0z"></path></svg>
+                </button>
+                <button onclick="logoutAdmin()" class="p-2 rounded-lg bg-gray-100 dark:bg-amoled-input border border-gray-200 dark:border-amoled-border hover:bg-red-50 dark:hover:bg-red-950/20 transition text-red-600 dark:text-red-400 shadow-sm" title="Logout">
+                    <svg class="w-6 h-6" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M17 16l4-4m0 0l-4-4m4 4H7m6 4v1a3 3 0 01-3 3H6a3 3 0 01-3-3V7a3 3 0 013-3h4a3 3 0 013 3v1"></path></svg>
+                </button>
+            </div>
+        </div>
+    </header>
+    <main class="max-w-6xl mx-auto px-4 py-8 pb-56 md:pb-32">
+<div class="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-5 gap-5 mb-8">
+    <div class="bg-white dark:bg-amoled-card border border-gray-200 dark:border-amoled-border rounded-2xl p-5 shadow-sm flex flex-col justify-between hover:shadow-md hover:border-indigo-400 dark:hover:border-indigo-500/50 transition duration-300 relative overflow-hidden group">
+        <div class="absolute -right-4 -bottom-4 w-24 h-24 bg-indigo-500/10 rounded-full blur-xl group-hover:scale-150 transition duration-500"></div>
+        <div class="flex items-center justify-between relative z-10 mb-2">
+            <span class="text-sm font-semibold text-gray-500 dark:text-zinc-400 whitespace-nowrap">تعداد کل کاربران</span>
+            <div class="p-2 bg-indigo-50 dark:bg-indigo-950/30 text-indigo-600 dark:text-indigo-400 rounded-xl flex-shrink-0">
+                <svg class="w-6 h-6" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="1.5" d="M17 20h5v-2a3 3 0 00-5.356-1.857M17 20H7m10 0v-2c0-.656-.126-1.283-.356-1.857M7 20H2v-2a3 3 0 015.356-1.857M7 20v-2c0-.656.126-1.283.356-1.857m0 0a5.002 5.002 0 019.288 0M15 7a3 3 0 11-6 0 3 3 0 016 0zm6 3a2 2 0 11-4 0 2 2 0 014 0zM7 10a2 2 0 11-4 0 2 2 0 014 0z"></path></svg>
+            </div>
+        </div>
+        <div class="space-y-1.5 relative z-10 min-w-0 flex-1">
+            <div class="text-2xl font-black text-gray-900 dark:text-zinc-100 transition-all" id="stat-total-users">0</div>
+            <span class="text-[11px] text-indigo-500 dark:text-indigo-400 flex items-center gap-1 font-medium whitespace-nowrap">
+                <span class="w-1.5 h-1.5 bg-indigo-500 rounded-full animate-ping"></span>
+                کل کاربران تعریف شده
+            </span>
         </div>
     </div>
-
-    <div class="w-full max-w-2xl card-main rounded-3xl p-6 md:p-8 space-y-6 relative overflow-hidden mt-12" id="main-card">
-
-        <!-- Header -->
-        <div class="flex flex-col md:flex-row md:items-center justify-between gap-4 pb-5 border-b border-card-main" style="border-color: var(--border-inner);">
-            <div class="flex items-center gap-4">
-                <div class="p-4 rounded-2xl" style="background: var(--accent-light); color: var(--accent); border: 1px solid var(--accent-border);">
-                    <svg class="w-7 h-7" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M16 7a4 4 0 11-8 0 4 4 0 018 0zM12 14a7 7 0 00-7 7h14a7 7 0 00-7-7z"></path></svg>
-                </div>
-                <div>
-                    <h1 class="text-xl md:text-2xl font-black tracking-tight" style="color: var(--text-primary);">${user.name}</h1>
-                    <p class="text-xs mt-1 font-mono" style="color: var(--text-muted);">${user.id}</p>
-                </div>
-            </div>
-            <div class="shrink-0">
-                <span id="status-badge" class="px-4 py-2 rounded-2xl text-xs font-bold inline-block"></span>
+    <div class="bg-white dark:bg-amoled-card border border-gray-200 dark:border-amoled-border rounded-2xl p-5 shadow-sm flex flex-col justify-between hover:shadow-md hover:border-emerald-400 dark:hover:border-emerald-500/50 transition duration-300 relative overflow-hidden group">
+        <div class="absolute -right-4 -bottom-4 w-24 h-24 bg-emerald-500/10 rounded-full blur-xl group-hover:scale-150 transition duration-500"></div>
+        <div class="flex items-center justify-between relative z-10 mb-2">
+            <span class="text-sm font-semibold text-gray-500 dark:text-zinc-400 whitespace-nowrap">کاربران فعال (آنلاین)</span>
+            <div class="p-2 bg-emerald-50 dark:bg-emerald-950/30 text-emerald-600 dark:text-emerald-400 rounded-xl flex-shrink-0">
+                <svg class="w-6 h-6" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="1.5" d="M13 10V3L4 14h7v7l9-11h-7z"></path></svg>
             </div>
         </div>
-
-        <!-- Metrics Section -->
-        <div class="grid grid-cols-1 md:grid-cols-3 gap-4">
-            <!-- Total Traffic -->
-            <div class="card-inner rounded-2xl p-4">
-                <p class="text-xs font-semibold uppercase tracking-widest text-secondary" data-i18n="totalUsage">Total Usage</p>
-                <div class="flex items-baseline gap-1.5 mt-2">
-                    <span class="text-2xl font-black" style="color: var(--text-primary);">${totalGb}</span>
-                    <span class="text-xs text-secondary">/ ${limitTotalGb} GB</span>
-                </div>
-                ${limitTotal ? `
-                <div class="w-full rounded-full h-1.5 mt-3 overflow-hidden progress-bar-bg">
-                    <div class="h-1.5 rounded-full" style="background: var(--accent); width: ${totalPercent}%;"></div>
-                </div>
-                <p class="text-[10px] text-muted text-right mt-1.5" data-i18n="used">${totalPercent}% Used</p>
-                ` : `<p class="text-[10px] text-muted mt-2" data-i18n="unlimitedPlan">Unlimited Plan</p>`}
-            </div>
-
-            <!-- Daily Traffic -->
-            <div class="card-inner rounded-2xl p-4">
-                <p class="text-xs font-semibold uppercase tracking-widest text-secondary" data-i18n="dailyUsage">Daily Usage</p>
-                <div class="flex items-baseline gap-1.5 mt-2">
-                    <span class="text-2xl font-black" style="color: var(--text-primary);">${dailyGb}</span>
-                    <span class="text-xs text-secondary">/ ${limitDailyGb} GB</span>
-                </div>
-                ${limitDaily ? `
-                <div class="w-full rounded-full h-1.5 mt-3 overflow-hidden progress-bar-bg">
-                    <div class="h-1.5 rounded-full" style="background: var(--amber-text); width: ${dailyPercent}%;"></div>
-                </div>
-                <p class="text-[10px] text-muted text-right mt-1.5" data-i18n="used">${dailyPercent}% Used</p>
-                ` : `<p class="text-[10px] text-muted mt-2" data-i18n="noDailyLimit">No Daily Limit</p>`}
-            </div>
-
-            <!-- Expiration -->
-            <div class="card-inner rounded-2xl p-4 flex flex-col justify-between">
-                <div>
-                    <p class="text-xs font-semibold uppercase tracking-widest text-secondary" data-i18n="expDate">Expiration Date</p>
-                    <p class="text-lg font-bold mt-2" style="color: var(--text-primary);">${expiryDateTxt}</p>
-                </div>
-                <p class="text-[10px] text-muted mt-1" data-i18n="calendarLocal">Calendar Local Time</p>
+        <div class="space-y-1.5 relative z-10 min-w-0 flex-1">
+            <div class="text-2xl font-black text-emerald-600 dark:text-emerald-400 transition-all" id="stat-active-users">0</div>
+            <span class="text-[11px] text-emerald-500 dark:text-emerald-400 flex items-center gap-1 font-medium whitespace-nowrap">
+                <span class="w-2 h-2 bg-emerald-500 rounded-full animate-pulse"></span>
+                متصل در این لحظه
+            </span>
+        </div>
+    </div>
+	<div id="card-cf-requests" class="bg-white dark:bg-amoled-card border border-gray-200 dark:border-amoled-border rounded-2xl p-5 shadow-sm flex flex-col justify-between hover:shadow-md hover:border-orange-400 dark:hover:border-orange-500/50 transition duration-300 relative overflow-hidden group">
+	    <div class="absolute -right-4 -bottom-4 w-24 h-24 bg-orange-500/10 rounded-full blur-xl group-hover:scale-150 transition duration-500"></div>
+	    <div class="flex items-center justify-between relative z-10 mb-2">
+	        <span class="text-sm font-semibold text-gray-500 dark:text-zinc-400 whitespace-nowrap">ریکوئست‌های روزانه</span>
+	        <div class="p-2 bg-orange-50 dark:bg-orange-950/30 text-orange-600 dark:text-orange-400 rounded-xl flex-shrink-0">
+	            <svg class="w-6 h-6" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M3 15a4 4 0 004 4h9a5 5 0 10-.1-9.999 5.002 5.002 0 10-9.78 2.096A4.001 4.001 0 003 15z"></path></svg>
+	        </div>
+	    </div>
+	    <div class="space-y-2 relative z-10 min-w-0 flex-1">
+	        <div class="flex items-center gap-1">
+	            <span class="text-2xl font-black text-orange-600 dark:text-orange-400 transition-all" id="stat-cf-requests">0</span>
+	            <span class="text-xs font-bold text-gray-400 mr-1">/ 100k</span>
+	            <button id="cf-warning-btn" onclick="openUsageWarning()" class="hidden flex items-center justify-center w-5 h-5 bg-red-100 dark:bg-red-900/40 text-red-600 dark:text-red-400 rounded-full font-bold text-xs animate-bounce shadow-sm border border-red-300 dark:border-red-700 mr-2">!</button>
+	        </div>
+	        <div class="w-full bg-gray-100 dark:bg-zinc-800 rounded-full h-1.5 mt-1">
+	            <div id="stat-cf-progress" class="bg-orange-500 h-1.5 rounded-full transition-all duration-500" style="width: 0%"></div>
+	        </div>
+	        <span class="text-[11px] text-orange-500 dark:text-orange-400 flex items-center justify-between font-medium whitespace-nowrap mt-1">
+	            <span>Total: <span id="stat-cf-total">0</span></span>
+	            <span dir="ltr">Cloudflare</span>
+	        </span>
+	    </div>
+	</div>
+    <div class="bg-white dark:bg-amoled-card border border-gray-200 dark:border-amoled-border rounded-2xl p-5 shadow-sm flex flex-col justify-between hover:shadow-md hover:border-blue-400 dark:hover:border-blue-500/50 transition duration-300 relative overflow-hidden group">
+        <div class="absolute -right-4 -bottom-4 w-24 h-24 bg-blue-500/10 rounded-full blur-xl group-hover:scale-150 transition duration-500"></div>
+        <div class="flex items-center justify-between relative z-10 mb-2">
+            <span class="text-sm font-semibold text-gray-500 dark:text-zinc-400 whitespace-nowrap">حجم مصرفی (۳۰ روز)</span>
+            <div class="p-2 bg-blue-50 dark:bg-blue-950/30 text-blue-600 dark:text-blue-400 rounded-xl flex-shrink-0">
+                <svg class="w-6 h-6" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="1.5" d="M19 11H5m14 0a2 2 0 012 2v6a2 2 0 01-2 2H5a2 2 0 01-2-2v-6a2 2 0 012-2m14 0V9a2 2 0 00-2-2M5 11V9a2 2 0 012-2m0 0V5a2 2 0 012-2h6a2 2 0 012 2v2M7 7h10"></path></svg>
             </div>
         </div>
-
-        <!-- Connection Settings Title -->
-        <div>
-            <h2 class="text-lg font-bold mb-1 flex items-center gap-2" style="color: var(--text-primary);">
-                <span class="w-2.5 h-2.5 rounded-full" style="background: var(--accent);"></span>
-                <span data-i18n="integrationTitle">Integration Connections</span>
-            </h2>
-            <p class="text-xs text-secondary" data-i18n="integrationDesc">Add the correct configuration link based on your preferred format below.</p>
+        <div class="space-y-1.5 relative z-10 min-w-0 flex-1">
+            <div class="text-2xl font-black text-blue-600 dark:text-blue-400 transition-all whitespace-nowrap" id="stat-total-usage">0 GB</div>
+            <span class="text-[11px] text-blue-500 dark:text-blue-400 flex items-center gap-1 font-medium whitespace-nowrap">
+                <svg class="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M7 16a4 4 0 01-.88-7.903A5 5 0 1115.9 6L16 6a5 5 0 011 9.9M9 19l3 3m0 0l3-3m-3 3V10"></path></svg>
+                مصرف کل کاربران
+            </span>
         </div>
-
-        <!-- Connection Options -->
-        <div class="space-y-4">
-            <div class="card-inner p-5 rounded-2xl relative">
-                <div class="flex items-center justify-between mb-3">
+    </div>
+    <div class="bg-white dark:bg-amoled-card border border-gray-200 dark:border-amoled-border rounded-2xl p-5 shadow-sm flex flex-col justify-between hover:shadow-md hover:border-amber-400 dark:hover:border-amber-500/50 transition duration-300 relative overflow-hidden group">
+        <div class="absolute -right-4 -bottom-4 w-24 h-24 bg-amber-500/10 rounded-full blur-xl group-hover:scale-150 transition duration-500"></div>
+        <div class="flex items-center justify-between relative z-10 mb-2">
+            <span class="text-sm font-semibold text-gray-500 dark:text-zinc-400 whitespace-nowrap">پر مصرف‌ترین کاربر</span>
+            <div class="p-2 bg-amber-50 dark:bg-amber-950/30 text-amber-600 dark:text-amber-400 rounded-xl flex-shrink-0">
+                <svg class="w-6 h-6" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="1.5" d="M16 7a4 4 0 11-8 0 4 4 0 018 0zM12 14a7 7 0 00-7 7h14a7 7 0 00-7-7z"></path></svg>
+            </div>
+        </div>
+        <div class="space-y-1.5 relative z-10 min-w-0 flex-1">
+            <div class="text-xl font-black text-amber-600 dark:text-amber-400 transition-all truncate max-w-[150px]" id="stat-top-user">-</div>
+            <span class="text-[11px] text-amber-500 dark:text-amber-400 flex items-center gap-1 font-medium whitespace-nowrap" id="stat-top-user-usage">۰ GB مصرف شده</span>
+        </div>
+    </div>
+</div>
+        <div id="loading-state" class="text-center py-12">
+            <span class="text-gray-500 dark:text-gray-400">در حال بارگذاری کاربران...</span>
+        </div>
+        <div class="mb-6 flex flex-col md:flex-row gap-4 justify-between items-center bg-white dark:bg-amoled-card border border-gray-200 dark:border-amoled-border rounded-2xl p-4 shadow-sm">
+            <!-- Search Box -->
+            <div class="relative w-full md:w-80">
+                <input type="text" id="search-input" oninput="filterAndRenderUsers()" placeholder="جستجوی نام کاربری یا UUID..." class="w-full pl-3 pr-9 py-2.5 bg-gray-50 dark:bg-amoled-input border border-gray-300 dark:border-amoled-border rounded-xl focus:outline-none focus:ring-2 focus:ring-blue-500 text-sm">
+                <div class="absolute inset-y-0 right-0 flex items-center pr-3 pointer-events-none text-gray-400">
+                    <svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M21 21l-6-6m2-5a7 7 0 11-14 0 7 7 0 0114 0z"></path></svg>
+                </div>
+            </div>
+            <!-- Filters & Sorting -->
+            <div class="flex flex-wrap items-center gap-3 w-full md:w-auto">
+                <!-- Status Filter -->
+                <select id="filter-status" onchange="filterAndRenderUsers()" class="px-3 py-2.5 bg-gray-50 dark:bg-amoled-input border border-gray-300 dark:border-amoled-border rounded-xl text-sm focus:outline-none focus:ring-2 focus:ring-blue-500 text-gray-700 dark:text-zinc-300 cursor-pointer">
+                    <option value="all">🔍 همه وضعیت‌ها</option>
+                    <option value="active">✅ فعال</option>
+                    <option value="inactive">❌ غیرفعال</option>
+                    <option value="online">⚡ آنلاین</option>
+                    <option value="offline">💤 آفلاین</option>
+                    <option value="expired">⏳ منقضی شده / تمام شده</option>
+                </select>
+                <!-- Sorting -->
+                <select id="sort-users" onchange="filterAndRenderUsers()" class="px-3 py-2.5 bg-gray-50 dark:bg-amoled-input border border-gray-300 dark:border-amoled-border rounded-xl text-sm focus:outline-none focus:ring-2 focus:ring-blue-500 text-gray-700 dark:text-zinc-300 cursor-pointer">
+                    <option value="newest">📅 جدیدترین</option>
+                    <option value="name">🔤 نام کاربری (الفبا)</option>
+                    <option value="usage-desc">📊 بیشترین مصرف</option>
+                    <option value="usage-asc">📈 کمترین مصرف</option>
+                    <option value="expiry-asc">⏳ کمترین زمان باقی‌مانده</option>
+                </select>
+            </div>
+        </div>
+		<div class="flex items-center justify-between mb-4">
+			<h2 class="text-lg font-bold text-gray-800 dark:text-zinc-200">لیست کاربران</h2>
+			<button onclick="openCreateModal()" class="p-2 rounded-lg bg-blue-50 dark:bg-blue-900/30 border-2 border-blue-200 dark:border-blue-800/50 hover:bg-blue-100 dark:hover:bg-blue-900/50 transition-all duration-300 text-blue-600 dark:text-blue-400 shadow-sm hover:shadow hover:scale-110">
+    			<svg class="w-6 h-6" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2.5" d="M12 4v16m8-8H4"></path></svg>
+			</button>
+		</div>
+        <div id="users-table-container" class="hidden overflow-x-auto border border-gray-200 dark:border-amoled-border rounded-xl bg-white dark:bg-amoled-card">
+            <table class="w-full text-right border-collapse">
+                <thead>
+                    <tr class="bg-gray-100 dark:bg-zinc-900/50 border-b border-gray-200 dark:border-amoled-border text-xs text-gray-500 dark:text-gray-400 text-center">
+                        <th class="p-2 w-10 text-center"><input type="checkbox" id="select-all-users" onchange="toggleSelectAllUsers(this)" class="w-5 h-5 rounded-md border-2 border-gray-300 dark:border-zinc-700 text-blue-600 bg-white dark:bg-zinc-800 checked:bg-blue-600 checked:border-blue-600 focus:ring-blue-500/50 focus:ring-offset-0 transition-all duration-200 cursor-pointer hover:scale-105 active:scale-95"></th>
+                        <th class="p-4">نام کاربر و عملیات</th>
+                        <th class="p-2 border-r border-gray-200 dark:border-zinc-800">لینک ساب</th>
+                        <th class="p-2 border-r border-gray-200 dark:border-zinc-800">پروتکل</th>
+                        <th class="p-2 border-r border-gray-200 dark:border-zinc-800">پورت</th>
+                        <th class="p-2 border-r border-gray-200 dark:border-zinc-800">حجم</th>
+                        <th class="p-2 border-r border-gray-200 dark:border-zinc-800">ریکوئست</th>
+                        <th class="p-2 border-r border-gray-200 dark:border-zinc-800">زمان</th>
+                        <th class="p-2 border-r border-gray-200 dark:border-zinc-800">کاربران آنلاین</th>
+                        <th class="p-2 border-r border-gray-200 dark:border-zinc-800">تاریخ ساخت</th>
+                    </tr>
+                </thead>
+                <tbody id="users-tbody" class="divide-y divide-gray-150 dark:divide-amoled-border text-sm"></tbody>
+            </table>
+        </div>
+        <div id="empty-state" class="hidden p-8 border border-dashed border-gray-300 dark:border-amoled-border rounded-2xl text-center">
+            <p class="text-gray-500 dark:text-gray-400">کاربری وجود ندارد. برای ساخت اولین کاربر روی دکمه «افزودن کاربر جدید» کلیک کنید.</p>
+        </div>
+    </main>
+<div id="path-warning-modal" class="fixed inset-0 z-[70] flex items-center justify-center p-4 bg-black/60 backdrop-blur-sm opacity-0 pointer-events-none transition-all duration-300 ease-out">
+    <div class="w-full max-w-md bg-white dark:bg-amoled-card border border-red-500/50 rounded-3xl shadow-2xl overflow-hidden p-6 text-center transition-all transform duration-300 opacity-0 scale-95 ease-out">
+        <div class="inline-flex items-center justify-center w-16 h-16 rounded-full bg-red-100 dark:bg-red-900/30 text-red-500 mb-4 shadow-inner">
+            <svg class="w-8 h-8" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2.5" d="M12 9v2m0 4h.01m-6.938 4h13.856c1.54 0 2.502-1.667 1.732-3L13.732 4c-.77-1.333-2.694-1.333-3.464 0L3.34 16c-.77 1.333.192 3 1.732 3z"></path></svg>
+        </div>
+        <h3 class="font-black text-xl text-gray-900 dark:text-white mb-2">تغییر مهم در ساختار کانفیگ‌ها</h3>
+        <p class="text-sm text-gray-600 dark:text-gray-400 mb-6 leading-relaxed font-medium">
+            به دلیل ارتقای امنیت و تغییر مسیر (Path) اتصال ، کانفیگ‌های قبل از نسخه 1.3.4 غیرفعال شده‌اند. درصورت عدم اتصال لطفاً ساب خود را بروزرسانی کنید .
+        </p>
+        <button onclick="closePathWarning()" class="w-full py-3.5 bg-red-600 hover:bg-red-700 text-white font-black rounded-xl text-sm transition duration-300 shadow-lg shadow-red-500/25">
+            متوجه شدم، کانفیگ‌های جدید را می‌گیرم 
+        </button>
+    </div>
+</div>
+<div id="usage-warning-modal" class="fixed inset-0 z-[80] flex items-center justify-center p-4 bg-black/60 backdrop-blur-sm opacity-0 pointer-events-none transition-all duration-300 ease-out">
+    <div class="w-full max-w-md bg-white dark:bg-amoled-card border border-orange-500/50 rounded-3xl shadow-2xl overflow-hidden p-6 text-center transition-all transform duration-300 opacity-0 scale-95 ease-out">
+        <div class="inline-flex items-center justify-center w-16 h-16 rounded-full bg-orange-100 dark:bg-orange-900/30 text-orange-500 mb-4 shadow-inner">
+            <svg class="w-8 h-8" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2.5" d="M12 9v2m0 4h.01m-6.938 4h13.856c1.54 0 2.502-1.667 1.732-3L13.732 4c-.77-1.333-2.694-1.333-3.464 0L3.34 16c-.77 1.333.192 3 1.732 3z"></path></svg>
+        </div>
+        <h3 class="font-black text-xl text-gray-900 dark:text-white mb-2">هشدار محدودیت درخواست روزانه</h3>
+        <p class="text-sm text-gray-600 dark:text-gray-400 mb-6 leading-relaxed font-medium">
+            درخواست‌های روزانه کلودفلر شما از ۹۰,۰۰۰ عبور کرده است. در صورت عبور از محدودیت رایگان ۱۰۰,۰۰۰ درخواست، دسترسی به پنل و اتصالات تا ساعت ۳:۳۰ بامداد (به وقت ایران) قطع خواهد شد.
+        </p>
+        <button onclick="closeUsageWarning()" class="w-full py-3.5 bg-orange-600 hover:bg-orange-700 text-white font-black rounded-xl text-sm transition duration-300 shadow-lg shadow-orange-500/25">
+            متوجه شدم
+        </button>
+    </div>
+</div>
+    <div id="user-modal" class="fixed inset-0 z-50 flex items-center justify-center p-4 bg-black/70 opacity-0 pointer-events-none transition-opacity duration-200 ease-out">
+        <div id="user-modal-card" class="w-full max-w-xl bg-white dark:bg-zinc-950 border border-gray-200 dark:border-zinc-800 rounded-2xl shadow-xl overflow-hidden transition-[opacity,transform] duration-200 opacity-0 scale-95 ease-out flex flex-col max-h-[90vh] transform-gpu" style="will-change: transform, opacity;">
+            <div class="px-6 py-4 border-b border-gray-150 dark:border-zinc-800/80 flex justify-between items-center bg-gray-50/50 dark:bg-zinc-900/30">
+                <div class="flex items-center gap-2">
+                    <div class="w-2.5 h-2.5 rounded-full bg-blue-500"></div>
+                    <h3 id="modal-title" class="font-bold text-gray-900 dark:text-zinc-100 text-base">ایجاد کاربر جدید</h3>
+                </div>
+                <button onclick="toggleModal(false)" class="p-1 rounded-lg hover:bg-gray-150 dark:hover:bg-zinc-800/60 text-gray-400 hover:text-gray-650 dark:hover:text-zinc-200 transition">
+                    <svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M6 18L18 6M6 6l12 12"></path></svg>
+                </button>
+            </div>
+            <form id="create-user-form" class="p-6 space-y-5 overflow-y-auto flex-1 overscroll-contain" style="-webkit-overflow-scrolling: touch; transform: translate3d(0,0,0); will-change: scroll-position, transform;" onsubmit="handleFormSubmit(event)">
+                <div class="space-y-4">
                     <div>
-                        <span class="text-xs font-bold" style="color: var(--green-text);" data-i18n="universalLink">Universal Auto-Detecting Configuration Link</span>
-                        <p class="text-[11px] text-secondary mt-1" data-i18n="universalDesc">This universal URL automatically detects your client and delivers the optimal format.</p>
+                        <label class="block text-xs font-bold text-gray-500 dark:text-zinc-400 mb-2 uppercase tracking-wider">نام کاربری</label>
+                        <div class="relative">
+                            <span class="absolute inset-y-0 right-0 flex items-center pr-3.5 pointer-events-none text-gray-400">
+                                <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M16 7a4 4 0 11-8 0 4 4 0 018 0zM12 14a7 7 0 00-7 7h14a7 7 0 00-7-7z"></path></svg>
+                            </span>
+                            <input type="text" id="input-name" placeholder="ali" class="w-full pl-3 pr-10 py-2.5 bg-gray-50 dark:bg-zinc-900 border border-gray-200 dark:border-zinc-800 rounded-xl focus:outline-none focus:ring-2 focus:ring-blue-500/50 text-sm font-semibold text-gray-800 dark:text-zinc-100 placeholder-gray-400/80 transition" required>
+                        </div>
+                    </div>
+                    <div class="grid grid-cols-2 sm:grid-cols-4 gap-4">
+                        <div>
+                            <label class="block text-[10px] sm:text-xs font-bold text-gray-500 dark:text-zinc-400 mb-2 uppercase tracking-wider">حجم (GB)</label>
+                            <div class="relative">
+                                <span class="absolute inset-y-0 right-0 flex items-center pr-3.5 pointer-events-none text-gray-400">
+                                    <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M19 11H5m14 0a2 2 0 012 2v6a2 2 0 01-2 2H5a2 2 0 01-2-2v-6a2 2 0 012-2m14 0V9a2 2 0 00-2-2M5 11V9a2 2 0 012-2m0 0V5a2 2 0 012-2h6a2 2 0 012 2v2M7 7h10"></path></svg>
+                                </span>
+                                <input type="number" id="input-limit" min="0" step="any" placeholder="نامحدود" class="w-full pl-3 pr-10 py-2.5 bg-gray-50 dark:bg-zinc-900 border border-gray-200 dark:border-zinc-800 rounded-xl focus:outline-none focus:ring-2 focus:ring-blue-500/50 text-sm font-semibold text-gray-800 dark:text-zinc-100 placeholder-gray-400/80 transition">
+                            </div>
+                        </div>
+                        <div>
+                            <label class="block text-[10px] sm:text-xs font-bold text-gray-500 dark:text-zinc-400 mb-2 uppercase tracking-wider">اعتبار (روز)</label>
+                            <div class="relative">
+                                <span class="absolute inset-y-0 right-0 flex items-center pr-3.5 pointer-events-none text-gray-400">
+                                    <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 8v4l3 3m6-3a9 9 0 11-18 0 9 9 0 0118 0z"></path></svg>
+                                </span>
+                                <input type="number" id="input-expiry" min="0" placeholder="نامحدود" class="w-full pl-3 pr-10 py-2.5 bg-gray-50 dark:bg-zinc-900 border border-gray-200 dark:border-zinc-800 rounded-xl focus:outline-none focus:ring-2 focus:ring-blue-500/50 text-sm font-semibold text-gray-800 dark:text-zinc-100 placeholder-gray-400/80 transition">
+                            </div>
+                        </div>
+                        <div>
+                            <label class="block text-[10px] sm:text-xs font-bold text-gray-500 dark:text-zinc-400 mb-2 uppercase tracking-wider">سقف ریکوئست</label>
+                            <div class="relative">
+                                <span class="absolute inset-y-0 right-0 flex items-center pr-3.5 pointer-events-none text-gray-400">
+                                    <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M13 10V3L4 14h7v7l9-11h-7z"></path></svg>
+                                </span>
+                                <input type="number" id="input-req-limit" min="0" placeholder="نامحدود" class="w-full pl-3 pr-10 py-2.5 bg-gray-50 dark:bg-zinc-900 border border-gray-200 dark:border-zinc-800 rounded-xl focus:outline-none focus:ring-2 focus:ring-blue-500/50 text-sm font-semibold text-gray-800 dark:text-zinc-100 placeholder-gray-400/80 transition">
+                            </div>
+                        </div>
+                        <div>
+                            <label class="block text-[10px] sm:text-xs font-bold text-gray-500 dark:text-zinc-400 mb-2 uppercase tracking-wider">محدودیت کاربر</label>
+                            <div class="relative">
+                                <span class="absolute inset-y-0 right-0 flex items-center pr-3.5 pointer-events-none text-gray-400">
+                                    <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M17 20h5v-2a3 3 0 00-5.356-1.857M17 20H7m10 0v-2c0-.656-.126-1.283-.356-1.857M7 20H2v-2a3 3 0 015.356-1.857M7 20v-2c0-.656.126-1.283.356-1.857m0 0a5.002 5.002 0 019.288 0M15 7a3 3 0 11-6 0 3 3 0 016 0zm6 3a2 2 0 11-4 0 2 2 0 014 0zM7 10a2 2 0 11-4 0 2 2 0 014 0z"></path></svg>
+                                </span>
+                                <input type="number" id="input-ip-limit" min="0" placeholder="نامحدود" class="w-full pl-3 pr-10 py-2.5 bg-gray-50 dark:bg-zinc-900 border border-gray-200 dark:border-zinc-800 rounded-xl focus:outline-none focus:ring-2 focus:ring-blue-500/50 text-sm font-semibold text-gray-800 dark:text-zinc-100 placeholder-gray-400/80 transition">
+                            </div>
+                        </div>
                     </div>
                 </div>
-                <div class="relative flex items-center">
-                    <input type="text" id="sub-norm" readonly value="${syncNormal}" class="input-field w-full px-4 py-3 rounded-xl text-xs font-mono pr-16 truncate outline-none" style="color: var(--text-secondary);">
-                    <div class="absolute right-2 flex gap-1">
-                        <button onclick="copyLink('sub-norm')" class="btn-primary px-3 py-2 rounded-lg text-xs font-bold transition-colors" data-i18n="copy">Copy</button>
-                        <button onclick="showQRModal()" class="btn-secondary px-3 py-2 rounded-lg text-xs font-bold transition-colors" data-i18n="qr">QR</button>
+                <div class="pt-2 border-t border-gray-100 dark:border-zinc-900">
+                    <label class="block text-xs font-bold text-gray-500 dark:text-zinc-400 mb-3 uppercase tracking-wider">پورت‌های اتصال (انتخاب چندگانه)</label>
+                    <div class="space-y-4">
+                        <div class="p-4 bg-gray-50/50 dark:bg-zinc-900/20 border border-gray-200/60 dark:border-zinc-800 rounded-2xl shadow-sm">
+                            <div class="flex items-center gap-1.5 mb-3">
+                                <span class="flex h-2 w-2 rounded-full bg-blue-500 shadow-sm"></span>
+                                <span class="text-xs font-bold text-blue-600 dark:text-blue-400">🔒 پورت‌های امن (TLS)</span>
+                            </div>
+                            <div class="grid grid-cols-3 sm:grid-cols-4 gap-2" id="tls-ports-list">
+                                <!-- Filled dynamically -->
+                            </div>
+                        </div>
+                        <div class="p-4 bg-gray-50/50 dark:bg-zinc-900/20 border border-gray-200/60 dark:border-zinc-800 rounded-2xl shadow-sm">
+                            <div class="flex items-center gap-1.5 mb-3">
+                                <span class="flex h-2 w-2 rounded-full bg-amber-500 shadow-sm"></span>
+                                <span class="text-xs font-bold text-amber-600 dark:text-amber-400">🔓 پورت‌های معمولی (Non-TLS)</span>
+                            </div>
+                            <div class="grid grid-cols-3 sm:grid-cols-4 gap-2" id="nontls-ports-list">
+                                <!-- Filled dynamically -->
+                            </div>
+                        </div>
                     </div>
                 </div>
-                <p class="text-[10px] text-muted mt-2" data-i18n="universalNote">Real-time import of complete nodes list with dynamic configuration update.</p>
+                <div class="pt-4 border-t border-gray-100 dark:border-zinc-900 space-y-4">
+					<div>
+    					<div class="flex items-center justify-between mb-2">
+        					<label class="block text-xs font-bold text-gray-500 dark:text-zinc-400 uppercase tracking-wider">آیپی تمیز کلودفلر (اختیاری)</label>
+        					<button type="button" onclick="openIpSelectorModal()" class="px-2.5 py-1 bg-indigo-50 dark:bg-indigo-900/30 text-indigo-600 dark:text-indigo-400 hover:bg-indigo-100 dark:hover:bg-indigo-900/50 rounded-lg text-xs font-bold transition border border-indigo-200 dark:border-indigo-800">مخزن آیپی تمیز</button>
+    					</div>
+    					<textarea id="input-ips" rows="2" placeholder="104.16.0.1" class="w-full px-3 py-2.5 bg-gray-50 dark:bg-zinc-900 border border-gray-200 dark:border-zinc-800 rounded-xl focus:outline-none focus:ring-2 focus:ring-blue-500/50 text-xs font-mono text-gray-800 dark:text-zinc-100 placeholder-gray-400/80 transition resize-none"></textarea>
+					</div>
+                    <div>
+                        <label class="block text-xs font-bold text-gray-500 dark:text-zinc-400 mb-2 uppercase tracking-wider">شبیه‌ساز اثر انگشت مرورگر (Fingerprint)</label>
+                        <div class="relative">
+                            <select id="fingerprint-select" class="w-full px-3 py-2.5 bg-gray-50 dark:bg-zinc-900 border border-gray-200 dark:border-zinc-800 rounded-xl focus:outline-none focus:ring-2 focus:ring-blue-500/50 text-xs font-semibold text-gray-700 dark:text-zinc-300 cursor-pointer appearance-none">
+                                <option value="chrome">🌐 Chrome</option>
+                                <option value="firefox">🦊 Firefox</option>
+                                <option value="safari">🧭 Safari</option>
+                                <option value="ios" selected>📱 iOS Device (پیش‌فرض)</option>
+                                <option value="android">🤖 Android Device</option>
+                                <option value="edge">🌀 Microsoft Edge</option>
+                                <option value="360">🔒 360 Browser</option>
+                                <option value="qq">💬 QQ Browser</option>
+                                <option value="random">🎲 Random (اتفاقی)</option>
+                                <option value="randomized">🎭 Randomized (پویا)</option>
+                            </select>
+                            <div class="pointer-events-none absolute inset-y-0 left-0 flex items-center pl-3 text-gray-500 dark:text-zinc-400">
+                                <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M19 9l-7 7-7-7"></path></svg>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+                <div class="pt-4 flex gap-3">
+                    <button type="button" onclick="toggleModal(false)" class="flex-1 py-3 bg-gray-100 hover:bg-gray-200 dark:bg-zinc-800 dark:hover:bg-zinc-700/80 text-gray-700 dark:text-zinc-300 font-bold rounded-xl text-sm transition duration-200">انصراف</button>
+                    <button type="submit" id="submit-btn" class="flex-1 py-3 bg-gradient-to-r from-blue-600 to-indigo-600 hover:from-blue-700 hover:to-indigo-700 text-white font-bold rounded-xl text-sm transition duration-200 shadow-md shadow-blue-500/10 hover:shadow-lg">ایجاد کاربر</button>
+                </div>
+            </form>
+        </div>
+    </div>
+<div id="ip-selector-modal" class="fixed inset-0 z-[60] flex items-center justify-center p-4 bg-black/60 backdrop-blur-sm opacity-0 pointer-events-none transition-all duration-300 ease-out">
+    <div class="w-full max-w-sm bg-white dark:bg-amoled-card border border-gray-200 dark:border-amoled-border rounded-2xl shadow-xl overflow-hidden transition-all transform duration-300 opacity-0 scale-95 ease-out">
+        <div class="px-6 py-4 border-b border-gray-150 dark:border-amoled-border flex justify-between items-center bg-gray-50 dark:bg-zinc-900/50">
+            <h3 class="font-bold text-gray-900 dark:text-zinc-100 text-sm">مخزن آیپی تمیز</h3>
+            <button type="button" onclick="toggleIpSelectorModal(false)" class="text-gray-400 hover:text-gray-600 dark:hover:text-zinc-200">
+                <svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M6 18L18 6M6 6l12 12"></path></svg>
+            </button>
+        </div>
+        <div class="p-6 space-y-4">
+            <div id="ip-loading-state" class="text-center text-sm text-gray-500 dark:text-zinc-400 hidden">
+                Loading IPs...
+            </div>
+            <div id="ip-selection-form" class="space-y-4">
+                <div>
+                    <label class="block text-xs font-medium mb-1.5 text-gray-700 dark:text-zinc-300">اوپراتور</label>
+                    <select id="ip-operator-select" class="w-full px-3 py-2.5 bg-gray-50 dark:bg-amoled-input border border-gray-300 dark:border-amoled-border rounded-xl text-xs focus:outline-none focus:ring-2 focus:ring-blue-500 text-gray-700 dark:text-zinc-300 cursor-pointer">
+                        <option value="all">All</option>
+                    </select>
+                </div>
+                <div>
+                    <label class="block text-xs font-medium mb-1.5 text-gray-700 dark:text-zinc-300">تعداد</label>
+                    <input type="number" id="ip-count-input" min="1" value="10" dir="ltr" class="w-full px-3 py-2.5 bg-gray-50 dark:bg-amoled-input border border-gray-300 dark:border-amoled-border rounded-xl focus:outline-none focus:ring-2 focus:ring-blue-500 text-xs font-mono text-center">
+                </div>
+            </div>
+            <div class="pt-4 flex gap-3">
+                <button type="button" onclick="toggleIpSelectorModal(false)" class="flex-1 py-2 bg-gray-100 hover:bg-gray-200 dark:bg-zinc-800 dark:hover:bg-zinc-700 font-medium rounded-xl text-xs transition">لغو</button>
+                <button type="button" onclick="applySelectedIps()" class="flex-1 py-2 bg-indigo-600 hover:bg-indigo-700 text-white font-medium rounded-xl text-xs transition">دریافت</button>
             </div>
         </div>
-
-        <!-- Action Buttons -->
-        <div class="pt-5 border-t grid grid-cols-1 sm:grid-cols-2 gap-4" style="border-color: var(--border-inner);">
-            <button onclick="fetchDecodedRawContent()" class="py-3 px-6 btn-primary rounded-2xl text-xs font-black transition-all flex items-center justify-center gap-2">
-                <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M8 16H6a2 2 0 01-2-2V6a2 2 0 012-2h8a2 2 0 012 2v2m-6 12h8a2 2 0 002-2v-8a2 2 0 00-2-2h-8a2 2 0 00-2 2v8a2 2 0 002 2z"></path></svg>
-                <span data-i18n="parsedContent">Retrieve Parsed Content</span>
+    </div>
+</div>
+    <div id="settings-modal" class="fixed inset-0 z-50 flex items-center justify-center p-4 bg-black/60 backdrop-blur-sm opacity-0 pointer-events-none transition-all duration-300 ease-out">
+        <div class="w-full max-w-md bg-white dark:bg-amoled-card border border-gray-200 dark:border-amoled-border rounded-2xl shadow-xl overflow-hidden transition-all transform duration-300 opacity-0 scale-95 ease-out flex flex-col max-h-[90vh]">
+            <div class="px-6 py-4 border-b border-gray-150 dark:border-amoled-border flex justify-between items-center bg-gray-50 dark:bg-zinc-900/50">
+                <h3 class="font-bold text-gray-900 dark:text-zinc-100">تنظیمات پنل</h3>
+                <button onclick="toggleSettingsModal(false)" class="text-gray-400 hover:text-gray-600 dark:hover:text-zinc-200">
+                    <svg class="w-6 h-6" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M6 18L18 6M6 6l12 12"></path></svg>
+                </button>
+            </div>
+            <div class="p-6 space-y-4 overflow-y-auto flex-1 overscroll-contain">
+                <div>
+                    <label class="block text-sm font-medium mb-1.5 text-gray-700 dark:text-zinc-300">موقعیت جغرافیایی پروکسی (Cloudflare)</label>
+                    <div class="relative">
+                        <select id="location-select" class="w-full pl-8 pr-3 py-2.5 bg-white dark:bg-amoled-input border border-gray-300 dark:border-amoled-border rounded-lg text-sm focus:outline-none focus:ring-2 focus:ring-blue-500 text-gray-700 dark:text-zinc-200 cursor-pointer appearance-none">
+                            <option value="">در حال بارگذاری...</option>
+                        </select>
+                        <div class="pointer-events-none absolute inset-y-0 left-0 flex items-center pl-3 text-gray-500 dark:text-zinc-400">
+                            <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M19 9l-7 7-7-7"></path></svg>
+                        </div>
+                    </div>
+                </div>
+                <div class="grid grid-cols-2 gap-4 pt-2 border-t border-gray-100 dark:border-zinc-800">
+                    <div>
+                        <label class="block text-sm font-medium mb-1.5 text-gray-700 dark:text-zinc-300">Fragment Length</label>
+                        <input type="text" id="frag-length" placeholder="20-30" class="w-full px-3 py-2.5 bg-white dark:bg-amoled-input border border-gray-300 dark:border-amoled-border rounded-lg focus:outline-none focus:ring-2 focus:ring-blue-500 text-sm text-center font-mono" dir="ltr">
+                    </div>
+                    <div>
+                        <label class="block text-sm font-medium mb-1.5 text-gray-700 dark:text-zinc-300">Fragment Interval</label>
+                        <input type="text" id="frag-interval" placeholder="1-2" class="w-full px-3 py-2.5 bg-white dark:bg-amoled-input border border-gray-300 dark:border-amoled-border rounded-lg focus:outline-none focus:ring-2 focus:ring-blue-500 text-sm text-center font-mono" dir="ltr">
+                    </div>
+                </div>
+                <!-- Change Password Section -->
+                <div class="pt-4 border-t border-gray-100 dark:border-zinc-800">
+                    <h4 class="text-sm font-bold mb-3 text-gray-800 dark:text-zinc-200">🔒 تغییر رمز عبور مدیریت</h4>
+                    <div class="space-y-3">
+                        <div>
+                            <label class="block text-[11px] text-gray-500 dark:text-gray-400 font-medium mb-1">رمز عبور فعلی</label>
+                            <input type="password" id="change-pwd-current" class="w-full px-3 py-2 bg-white dark:bg-amoled-input border border-gray-300 dark:border-amoled-border rounded-lg focus:outline-none focus:ring-2 focus:ring-blue-500 text-xs font-mono text-center">
+                        </div>
+                        <div>
+                            <label class="block text-[11px] text-gray-500 dark:text-gray-400 font-medium mb-1">رمز عبور جدید</label>
+                            <input type="password" id="change-pwd-new" class="w-full px-3 py-2 bg-white dark:bg-amoled-input border border-gray-300 dark:border-amoled-border rounded-lg focus:outline-none focus:ring-2 focus:ring-blue-500 text-xs font-mono text-center">
+                        </div>
+                        <button type="button" onclick="changeAdminPassword()" id="change-pwd-btn" class="w-full py-2 bg-gradient-to-r from-blue-600 to-indigo-600 hover:from-blue-700 hover:to-indigo-700 text-white font-semibold rounded-lg text-xs transition-all shadow-sm">تغییر رمز عبور</button>
+                    </div>
+                </div>
+                <!-- Backup & Restore Section -->
+                <div class="pt-4 border-t border-gray-100 dark:border-zinc-800">
+                    <h4 class="text-sm font-bold mb-3 text-gray-800 dark:text-zinc-200">💾 پشتیبان‌گیری و بازیابی</h4>
+                    <div class="grid grid-cols-2 gap-3">
+                        <button type="button" onclick="exportUsersBackup()" class="py-2.5 bg-indigo-50 dark:bg-indigo-950/20 text-indigo-600 dark:text-indigo-400 hover:bg-indigo-100 dark:hover:bg-indigo-900/30 border border-indigo-200 dark:border-indigo-900/50 rounded-xl text-xs font-bold transition flex items-center justify-center gap-1.5 shadow-sm">
+                            📤 پشتیبان گیری
+                        </button>
+                        <button type="button" onclick="triggerImportBackup()" class="py-2.5 bg-emerald-50 dark:bg-emerald-950/20 text-emerald-600 dark:text-emerald-400 hover:bg-emerald-100 dark:hover:bg-emerald-900/30 border border-emerald-200 dark:border-emerald-900/50 rounded-xl text-xs font-bold transition flex items-center justify-center gap-1.5 shadow-sm">
+                            📥 بازیابی
+                        </button>
+                    </div>
+                    <input type="file" id="backup-file-input" onchange="importUsersBackup(event)" accept=".json" class="hidden">
+                </div>
+                <div class="pt-4 flex gap-3">
+                    <button type="button" onclick="toggleSettingsModal(false)" class="flex-1 py-2 bg-gray-100 hover:bg-gray-200 dark:bg-zinc-800 dark:hover:bg-zinc-700 font-medium rounded-lg text-sm transition">انصراف</button>
+                    <button type="button" onclick="saveSettings()" id="save-settings-btn" class="flex-1 py-2 bg-blue-600 hover:bg-blue-700 text-white font-medium rounded-lg text-sm transition">ذخیره تنظیمات</button>
+                </div>
+            </div>
+        </div>
+    </div>
+    <!-- Floating Bulk Actions Bar -->
+    <div id="bulk-actions-bar" class="fixed bottom-4 left-1/2 -translate-x-1/2 z-[40] bg-white dark:bg-zinc-900/90 border border-gray-200 dark:border-zinc-800/80 px-6 py-4 rounded-2xl shadow-2xl flex flex-wrap items-center justify-between gap-4 w-[95%] max-w-4xl transition-all duration-300 transform translate-y-28 opacity-0 pointer-events-none backdrop-blur-md">
+        <div class="flex items-center gap-2">
+            <span class="w-3 h-3 bg-blue-500 rounded-full animate-pulse shadow-sm shadow-blue-500/50"></span>
+            <span id="bulk-selected-count" class="text-sm font-bold text-gray-800 dark:text-zinc-200">۰ کاربر انتخاب شده</span>
+        </div>
+        <div class="flex flex-wrap gap-2 justify-end">
+            <button onclick="bulkEdit()" class="px-3 py-1.5 bg-yellow-50 dark:bg-yellow-950/20 text-yellow-600 dark:text-yellow-400 hover:bg-yellow-100 dark:hover:bg-yellow-900/30 rounded-xl text-xs font-bold transition border border-yellow-200 dark:border-yellow-900/50 flex items-center gap-1">
+                ✏️ ویرایش گروهی
             </button>
-            <button onclick="window.print()" class="py-3 px-6 btn-secondary rounded-2xl text-xs font-bold transition-all flex items-center justify-center gap-2">
-                <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M17 17h2a2 2 0 002-2v-4a2 2 0 00-2-2H5a2 2 0 00-2 2v4a2 2 0 002 2h2m2 4h10a2 2 0 002-2v-3a2 2 0 00-2-2H9a2 2 0 00-2 2v3a2 2 0 002 2zm5-11h.01"></path></svg>
-                <span data-i18n="printConfig">Print Config Card</span>
+            <button onclick="bulkToggleStatus(1)" class="px-3 py-1.5 bg-emerald-50 dark:bg-emerald-950/20 text-emerald-600 dark:text-emerald-400 hover:bg-emerald-100 dark:hover:bg-emerald-900/30 rounded-xl text-xs font-bold transition border border-emerald-200 dark:border-emerald-900/50 flex items-center gap-1">
+                ✅ فعال‌سازی
+            </button>
+            <button onclick="bulkToggleStatus(0)" class="px-3 py-1.5 bg-amber-50 dark:bg-amber-950/20 text-amber-600 dark:text-amber-400 hover:bg-amber-100 dark:hover:bg-amber-900/30 rounded-xl text-xs font-bold transition border border-amber-200 dark:border-amber-900/50 flex items-center gap-1">
+                ❌ غیرفعال‌سازی
+            </button>
+            <button onclick="bulkReset('volume')" class="px-3 py-1.5 bg-blue-50 dark:bg-blue-950/20 text-blue-600 dark:text-blue-400 hover:bg-blue-100 dark:hover:bg-blue-900/30 rounded-xl text-xs font-bold transition border border-blue-200 dark:border-blue-900/50 flex items-center gap-1">
+                📊 ریست حجم
+            </button>
+            <button onclick="bulkReset('req')" class="px-3 py-1.5 bg-sky-50 dark:bg-sky-950/20 text-sky-600 dark:text-sky-400 hover:bg-sky-100 dark:hover:bg-sky-900/30 rounded-xl text-xs font-bold transition border border-sky-200 dark:border-sky-900/50 flex items-center gap-1">
+                ⚡ ریست ریکوئست
+            </button>
+            <button onclick="bulkReset('time')" class="px-3 py-1.5 bg-purple-50 dark:bg-purple-950/20 text-purple-600 dark:text-purple-400 hover:bg-purple-100 dark:hover:bg-purple-900/30 rounded-xl text-xs font-bold transition border border-purple-200 dark:border-purple-900/50 flex items-center gap-1">
+                ⏳ ریست زمان
+            </button>
+            <button onclick="bulkDelete()" class="px-3 py-1.5 bg-red-50 dark:bg-red-950/30 text-red-600 dark:text-red-450 hover:bg-red-100 dark:hover:bg-red-900/40 rounded-xl text-xs font-bold transition border border-red-200 dark:border-red-900/50 flex items-center gap-1">
+                🗑️ حذف گروهی
             </button>
         </div>
     </div>
-
-    <!-- QR Code Modal -->
-    <div id="qr-modal" class="fixed inset-0 modal-overlay backdrop-blur-md z-50 hidden items-center justify-center p-4">
-        <div class="modal-card rounded-3xl max-w-sm w-full p-6 text-center space-y-4">
-            <h3 id="qr-title" class="text-lg font-black" style="color: var(--text-primary);"></h3>
-            <div class="bg-white p-4 rounded-2xl inline-block mx-auto">
-                <img id="qr-img" src="" alt="QR Code" class="w-48 h-48">
+    <!-- Bulk Edit Modal -->
+    <div id="bulk-edit-modal" class="fixed inset-0 z-[80] flex items-center justify-center p-4 bg-black/70 opacity-0 pointer-events-none transition-opacity duration-200 ease-out">
+        <div id="bulk-edit-modal-card" class="w-full max-w-xl bg-white dark:bg-zinc-950 border border-gray-200 dark:border-zinc-800 rounded-2xl shadow-xl overflow-hidden transition-[opacity,transform] duration-200 opacity-0 scale-95 ease-out flex flex-col max-h-[90vh] transform-gpu" style="will-change: transform, opacity;">
+            <div class="px-6 py-4 border-b border-gray-150 dark:border-zinc-800/80 flex justify-between items-center bg-gray-50/50 dark:bg-zinc-900/30">
+                <div class="flex items-center gap-2">
+                    <div class="w-2.5 h-2.5 rounded-full bg-yellow-500"></div>
+                    <h3 class="font-bold text-gray-900 dark:text-zinc-100 text-base">ویرایش گروهی کاربران</h3>
+                </div>
+                <button onclick="toggleBulkEditModal(false)" class="p-1 rounded-lg hover:bg-gray-150 dark:hover:bg-zinc-800/60 text-gray-400 hover:text-gray-650 dark:hover:text-zinc-200 transition">
+                    <svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M6 18L18 6M6 6l12 12"></path></svg>
+                </button>
             </div>
-            <p id="qr-text" class="text-[10px] font-mono break-all p-3 rounded-xl max-h-24 overflow-y-auto" style="color: var(--text-muted); background: var(--bg-input); border: 1px solid var(--border-inner);"></p>
-            <button onclick="closeQRModal()" class="w-full py-2.5 btn-primary rounded-xl text-xs font-bold transition-colors" data-i18n="close">Close</button>
+            <form id="bulk-edit-form" class="p-6 space-y-5 overflow-y-auto flex-1 overscroll-contain" style="-webkit-overflow-scrolling: touch; transform: translate3d(0,0,0); will-change: scroll-position, transform;" onsubmit="handleBulkEditSubmit(event)">
+                <p class="text-xs text-amber-600 dark:text-amber-400 font-semibold mb-2">💡 تغییرات فقط روی بخش‌هایی اعمال می‌شوند که دکمه فعال‌ساز تغییر (چپ) آن‌ها روشن باشد.</p>
+                <div class="space-y-4">
+                    <!-- Limit GB -->
+                    <div class="flex items-center gap-3 border border-gray-100 dark:border-zinc-900 p-3 rounded-xl bg-gray-50/20 dark:bg-zinc-900/10">
+                        <label class="relative inline-flex items-center cursor-pointer select-none">
+                            <input type="checkbox" id="bulk-apply-limit" class="sr-only peer">
+                            <div class="w-9 h-5 bg-gray-200 peer-focus:outline-none rounded-full peer dark:bg-zinc-700 peer-checked:after:translate-x-full peer-checked:after:border-white after:content-[''] after:absolute after:top-[2px] after:left-[2px] after:bg-white after:border-gray-300 after:border after:rounded-full after:h-4 after:w-4 after:transition-all dark:border-gray-600 peer-checked:bg-blue-600"></div>
+                        </label>
+                        <div class="flex-1">
+                            <label class="block text-xs font-bold text-gray-500 dark:text-zinc-400 mb-1 uppercase tracking-wider">حجم (GB)</label>
+                            <input type="number" id="bulk-input-limit" min="0" step="any" placeholder="بدون تغییر" class="w-full px-3 py-2 bg-gray-50 dark:bg-zinc-900 border border-gray-200 dark:border-zinc-800 rounded-xl focus:outline-none focus:ring-2 focus:ring-blue-500/50 text-sm font-semibold text-gray-800 dark:text-zinc-100 placeholder-gray-400/80 transition">
+                        </div>
+                    </div>
+                    <!-- Expiry Days -->
+                    <div class="flex items-center gap-3 border border-gray-100 dark:border-zinc-900 p-3 rounded-xl bg-gray-50/20 dark:bg-zinc-900/10">
+                        <label class="relative inline-flex items-center cursor-pointer select-none">
+                            <input type="checkbox" id="bulk-apply-expiry" class="sr-only peer">
+                            <div class="w-9 h-5 bg-gray-200 peer-focus:outline-none rounded-full peer dark:bg-zinc-700 peer-checked:after:translate-x-full peer-checked:after:border-white after:content-[''] after:absolute after:top-[2px] after:left-[2px] after:bg-white after:border-gray-300 after:border after:rounded-full after:h-4 after:w-4 after:transition-all dark:border-gray-600 peer-checked:bg-blue-600"></div>
+                        </label>
+                        <div class="flex-1">
+                            <label class="block text-xs font-bold text-gray-500 dark:text-zinc-400 mb-1 uppercase tracking-wider">اعتبار (روز)</label>
+                            <input type="number" id="bulk-input-expiry" min="0" placeholder="بدون تغییر" class="w-full px-3 py-2 bg-gray-50 dark:bg-zinc-900 border border-gray-200 dark:border-zinc-800 rounded-xl focus:outline-none focus:ring-2 focus:ring-blue-500/50 text-sm font-semibold text-gray-800 dark:text-zinc-100 placeholder-gray-400/80 transition">
+                        </div>
+                    </div>
+                    <!-- Req Limit -->
+                    <div class="flex items-center gap-3 border border-gray-100 dark:border-zinc-900 p-3 rounded-xl bg-gray-50/20 dark:bg-zinc-900/10">
+                        <label class="relative inline-flex items-center cursor-pointer select-none">
+                            <input type="checkbox" id="bulk-apply-req-limit" class="sr-only peer">
+                            <div class="w-9 h-5 bg-gray-200 peer-focus:outline-none rounded-full peer dark:bg-zinc-700 peer-checked:after:translate-x-full peer-checked:after:border-white after:content-[''] after:absolute after:top-[2px] after:left-[2px] after:bg-white after:border-gray-300 after:border after:rounded-full after:h-4 after:w-4 after:transition-all dark:border-gray-600 peer-checked:bg-blue-600"></div>
+                        </label>
+                        <div class="flex-1">
+                            <label class="block text-xs font-bold text-gray-500 dark:text-zinc-400 mb-1 uppercase tracking-wider">سقف ریکوئست</label>
+                            <input type="number" id="bulk-input-req-limit" min="0" placeholder="بدون تغییر" class="w-full px-3 py-2 bg-gray-50 dark:bg-zinc-900 border border-gray-200 dark:border-zinc-800 rounded-xl focus:outline-none focus:ring-2 focus:ring-blue-500/50 text-sm font-semibold text-gray-800 dark:text-zinc-100 placeholder-gray-400/80 transition">
+                        </div>
+                    </div>
+                    <!-- IP Limit -->
+                    <div class="flex items-center gap-3 border border-gray-100 dark:border-zinc-900 p-3 rounded-xl bg-gray-50/20 dark:bg-zinc-900/10">
+                        <label class="relative inline-flex items-center cursor-pointer select-none">
+                            <input type="checkbox" id="bulk-apply-ip-limit" class="sr-only peer">
+                            <div class="w-9 h-5 bg-gray-200 peer-focus:outline-none rounded-full peer dark:bg-zinc-700 peer-checked:after:translate-x-full peer-checked:after:border-white after:content-[''] after:absolute after:top-[2px] after:left-[2px] after:bg-white after:border-gray-300 after:border after:rounded-full after:h-4 after:w-4 after:transition-all dark:border-gray-600 peer-checked:bg-blue-600"></div>
+                        </label>
+                        <div class="flex-1">
+                            <label class="block text-xs font-bold text-gray-500 dark:text-zinc-400 mb-1 uppercase tracking-wider">محدودیت کاربر</label>
+                            <input type="number" id="bulk-input-ip-limit" min="0" placeholder="بدون تغییر" class="w-full px-3 py-2 bg-gray-50 dark:bg-zinc-900 border border-gray-200 dark:border-zinc-800 rounded-xl focus:outline-none focus:ring-2 focus:ring-blue-500/50 text-sm font-semibold text-gray-800 dark:text-zinc-100 placeholder-gray-400/80 transition">
+                        </div>
+                    </div>
+                    <!-- Fingerprint -->
+                    <div class="flex items-center gap-3 border border-gray-100 dark:border-zinc-900 p-3 rounded-xl bg-gray-50/20 dark:bg-zinc-900/10">
+                        <label class="relative inline-flex items-center cursor-pointer select-none">
+                            <input type="checkbox" id="bulk-apply-fingerprint" class="sr-only peer">
+                            <div class="w-9 h-5 bg-gray-200 peer-focus:outline-none rounded-full peer dark:bg-zinc-700 peer-checked:after:translate-x-full peer-checked:after:border-white after:content-[''] after:absolute after:top-[2px] after:left-[2px] after:bg-white after:border-gray-300 after:border after:rounded-full after:h-4 after:w-4 after:transition-all dark:border-gray-600 peer-checked:bg-blue-600"></div>
+                        </label>
+                        <div class="flex-1">
+                            <label class="block text-xs font-bold text-gray-500 dark:text-zinc-400 mb-1.5 uppercase tracking-wider">Fingerprint</label>
+                            <select id="bulk-fingerprint-select" class="w-full px-3 py-2.5 bg-gray-50 dark:bg-zinc-900 border border-gray-200 dark:border-zinc-800 rounded-xl focus:outline-none focus:ring-2 focus:ring-blue-500/50 text-xs font-semibold text-gray-700 dark:text-zinc-300 cursor-pointer">
+                                <option value="chrome">🌐 Chrome</option>
+                                <option value="firefox">🦊 Firefox</option>
+                                <option value="safari">🧭 Safari</option>
+                                <option value="ios">📱 iOS Device</option>
+                                <option value="android">🤖 Android Device</option>
+                                <option value="edge">🌀 Microsoft Edge</option>
+                                <option value="360">🔒 360 Browser</option>
+                                <option value="qq">💬 QQ Browser</option>
+                                <option value="random">🎲 Random (اتفاقی)</option>
+                                <option value="randomized">🎭 Randomized (پویا)</option>
+                            </select>
+                        </div>
+                    </div>
+                    <!-- Ports -->
+                    <div class="flex items-center gap-3 border border-gray-100 dark:border-zinc-900 p-3 rounded-xl bg-gray-50/20 dark:bg-zinc-900/10">
+                        <label class="relative inline-flex items-center cursor-pointer select-none">
+                            <input type="checkbox" id="bulk-apply-ports" class="sr-only peer">
+                            <div class="w-9 h-5 bg-gray-200 peer-focus:outline-none rounded-full peer dark:bg-zinc-700 peer-checked:after:translate-x-full peer-checked:after:border-white after:content-[''] after:absolute after:top-[2px] after:left-[2px] after:bg-white after:border-gray-300 after:border after:rounded-full after:h-4 after:w-4 after:transition-all dark:border-gray-600 peer-checked:bg-blue-600"></div>
+                        </label>
+                        <div class="flex-1 space-y-2">
+                            <label class="block text-xs font-bold text-gray-500 dark:text-zinc-400 uppercase tracking-wider">پورت‌های اتصال (TLS و غیر TLS)</label>
+                            <div class="grid grid-cols-4 gap-2">
+                                <label class="flex items-center gap-1 text-[11px] text-gray-700 dark:text-zinc-300 cursor-pointer"><input type="checkbox" name="bulk-ports" value="443" class="rounded border-gray-300 dark:border-zinc-800 text-blue-600 focus:ring-blue-500"> 443</label>
+                                <label class="flex items-center gap-1 text-[11px] text-gray-700 dark:text-zinc-300 cursor-pointer"><input type="checkbox" name="bulk-ports" value="80" class="rounded border-gray-300 dark:border-zinc-800 text-blue-600 focus:ring-blue-500"> 80</label>
+                                <label class="flex items-center gap-1 text-[11px] text-gray-700 dark:text-zinc-300 cursor-pointer"><input type="checkbox" name="bulk-ports" value="2053" class="rounded border-gray-300 dark:border-zinc-800 text-blue-600 focus:ring-blue-500"> 2053</label>
+                                <label class="flex items-center gap-1 text-[11px] text-gray-700 dark:text-zinc-300 cursor-pointer"><input type="checkbox" name="bulk-ports" value="2083" class="rounded border-gray-300 dark:border-zinc-800 text-blue-600 focus:ring-blue-500"> 2083</label>
+                            </div>
+                        </div>
+                    </div>
+                    <!-- Clean IPs -->
+                    <div class="flex items-center gap-3 border border-gray-100 dark:border-zinc-900 p-3 rounded-xl bg-gray-50/20 dark:bg-zinc-900/10">
+                        <label class="relative inline-flex items-center cursor-pointer select-none">
+                            <input type="checkbox" id="bulk-apply-ips" class="sr-only peer">
+                            <div class="w-9 h-5 bg-gray-200 peer-focus:outline-none rounded-full peer dark:bg-zinc-700 peer-checked:after:translate-x-full peer-checked:after:border-white after:content-[''] after:absolute after:top-[2px] after:left-[2px] after:bg-white after:border-gray-300 after:border after:rounded-full after:h-4 after:w-4 after:transition-all dark:border-gray-600 peer-checked:bg-blue-600"></div>
+                        </label>
+                        <div class="flex-1">
+                            <label class="block text-xs font-bold text-gray-500 dark:text-zinc-400 mb-1 uppercase tracking-wider">آیپی تمیز کلودفلر (اختیاری)</label>
+                            <textarea id="bulk-input-ips" rows="2" placeholder="104.16.0.1" class="w-full px-3 py-2 bg-gray-50 dark:bg-zinc-900 border border-gray-200 dark:border-zinc-800 rounded-xl focus:outline-none focus:ring-2 focus:ring-blue-500/50 text-xs font-mono text-gray-800 dark:text-zinc-100 placeholder-gray-400/80 transition resize-none"></textarea>
+                        </div>
+                    </div>
+                </div>
+                <div class="pt-4 flex gap-3">
+                    <button type="button" onclick="toggleBulkEditModal(false)" class="flex-1 py-3 bg-gray-100 hover:bg-gray-200 dark:bg-zinc-800 dark:hover:bg-zinc-700/80 text-gray-700 dark:text-zinc-300 font-bold rounded-xl text-sm transition duration-200">انصراف</button>
+                    <button type="submit" id="bulk-submit-btn" class="flex-1 py-3 bg-gradient-to-r from-yellow-600 to-amber-600 hover:from-yellow-700 hover:to-amber-700 text-white font-bold rounded-xl text-sm transition duration-200 shadow-md shadow-yellow-500/10">ثبت تغییرات گروهی</button>
+                </div>
+            </form>
         </div>
     </div>
-
-    <!-- Toast -->
-    <div id="toast" class="fixed bottom-6 left-1/2 -translate-x-1/2 px-5 py-3 rounded-xl text-xs shadow-xl opacity-0 transition-opacity duration-350 pointer-events-none font-bold" style="background: var(--green-text); color: white;"></div>
-
     <script>
-        const I18N = {
-            en: {
-                totalUsage: 'Total Usage',
-                dailyUsage: 'Daily Usage',
-                expDate: 'Expiration Date',
-                calendarLocal: 'Calendar Local Time',
-                unlimitedPlan: 'Unlimited Plan',
-                noDailyLimit: 'No Daily Limit',
-                integrationTitle: 'Integration Connections',
-                integrationDesc: 'Add the correct configuration link based on your preferred format below.',
-                universalLink: 'Universal Auto-Detecting Link',
-                universalDesc: 'This URL automatically detects your client and delivers the optimal format.',
-                universalNote: 'Real-time import of complete nodes list with dynamic update.',
-                copy: 'Copy',
-                qr: 'QR',
-                parsedContent: 'Retrieve Raw Content',
-                printConfig: 'Print Config Card',
-                close: 'Close',
-                qrTitle: 'Scan QR Code',
-                copied: 'Copied to clipboard!',
-                decodedCopied: 'Decoded links copied!',
-                decodedError: 'Error fetching content',
-                used: '% Used',
-                active: 'Active',
-                paused: 'Paused',
-                expired: 'Expired',
-                limitExceeded: 'Limit Exceeded',
-                dailyLimitExceeded: 'Daily Limit Exceeded'
-            },
-            fa: {
-                totalUsage: 'مصرف کل',
-                dailyUsage: 'مصرف روزانه',
-                expDate: 'تاریخ انقضا',
-                calendarLocal: 'زمان محلی',
-                unlimitedPlan: 'طرح نامحدود',
-                noDailyLimit: 'بدون محدودیت روزانه',
-                integrationTitle: 'لینک اتصال',
-                integrationDesc: 'لینک پیکربندی مورد نظر خود را اضافه کنید.',
-                universalLink: 'لینک خودکار برای همه کلاینت‌ها',
-                universalDesc: 'این لینک کلاینت شما را شناسایی و بهترین فرمت را ارسال می‌کند.',
-                universalNote: 'دریافت لحظه‌ای لیست نودها با به‌روزرسانی پویا.',
-                copy: 'کپی',
-                qr: 'QR',
-                parsedContent: 'دریافت متن خام',
-                printConfig: 'چاپ کارت پیکربندی',
-                close: 'بستن',
-                qrTitle: 'اسکن کد QR',
-                copied: 'کپی شد!',
-                decodedCopied: 'لینک‌ها کپی شد!',
-                decodedError: 'خطا در دریافت',
-                used: '% مصرف',
-                active: 'فعال',
-                paused: 'متوقف',
-                expired: 'منقضی',
-                limitExceeded: 'از حد مجاز رد شده',
-                dailyLimitExceeded: 'از حد روزانه رد شده'
-            }
-        };
-
-        let currentLang = 'en';
-        let isDark = true;
-
-        function applyTheme() {
-            const root = document.documentElement;
-            const themeLabel = document.getElementById('theme-label');
-            if (isDark) {
-                root.classList.add('dark');
-                document.getElementById('theme-icon').textContent = '\u2600\ufe0f';
-                if (themeLabel) themeLabel.textContent = currentLang === 'fa' ? 'روشن' : 'Light';
-            } else {
-                root.classList.remove('dark');
-                document.getElementById('theme-icon').textContent = '\ud83c\udf19';
-                if (themeLabel) themeLabel.textContent = currentLang === 'fa' ? 'تاریک' : 'Dark';
-            }
-            try { localStorage.setItem('sub-theme', isDark ? 'dark' : 'light'); } catch(e) {}
-        }
-
-        function applyLang() {
-            const t = I18N[currentLang];
-            document.querySelectorAll('[data-i18n]').forEach(el => {
-                const key = el.getAttribute('data-i18n');
-                if (t[key]) el.textContent = t[key];
-            });
-            if (currentLang === 'fa') {
-                document.documentElement.setAttribute('dir', 'rtl');
-                document.documentElement.setAttribute('lang', 'fa');
-                document.getElementById('lang-icon').textContent = '\ud83c\uddee\ud83c\uddf7';
-                document.getElementById('lang-label').textContent = 'FA';
-            } else {
-                document.documentElement.setAttribute('dir', 'ltr');
-                document.documentElement.setAttribute('lang', 'en');
-                document.getElementById('lang-icon').textContent = '\ud83c\uddfa\ud83c\uddf8';
-                document.getElementById('lang-label').textContent = 'EN';
-            }
-            initStatusBadge();
-            try { localStorage.setItem('sub-lang', currentLang); } catch(e) {}
-        }
-
-        function toggleTheme() {
-            isDark = !isDark;
-            applyTheme();
-        }
-
-        function toggleLang() {
-            currentLang = currentLang === 'en' ? 'fa' : 'en';
-            applyLang();
-            applyTheme();
-        }
-
-        function initStatusBadge() {
-            const badge = document.getElementById('status-badge');
-            const t = I18N[currentLang];
-            const map = {
-                active: { en: t.active || 'Active', bg: 'var(--green-bg)', border: 'var(--green-border)', color: 'var(--green-text)' },
-                paused: { en: t.paused || 'Paused', bg: 'var(--amber-bg)', border: 'var(--amber-border)', color: 'var(--amber-text)' },
-                expired: { en: t.expired || 'Expired', bg: 'var(--red-bg)', border: 'var(--red-border)', color: 'var(--red-text)' },
-                limit: { en: t.limitExceeded || 'Limit Exceeded', bg: 'var(--red-bg)', border: 'var(--red-border)', color: 'var(--red-text)' },
-                dailyLimit: { en: t.dailyLimitExceeded || 'Daily Limit Exceeded', bg: 'var(--red-bg)', border: 'var(--red-border)', color: 'var(--red-text)' }
-            };
-            const s = map['${statusCode}'] || map.active;
-            badge.textContent = s.en;
-            badge.style.background = s.bg;
-            badge.style.borderColor = s.border;
-            badge.style.color = s.color;
-            badge.style.border = '1px solid ' + s.border;
-        }
-
-        function copyLink(id) {
-            const el = document.getElementById(id);
-            el.select();
-            navigator.clipboard.writeText(el.value);
-            showToast(I18N[currentLang].copied);
-        }
-
-        async function fetchDecodedRawContent() {
-            try {
-                const res = await fetch('${syncRaw}');
-                if(!res.ok) throw new Error('Failed');
-                const base64Str = await res.text();
-                const decodedText = atob(base64Str.trim());
-                await navigator.clipboard.writeText(decodedText);
-                showToast(I18N[currentLang].decodedCopied);
-            } catch(e) {
-                alert(I18N[currentLang].decodedError + ': ' + e.message);
-            }
-        }
-
-        function showQRModal() {
-            const t = I18N[currentLang];
-            document.getElementById('qr-title').innerText = t.qrTitle;
-            document.getElementById('qr-text').innerText = '${syncNormal}';
-            document.getElementById('qr-img').src = 'https://api.qrserver.com/v1/create-qr-code/?size=300x300&data=' + encodeURIComponent('${syncNormal}');
-            document.getElementById('qr-modal').classList.remove('hidden');
-            document.getElementById('qr-modal').classList.add('flex');
-        }
-
-        function closeQRModal() {
-            document.getElementById('qr-modal').classList.add('hidden');
-            document.getElementById('qr-modal').classList.remove('flex');
-        }
-
-        function showToast(msg) {
-            const t = document.getElementById('toast');
-            t.innerText = msg;
-            t.style.opacity = '1';
-            setTimeout(() => { t.style.opacity = '0'; }, 2000);
-        }
-
-        (function init() {
-            try {
-                const savedTheme = localStorage.getItem('sub-theme');
-                if (savedTheme) isDark = savedTheme === 'dark';
-            } catch(e) {}
-            try {
-                const savedLang = localStorage.getItem('sub-lang');
-                if (savedLang && I18N[savedLang]) currentLang = savedLang;
-            } catch(e) {}
-            applyTheme();
-            applyLang();
-        })();
-    <\/script>
-</body>
-</html>`;
-    return new Response(html, { headers: { "Content-Type": "text/html; charset=utf-8" } });
-}
-
-let sysConfigLoading = null;
-let sysUsageLoading = null;
-let backupIpLoading = null;
-
-async function loadSysConfig(env) {
-    const now = Date.now();
-
-    if (env.IOT_DB) {
-        if (now - sysConfigCacheTime > CACHE_TTL_CONFIG) {
-            if (!sysConfigLoading) {
-                sysConfigLoading = d1Get(env, "sys_config").then(stored => {
-                    sysConfig = { ...SYSTEM_DEFAULTS, ...(stored ? JSON.parse(stored) : null) };
-                    sysConfigCacheTime = Date.now();
-                }).catch(() => {
-                    sysConfig = { ...SYSTEM_DEFAULTS };
-                    sysConfigCacheTime = Date.now();
-                }).finally(() => { sysConfigLoading = null; });
-            }
-            await sysConfigLoading;
-        }
-        if (now - sysUsageCacheTime > CACHE_TTL_USAGE) {
-            if (!sysUsageLoading) {
-                sysUsageLoading = d1Get(env, "sys_usage").then(ustored => {
-                    if (ustored) sysUsageCache = JSON.parse(ustored);
-                    else sysUsageCache = { users: {} };
-                    sysUsageCacheTime = Date.now();
-                }).catch(() => {
-                    sysUsageCache = { users: {} };
-                    sysUsageCacheTime = Date.now();
-                }).finally(() => { sysUsageLoading = null; });
-            }
-            await sysUsageLoading;
-        }
-    }
-
-    if (now - backupIpCacheTime > CACHE_TTL_BACKUP_IP) {
-        if (!backupIpLoading) {
-            backupIpLoading = (env.IOT_DB ? d1Get(env, "backup_ip") : Promise.resolve(null)).then(val => {
-                backupIpCache = val;
-                backupIpCacheTime = Date.now();
-            }).catch(() => {
-                backupIpCacheTime = Date.now();
-            }).finally(() => { backupIpLoading = null; });
-        }
-        await backupIpLoading;
-    }
-    sysConfig.customRelay = backupIpCache ?? env.RELAY_IP ?? "";
-}
-
-async function fetchCloudflareUsage(accountId, apiToken) {
-    if (!accountId || !apiToken) return null;
-    try {
-        const d = new Date();
-        const currentDate = d.toISOString().split('T')[0] + "T00:00:00Z";
-        
-        const query = `query GetDailyUsage($accountId: String!, $start: ISO8601DateTime!) { viewer { accounts(filter: {accountTag: $accountId}) { workersInvocationsAdaptive(limit: 1, filter: { datetime_geq: $start }) { sum { requests } } } } }`;
-        const variables = { accountId: accountId, start: currentDate };
-        
-        const res = await fetch("https://api.cloudflare.com/client/v4/graphql", {
-            method: "POST",
-            headers: {
-                "Authorization": `Bearer ${apiToken}`,
-                "Content-Type": "application/json"
-            },
-            body: JSON.stringify({ query, variables })
-        });
-        
-        const json = await res.json();
-        const reqs = json?.data?.viewer?.accounts?.[0]?.workersInvocationsAdaptive?.[0]?.sum?.requests;
-        return typeof reqs === 'number' ? reqs : null;
-    } catch(e) {
-        return null;
-    }
-}
-
-async function sendTelegramMessage(request, type, hostName) {
-    if (!sysConfig.tgToken || !(sysConfig.tgAdminId || sysConfig.tgChatId)) return;
-
-    const escMd = (s) => String(s).replace(/[_*`[]/g, '\\$&');
-
-    let usageStr = "نامشخص (0.00%)";
-    if (sysConfig.cfAccountId && sysConfig.cfApiToken) {
-        const reqs = await fetchCloudflareUsage(sysConfig.cfAccountId, sysConfig.cfApiToken);
-        if (reqs !== null) {
-            const limit = 100000;
-            const pct = ((reqs / limit) * 100).toFixed(2);
-            usageStr = `${reqs}/${limit} ${pct}%`;
-        }
-    }
-
-    const ip = request.headers.get("cf-connecting-ip") || "Unknown";
-    const cf = request.cf || {};
-    const country = cf.country || "Unknown";
-    const city = cf.city || "Unknown";
-    const asn = cf.asn || "Unknown";
-    const asOrg = cf.asOrganization || "Unknown";
-    const domain = request.headers.get("Host") || new URL(request.url).hostname;
-    const path = new URL(request.url).pathname;
-    const ua = request.headers.get("User-Agent") || "حالا یوزرایجنت مارو نبینین";
-
-    const d = new Date();
-    const timeStr = new Intl.DateTimeFormat('fa-IR', { 
-        year: 'numeric', month: 'long', day: 'numeric', 
-        hour: '2-digit', minute: '2-digit', second: '2-digit' 
-    }).format(d);
-
-    const text = `📌 نوع: ${escMd(type)}\n` +
-                 `🌐 IP: ${escMd(ip)}\n` +
-                 `📍 موقعیت: ${escMd(country)} ${escMd(city)}\n` +
-                 `🏢 ASN: AS${escMd(asn)} ${escMd(asOrg)}\n` +
-                 `🔗 دامنه: ${escMd(domain)}\n` +
-                 `🔍 مسیر: ${escMd(path)}\n` +
-                 `🤖 مرورگر: ${escMd(ua)}\n` +
-                 `📅 زمان: ${escMd(timeStr)}\n` +
-                 `📊 مصرف: ${usageStr}`;
-
-    const h = hostName || domain;
-    const langCode = sysConfig.tgBotLang || "fa";
-    const locT = (key) => botI18n[langCode]?.[key] || botI18n["en"]?.[key] || key;
-    const isPaused = sysConfig.isPaused || false;
-    const panelUrl = `https://${h}/${encodeURI(sysConfig.apiRoute)}/dash`;
-    const subUrl = `https://${h}/${sysConfig.apiRoute}`;
-    const inline_keyboard = [
-        [
-            { text: `📊 ${locT("dashboard")}`, callback_data: "sys_dashboard" },
-            { text: `📈 ${locT("statistics")}`, callback_data: "sys_stats" }
-        ],
-        [
-            { text: `🔗 ${locT("btn_sub_link")}`, callback_data: "get_sub_link" },
-            { text: `ℹ️ ${locT("panel_info")}`, callback_data: "sys_panel_info" }
-        ],
-        [
-            { text: `🌐 ${langCode === 'fa' ? 'English 🇺🇸' : 'فارسی 🇮🇷'}`, callback_data: "sys_lang" },
-            { text: isPaused ? `▶️ ${locT("btn_resume")}` : `⏸️ ${locT("btn_pause")}`, callback_data: "sys_toggle_status" }
-        ],
-        [
-            { text: `🔑 ${locT("dash")}`, web_app: { url: panelUrl } }
-        ]
-    ];
-
-    const tgUrl = `https://api.telegram.org/bot${sysConfig.tgToken}/sendMessage`;
-    const notifyChatId = sysConfig.tgAdminId || sysConfig.tgChatId;
-    try {
-        await fetch(tgUrl, {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({
-                chat_id: notifyChatId,
-                text: text,
-                parse_mode: 'Markdown',
-                reply_markup: /** @type {any} */ ({ inline_keyboard })
-            })
-        });
-    } catch (e) {}
-}
-
-async function logActivity(env, type, detail) {
-    if (!env || !env.IOT_DB) return;
-    try {
-        const ts = new Date().toISOString();
-        let logs = [];
-        const stored = await d1Get(env, "sys_logs");
-        if (stored) logs = JSON.parse(stored);
-        logs.unshift({ ts, type, detail });
-        if (logs.length > 50) logs = logs.slice(0, 50);
-        await d1Put(env, "sys_logs", JSON.stringify(logs));
-    } catch (e) {}
-}
-
-async function handleLogs(request, env) {
-    try {
-        if (request.method === "POST") {
-            const data = await request.json();
-            if (!isAuthorized(request, data)) return new Response(JSON.stringify({ success: false }), { status: 401 });
-            let logs = [];
-            if (env.IOT_DB) {
-                const stored = await d1Get(env, "sys_logs");
-                if (stored) logs = JSON.parse(stored);
-            }
-            return new Response(JSON.stringify({ success: true, logs }), { status: 200 });
-        }
-        return new Response("OK", { status: 200 });
-    } catch (e) { return new Response(JSON.stringify({ success: false }), { status: 400 }); }
-}
-
-async function handleUsersApi(request, env, ctx) {
-    try {
-        const url = new URL(request.url);
-        const method = request.method;
-        const userId = url.searchParams.get("id");
-        const action = url.searchParams.get("action");
-
-        const authHeader = request.headers.get("Authorization") || "";
-        const authKey = authHeader.replace("Bearer ", "") || url.searchParams.get("key") || "";
-        let bodyKey = "";
-        if (method === "POST" || method === "PUT") {
-            try {
-                const body = await request.clone().json();
-                bodyKey = body.key || "";
-            } catch(e) {}
-        }
-        const isAuth = (authKey === sysConfig.masterKey) || (bodyKey === sysConfig.masterKey) || isPanelApiKey(authKey) || isPanelApiKey(bodyKey);
-        if (!isAuth) {
-            return new Response(JSON.stringify({ success: false, error: "Unauthorized" }), { status: 401, headers: { "Content-Type": "application/json" } });
-        }
-
-        if (method === "GET" && !userId) {
-            const q = url.searchParams.get("q") || "";
-            let users = sysConfig.users || [];
-            if (q) {
-                const ql = q.toLowerCase();
-                users = users.filter(u => u.name.toLowerCase().includes(ql) || u.id.toLowerCase().includes(ql) || (u.notes && u.notes.toLowerCase().includes(ql)));
-            }
-            const enriched = users.map(u => {
-                const idClean = u.id.replace(/-/g, '').toLowerCase();
-                const sysU = sysUsageCache?.users?.[idClean] || { reqs: 0, dReqs: 0, lastDay: '' };
-                const usedBytes = Math.floor((sysU.reqs || 0) * (1073741824 / 6000));
-                const limitBytes = u.limitTotalReq ? Math.floor(u.limitTotalReq * (1073741824 / 6000)) : 0;
-                const isExpired = u.expiryMs && Date.now() > u.expiryMs;
-                let status = "active";
-                if (u.isPaused && u.disabledReason) status = "auto-disabled";
-                else if (u.isPaused) status = "paused";
-                else if (isExpired) status = "expired";
-                return { ...u, usage: { total: usedBytes, limit: limitBytes, daily: sysU.dReqs || 0, dailyLimit: u.limitDailyReq || 0 }, status };
-            });
-            return new Response(JSON.stringify({ success: true, users: enriched, total: enriched.length }), { headers: { "Content-Type": "application/json" } });
-        }
-
-        if (method === "GET" && userId) {
-            const u = (sysConfig.users || []).find(usr => usr.id === userId || usr.name.toLowerCase() === userId.toLowerCase());
-            if (!u) return new Response(JSON.stringify({ success: false, error: "User not found" }), { status: 404, headers: { "Content-Type": "application/json" } });
-            const idClean = u.id.replace(/-/g, '').toLowerCase();
-            const sysU = sysUsageCache?.users?.[idClean] || { reqs: 0, dReqs: 0, lastDay: '' };
-            const usedBytes = Math.floor((sysU.reqs || 0) * (1073741824 / 6000));
-            const limitBytes = u.limitTotalReq ? Math.floor(u.limitTotalReq * (1073741824 / 6000)) : 0;
-            const isExpired = u.expiryMs && Date.now() > u.expiryMs;
-            let status = "active";
-            if (u.isPaused && u.disabledReason) status = "auto-disabled";
-            else if (u.isPaused) status = "paused";
-            else if (isExpired) status = "expired";
-            const hostName = new URL(request.url).hostname;
-            const subUrl = `https://${hostName}/${sysConfig.apiRoute}?sub=${encodeURIComponent(u.name)}`;
-            return new Response(JSON.stringify({ success: true, user: { ...u, usage: { total: usedBytes, limit: limitBytes, daily: sysU.dReqs || 0, dailyLimit: u.limitDailyReq || 0 }, status, subscriptionUrl: subUrl } }), { headers: { "Content-Type": "application/json" } });
-        }
-
-        if (method === "POST" && !userId) {
-            const body = await request.json();
-            const { name, trafficLimit, expiryDays, notes, maxConfigs, proxyIp, cleanIp, userMode, userPorts, userNodes, nat64, connLimit, userPanelUrl } = body;
-            if (!name) return new Response(JSON.stringify({ success: false, error: "Name is required" }), { status: 400, headers: { "Content-Type": "application/json" } });
-            const newId = crypto.randomUUID();
-            const newUser = {
-                id: newId,
-                name: name,
-                limitTotalReq: trafficLimit ? Math.floor(parseFloat(trafficLimit) * 6000) : null,
-                limitDailyReq: body.dailyLimit ? Math.floor(parseFloat(body.dailyLimit) * 6000) : null,
-                expiryMs: expiryDays ? Date.now() + parseInt(expiryDays) * 86400000 : null,
-                notes: notes || "",
-                maxConfigs: maxConfigs ? parseInt(maxConfigs) : null,
-                proxyIp: proxyIp || null,
-cleanIp: cleanIp || null,
-                userMode: userMode || null,
-                userPorts: userPorts || null,
-                userNodes: userNodes || null,
-                nat64: nat64 || null,
-                connLimit: connLimit ? parseInt(connLimit) : null,
-                userPanelUrl: userPanelUrl || null,
-                createdAt: Date.now()
-            };
-            await resolveUserProxyIpGeo(newUser);
-            if (!sysConfig.users) sysConfig.users = [];
-            sysConfig.users.push(newUser);
-            await cachedD1Put(env, "sys_config", JSON.stringify(sysConfig));
-            ctx?.waitUntil(logActivity(env, "User Created", `User "${name}" (${newId}) created via API`).catch(()=>{}));
-            const hostName = new URL(request.url).hostname;
-            const subUrl = `https://${hostName}/${sysConfig.apiRoute}?sub=${encodeURIComponent(name)}`;
-            return new Response(JSON.stringify({ success: true, user: newUser, subscriptionUrl: subUrl }), { status: 201, headers: { "Content-Type": "application/json" } });
-        }
-
-        if (method === "PUT" && userId) {
-            const body = await request.json();
-            if (!sysConfig.users) return new Response(JSON.stringify({ success: false, error: "No users" }), { status: 400, headers: { "Content-Type": "application/json" } });
-            const u = sysConfig.users.find(usr => usr.id === userId);
-            if (!u) return new Response(JSON.stringify({ success: false, error: "User not found" }), { status: 404, headers: { "Content-Type": "application/json" } });
-            if (body.name !== undefined) u.name = body.name;
-            if (body.trafficLimit !== undefined) u.limitTotalReq = body.trafficLimit ? Math.floor(parseFloat(body.trafficLimit) * 6000) : null;
-            if (body.dailyLimit !== undefined) u.limitDailyReq = body.dailyLimit ? Math.floor(parseFloat(body.dailyLimit) * 6000) : null;
-            if (body.expiryDays !== undefined) u.expiryMs = body.expiryDays ? Date.now() + parseInt(body.expiryDays) * 86400000 : null;
-            if (body.notes !== undefined) u.notes = body.notes;
-            if (body.maxConfigs !== undefined) u.maxConfigs = body.maxConfigs ? parseInt(body.maxConfigs) : null;
-            if (body.proxyIp !== undefined) { u.proxyIp = body.proxyIp; if (!body.proxyIp) { u.proxyIpGeo = null; } else { await resolveUserProxyIpGeo(u); } }
-            if (body.cleanIp !== undefined) u.cleanIp = body.cleanIp;
-            if (body.userMode !== undefined) u.userMode = body.userMode;
-            if (body.userPorts !== undefined) u.userPorts = body.userPorts;
-            if (body.userNodes !== undefined) u.userNodes = body.userNodes;
-            if (body.nat64 !== undefined) u.nat64 = body.nat64;
-            if (body.connLimit !== undefined) u.connLimit = body.connLimit ? parseInt(body.connLimit) : null;
-            if (body.userPanelUrl !== undefined) u.userPanelUrl = body.userPanelUrl || null;
-            if (body.status !== undefined) {
-                if (body.status === "active") { u.isPaused = false; u.disabledReason = null; u.disabledAt = null; }
-                else if (body.status === "paused") { u.isPaused = true; u.disabledReason = null; u.disabledAt = null; }
-            }
-            await cachedD1Put(env, "sys_config", JSON.stringify(sysConfig));
-            ctx?.waitUntil(logActivity(env, "User Updated", `User "${u.name}" (${userId}) updated via API`).catch(()=>{}));
-            return new Response(JSON.stringify({ success: true, user: u }), { headers: { "Content-Type": "application/json" } });
-        }
-
-        if (method === "DELETE" && userId) {
-            if (!sysConfig.users) return new Response(JSON.stringify({ success: false, error: "No users" }), { status: 400, headers: { "Content-Type": "application/json" } });
-            const idx = sysConfig.users.findIndex(usr => usr.id === userId);
-            if (idx === -1) return new Response(JSON.stringify({ success: false, error: "User not found" }), { status: 404, headers: { "Content-Type": "application/json" } });
-            const deleted = sysConfig.users.splice(idx, 1)[0];
-            await cachedD1Put(env, "sys_config", JSON.stringify(sysConfig));
-            ctx?.waitUntil(logActivity(env, "User Deleted", `User "${deleted.name}" (${userId}) deleted via API`).catch(()=>{}));
-            return new Response(JSON.stringify({ success: true, deleted: deleted.id }), { headers: { "Content-Type": "application/json" } });
-        }
-
-        if (method === "POST" && userId && action === "toggle") {
-            if (!sysConfig.users) return new Response(JSON.stringify({ success: false, error: "No users" }), { status: 400, headers: { "Content-Type": "application/json" } });
-            const u = sysConfig.users.find(usr => usr.id === userId);
-            if (!u) return new Response(JSON.stringify({ success: false, error: "User not found" }), { status: 404, headers: { "Content-Type": "application/json" } });
-            u.isPaused = !u.isPaused;
-            if (!u.isPaused) { u.disabledReason = null; u.disabledAt = null; }
-            await cachedD1Put(env, "sys_config", JSON.stringify(sysConfig));
-            ctx?.waitUntil(logActivity(env, "User Toggled", `User "${u.name}" (${userId}) ${u.isPaused ? 'paused' : 'resumed'} via API`).catch(()=>{}));
-            return new Response(JSON.stringify({ success: true, user: u }), { headers: { "Content-Type": "application/json" } });
-        }
-
-        if (method === "POST" && userId && action === "reset") {
-            if (!sysUsageCache) sysUsageCache = { users: {} };
-            if (!sysUsageCache.users) sysUsageCache.users = {};
-            const uuidClean = userId.replace(/-/g, '').toLowerCase();
-            if (sysUsageCache.users[uuidClean]) {
-                sysUsageCache.users[uuidClean].reqs = 0;
-                sysUsageCache.users[uuidClean].dReqs = 0;
-            } else {
-                sysUsageCache.users[uuidClean] = { reqs: 0, dReqs: 0, lastDay: new Date().toISOString().split('T')[0] };
-            }
-            await cachedD1Put(env, "sys_usage", JSON.stringify(sysUsageCache));
-            ctx?.waitUntil(logActivity(env, "Traffic Reset", `Traffic reset for user ${userId} via API`).catch(()=>{}));
-            return new Response(JSON.stringify({ success: true, message: "Traffic reset" }), { headers: { "Content-Type": "application/json" } });
-        }
-
-        return new Response(JSON.stringify({ success: false, error: "Invalid request" }), { status: 400, headers: { "Content-Type": "application/json" } });
-    } catch (e) { return new Response(JSON.stringify({ success: false, error: e.message }), { status: 500, headers: { "Content-Type": "application/json" } }); }
-}
-
-async function handleStatsApi(request, env) {
-    try {
-        const url = new URL(request.url);
-        const authHeader = request.headers.get("Authorization") || "";
-        const authKey = authHeader.replace("Bearer ", "") || url.searchParams.get("key") || "";
-        if (authKey !== sysConfig.masterKey && !isPanelApiKey(authKey)) {
-            return new Response(JSON.stringify({ success: false, error: "Unauthorized" }), { status: 401, headers: { "Content-Type": "application/json" } });
-        }
-
-        const users = sysConfig.users || [];
-        const totalUsers = users.length;
-        const activeUsers = users.filter(u => !u.isPaused && (!u.expiryMs || Date.now() <= u.expiryMs)).length;
-        const autoDisabledUsers = users.filter(u => u.isPaused && u.disabledReason).length;
-        const pausedUsers = users.filter(u => u.isPaused && !u.disabledReason).length;
-        const expiredUsers = users.filter(u => u.expiryMs && Date.now() > u.expiryMs && !u.isPaused).length;
-
-        let totalTrafficReqs = 0;
-        let dailyTrafficReqs = 0;
-        const todayDate = new Date().toISOString().split('T')[0];
-        users.forEach(u => {
-            const idClean = u.id.replace(/-/g, '').toLowerCase();
-            const sysU = sysUsageCache?.users?.[idClean] || { reqs: 0, dReqs: 0, lastDay: '' };
-            totalTrafficReqs += (sysU.reqs || 0);
-            if (sysU.lastDay === todayDate) dailyTrafficReqs += (sysU.dReqs || 0);
-        });
-
-        const upSeconds = Math.floor((Date.now() - isolateStartTime) / 1000);
-
-        return new Response(JSON.stringify({
-            success: true,
-            stats: {
-                users: { total: totalUsers, active: activeUsers, paused: pausedUsers, expired: expiredUsers, autoDisabled: autoDisabledUsers },
-                traffic: { totalRequests: totalTrafficReqs, totalGB: (totalTrafficReqs / 6000).toFixed(2), dailyRequests: dailyTrafficReqs, dailyGB: (dailyTrafficReqs / 6000).toFixed(2) },
-                system: { uptimeSeconds: upSeconds, activeConnections, version: CURRENT_VERSION, isPaused: sysConfig.isPaused || false }
-            }
-        }), { headers: { "Content-Type": "application/json" } });
-    } catch (e) { return new Response(JSON.stringify({ success: false, error: e.message }), { status: 500, headers: { "Content-Type": "application/json" } }); }
-}
-
-function cmpVersions(a, b) {
-    const strip = v => String(v).replace(/^v/, '').trim();
-    const pa = strip(a).split('.').map(Number);
-    const pb = strip(b).split('.').map(Number);
-    for (let i = 0; i < Math.max(pa.length, pb.length); i++) {
-        let na = pa[i] || 0, nb = pb[i] || 0;
-        if (na > nb) return 1;
-        if (nb > na) return -1;
-    }
-    return 0;
-}
-
-
-async function handleApiKeys(request, env, ctx) {
-    try {
-        const url = new URL(request.url);
-        const method = request.method;
-
-        const authKey = extractAuthKey(request, null);
-        if (authKey !== sysConfig.masterKey) {
-            return new Response(JSON.stringify({ success: false, error: "Only master key can manage API keys" }), { status: 401, headers: { "Content-Type": "application/json" } });
-        }
-
-        if (method === "GET") {
-            const keys = (sysConfig.panelApiKeys || []).map(k => ({
-                id: k.id, name: k.name, keyPreview: k.key.slice(0, 8) + "..." + k.key.slice(-4),
-                createdAt: k.createdAt, lastUsed: k.lastUsed
-            }));
-            return new Response(JSON.stringify({ success: true, keys }), { headers: { "Content-Type": "application/json" } });
-        }
-
-        if (method === "POST") {
-            const body = await request.json();
-            if (body.action === "create") {
-                if (!sysConfig.panelApiKeys) sysConfig.panelApiKeys = [];
-                if (sysConfig.panelApiKeys.length >= 10) {
-                    return new Response(JSON.stringify({ success: false, error: "Maximum 10 API keys allowed" }), { status: 400, headers: { "Content-Type": "application/json" } });
+        window.selectedUsernames = new Set();
+        function toggleSelectAllUsers(el) {
+            const checkboxes = document.querySelectorAll('input[name="select-user"]');
+            checkboxes.forEach(cb => {
+                cb.checked = el.checked;
+                const username = decodeURIComponent(cb.value);
+                if (el.checked) {
+                    window.selectedUsernames.add(username);
+                } else {
+                    window.selectedUsernames.delete(username);
                 }
-                const newKey = generateApiKey(body.name);
-                sysConfig.panelApiKeys.push(newKey);
-                await cachedD1Put(env, "sys_config", JSON.stringify(sysConfig));
-                ctx?.waitUntil(logActivity(env, "API Key Created", `Key "${newKey.name}" created`).catch(()=>{}));
-                return new Response(JSON.stringify({ success: true, key: newKey }), { status: 201, headers: { "Content-Type": "application/json" } });
+            });
+            updateBulkActionsBar();
+        }
+        function onUserSelectChange(el) {
+            const username = decodeURIComponent(el.value);
+            if (el.checked) {
+                window.selectedUsernames.add(username);
+            } else {
+                window.selectedUsernames.delete(username);
             }
-            if (body.action === "revoke") {
-                if (!body.id) return new Response(JSON.stringify({ success: false, error: "ID required" }), { status: 400, headers: { "Content-Type": "application/json" } });
-                const idx = (sysConfig.panelApiKeys || []).findIndex(k => k.id === body.id);
-                if (idx === -1) return new Response(JSON.stringify({ success: false, error: "Key not found" }), { status: 404, headers: { "Content-Type": "application/json" } });
-                const revoked = sysConfig.panelApiKeys.splice(idx, 1)[0];
-                await cachedD1Put(env, "sys_config", JSON.stringify(sysConfig));
-                ctx?.waitUntil(logActivity(env, "API Key Revoked", `Key "${revoked.name}" revoked`).catch(()=>{}));
-                return new Response(JSON.stringify({ success: true, revoked: revoked.id }), { headers: { "Content-Type": "application/json" } });
+            updateBulkActionsBar();
+        }
+        function updateBulkActionsBar() {
+            const bar = document.getElementById('bulk-actions-bar');
+            const countSpan = document.getElementById('bulk-selected-count');
+            const selectAllCheckbox = document.getElementById('select-all-users');
+            const selectedCount = window.selectedUsernames.size;
+            if (countSpan) {
+                countSpan.innerText = selectedCount + ' کاربر انتخاب شده';
+            }
+            const checkboxes = document.querySelectorAll('input[name="select-user"]');
+            if (checkboxes.length > 0) {
+                const allChecked = Array.from(checkboxes).every(cb => cb.checked);
+                if (selectAllCheckbox) selectAllCheckbox.checked = allChecked;
+            } else {
+                if (selectAllCheckbox) selectAllCheckbox.checked = false;
+            }
+            if (selectedCount > 0) {
+                bar.classList.remove('opacity-0', 'pointer-events-none', 'translate-y-28');
+                bar.classList.add('opacity-100', 'pointer-events-auto', 'translate-y-0');
+            } else {
+                bar.classList.remove('opacity-100', 'pointer-events-auto', 'translate-y-0');
+                bar.classList.add('opacity-0', 'pointer-events-none', 'translate-y-28');
             }
         }
-
-        return new Response(JSON.stringify({ success: false, error: "Invalid request" }), { status: 400, headers: { "Content-Type": "application/json" } });
-    } catch(e) {
-        return new Response(JSON.stringify({ success: false, error: e.message }), { status: 500, headers: { "Content-Type": "application/json" } });
-    }
-}
-
-async function handleAuth(request, hostName, ctx, env) {
-    try {
-        const data = await request.json();
-        const ip = request.headers.get("cf-connecting-ip") || "Unknown";
-        const loginKey = data.key || "";
-        const isKeyAuth = loginKey === sysConfig.masterKey || isPanelApiKey(loginKey);
-        if (isKeyAuth) {
-            if (isPanelApiKey(loginKey)) {
-                const apiKeyEntry = (sysConfig.panelApiKeys || []).find(k => k.key === loginKey);
-                if (apiKeyEntry) apiKeyEntry.lastUsed = Date.now();
-            }
-            ctx?.waitUntil(logActivity(env, "Auth Success", `Successful panel login from ${ip} (via ${isPanelApiKey(loginKey) ? 'API Key' : 'Master Key'})`));
-            if (!sysConfig.silentAlerts && ctx) ctx.waitUntil(sendTelegramMessage(request, "ورود به پنل (موفق)", hostName));
-
-            // Store login signal for Telegram bot
-            if (sysConfig.tgAdminId && env.IOT_DB) {
-                const loginSignal = {
-                    name: sysConfig.name || hostName,
-                    host: hostName,
-                    apiRoute: sysConfig.apiRoute,
-                    masterKey: sysConfig.masterKey,
-                    isLocal: true,
-                    ts: Date.now()
-                };
-                ctx?.waitUntil(d1Put(env, "tg_panel_login", JSON.stringify(loginSignal)).catch(() => {}));
-            }
-
-            // Notify hub panel if configured
-            if (sysConfig.hubPanelUrl && sysConfig.hubPanelUrl.trim() && sysConfig.tgAdminId) {
+        async function bulkDelete() {
+            const usernames = Array.from(window.selectedUsernames);
+            if (usernames.length === 0) return;
+            if (confirm('⚠️ آیا از حذف گروهی ' + usernames.length + ' کاربر انتخاب شده مطمئن هستید؟ این عمل غیرقابل بازگشت است.')) {
+                const bar = document.getElementById('bulk-actions-bar');
+                const buttons = bar.querySelectorAll('button');
+                buttons.forEach(btn => btn.disabled = true);
                 try {
-                    let hubUrl = sysConfig.hubPanelUrl.trim();
-                    if (!hubUrl.startsWith('http')) hubUrl = 'https://' + hubUrl;
-                    const signalPayload = {
-                        signal: "panel_login",
-                        panelName: sysConfig.name || hostName,
-                        panelHost: hostName,
-                        panelApiRoute: sysConfig.apiRoute,
-                        panelMasterKey: sysConfig.masterKey,
-                        tgAdminId: sysConfig.tgAdminId,
-                        ts: Date.now()
-                    };
-                    ctx?.waitUntil(fetch(`${hubUrl}/${encodeURI(sysConfig.apiRoute)}/tg/sync_panel`, {
-                        method: 'POST',
-                        headers: { 'Content-Type': 'application/json' },
-                        body: JSON.stringify(signalPayload)
-                    }).catch(() => {}));
-                } catch(e) {}
-            }
-
-            const netInfo = {
-                ip: ip,
-                colo: request.cf?.colo || "Unknown",
-                loc: (request.cf?.city || "Unknown") + ", " + (request.cf?.country || "Unknown")
-            };
-            let usageData = {};
-            for(let [k,v] of uuidUsage.entries()) usageData[k] = v;
-            let baseHost = hostName;
-            let protocol = "https";
-            if (sysConfig.customPanelUrl && sysConfig.customPanelUrl.trim()) {
-                let customUrlStr = sysConfig.customPanelUrl.trim();
-                if (!customUrlStr.startsWith('http://') && !customUrlStr.startsWith('https://')) {
-                    customUrlStr = 'https://' + customUrlStr;
+                    let successCount = 0;
+                    await Promise.all(usernames.map(async (uname) => {
+                        try {
+                            const res = await fetch('/api/users/' + encodeURIComponent(uname), { method: 'DELETE' });
+                            if (res.ok) {
+                                successCount++;
+                                window.selectedUsernames.delete(uname);
+                            }
+                        } catch(e) {}
+                    }));
+                    alert('✅ عملیات حذف گروهی انجام شد. ' + successCount + ' کاربر با موفقیت حذف شدند.');
+                } finally {
+                    buttons.forEach(btn => btn.disabled = false);
+                    updateBulkActionsBar();
+                    await loadUsers(true);
                 }
+            }
+        }
+        async function bulkToggleStatus(targetActive) {
+            const usernames = Array.from(window.selectedUsernames);
+            if (usernames.length === 0) return;
+            const actionText = targetActive === 1 ? 'فعال‌سازی' : 'غیرفعال‌سازی';
+            if (confirm('آیا از ' + actionText + ' گروهی ' + usernames.length + ' کاربر انتخاب شده مطمئن هستید؟')) {
+                const bar = document.getElementById('bulk-actions-bar');
+                const buttons = bar.querySelectorAll('button');
+                buttons.forEach(btn => btn.disabled = true);
                 try {
-                    const customUrl = new URL(customUrlStr);
-                    baseHost = customUrl.host;
-                    protocol = customUrl.protocol.replace(':', '');
-                } catch(e) {}
-            }
-            return new Response(JSON.stringify({
-                success: true, config: isPanelApiKey(loginKey) ? { ...sysConfig, masterKey: "[PROTECTED]", panelApiKeys: "[PROTECTED]" } : sysConfig, deviceId: activeDeviceId, network: netInfo, usage: usageData, sysUsage: (sysUsageCache && sysUsageCache.users) ? sysUsageCache.users : {},
-                version: CURRENT_VERSION,
-                profiles: getAllProfiles().map(p => {
-                    let subSuffix = p.name === 'Default' ? '' : '?sub=' + encodeURIComponent(p.name);
-                    return {
-                        name: p.name,
-                        id: p.id,
-                        sync: `${protocol}://${baseHost}/${sysConfig.apiRoute}${subSuffix}`
-                    };
-                })
-            }), { status: 200 });
-        }
-        ctx?.waitUntil(logActivity(env, "Auth Failed", `Failed login attempt from ${ip}`));
-        if (ctx) ctx.waitUntil(sendTelegramMessage(request, "تلاش ناموفق ورود به پنل!", hostName));
-        return new Response(JSON.stringify({ success: false }), { status: 401 });
-    } catch (e) { return new Response(JSON.stringify({ success: false }), { status: 400 }); }
-}
-
-async function handleConfigSync(request, env, ctx) {
-    try {
-        const data = await request.json();
-        const isAuthSync = (data.key === sysConfig.masterKey) || 
-                             (data.oldKey && data.oldKey === sysConfig.masterKey) || 
-                             (sysConfig.masterKey === "admin") ||
-                             isPanelApiKey(data.key) || isPanelApiKey(data.oldKey) ||
-                             (data.fromMaster && data.config && data.config.masterKey && data.config.masterKey === sysConfig.masterKey);
-        if (!isAuthSync) return new Response(JSON.stringify({ success: false, error: "Auth failed. Generate the API key on THIS panel, not the main panel." }), { status: 401 });
-        if (!env.IOT_DB) return new Response(JSON.stringify({ success: false, msg: "DB Error" }), { status: 400 });
-        
-        let nextConfig = sysConfig;
-        if (data.config) {
-            const preserveApiKeys = sysConfig.panelApiKeys || [];
-            nextConfig = { ...sysConfig, ...data.config };
-            if (preserveApiKeys.length > 0 && (!data.config.panelApiKeys || data.config.panelApiKeys.length === 0)) {
-                nextConfig.panelApiKeys = preserveApiKeys;
-            }
-            if (Array.isArray(nextConfig.users) && nextConfig.users.length > 0) {
-                const geoPromises = nextConfig.users.map(async (u) => {
-                    if (u.proxyIp) {
-                        await resolveUserProxyIpGeo(u);
-                    } else {
-                        u.proxyIpGeo = null;
-                    }
-                });
-                await Promise.all(geoPromises);
-            }
-            sysConfig = nextConfig;
-            await cachedD1Put(env, "sys_config", JSON.stringify(nextConfig));
-        }
-
-        let tagWarning = null;
-        if (nextConfig.nameStrategy && nextConfig.nameStrategy.includes('{') && nextConfig.nameStrategy.includes('}')) {
-            let vResult = validateNameStrategy(nextConfig.nameStrategy);
-            if (!vResult.valid) tagWarning = `Unknown tags detected: ${vResult.unknownTags.join(', ')}`;
-        }
-
-        if (data.resetUUID) {
-            const uuidClean = data.resetUUID.replace(/-/g, '').toLowerCase();
-            if (!sysUsageCache) sysUsageCache = { users: {} };
-            if (!sysUsageCache.users) sysUsageCache.users = {};
-            if (sysUsageCache.users[uuidClean]) {
-                sysUsageCache.users[uuidClean].reqs = 0;
-                sysUsageCache.users[uuidClean].dReqs = 0;
-            } else {
-                sysUsageCache.users[uuidClean] = { reqs: 0, dReqs: 0, lastDay: new Date().toISOString().split('T')[0] };
-            }
-            await cachedD1Put(env, "sys_usage", JSON.stringify(sysUsageCache));
-        }
-
-        if (data.config && !data.fromMaster && nextConfig.slaveNodes && nextConfig.slaveNodes.trim().length > 0) {
-            let nodes = nextConfig.slaveNodes.split(/[\r\n,;]+/).map(s=>s.trim()).filter(Boolean);
-            let syncKey = nextConfig.syncApiKey || '';
-            let currentHost = new URL(request.url).hostname;
-            // Strip master-only secrets so they never leave this panel. Slave nodes keep their
-            // own values (slave merges via { ...sysConfig, ...data.config }, so omitted keys are untouched).
-            let slaveConfig = { ...nextConfig };
-            ['cfAccountId', 'cfApiToken', 'cfWorkerName', 'tgToken', 'tgChatId', 'tgAdminId'].forEach(k => delete slaveConfig[k]);
-            nodes.forEach(node => {
-                if(node !== currentHost) {
-                     ctx?.waitUntil(fetch(`https://${node}/${encodeURI(nextConfig.apiRoute)}/api/sync`, {
-                         method: 'POST',
-                         headers: { 'Content-Type': 'application/json' },
-                         body: JSON.stringify({ key: syncKey, config: slaveConfig, fromMaster: true })
-                     }).catch(() => {}));
+                    let successCount = 0;
+                    await Promise.all(usernames.map(async (uname) => {
+                        const user = window.allUsers.find(u => u.username === uname);
+                        if (!user) return;
+                        const isCurrentActive = user.is_active !== 0;
+                        const shouldToggle = (targetActive === 1 && !isCurrentActive) || (targetActive === 0 && isCurrentActive);
+                        if (shouldToggle) {
+                            try {
+                                const res = await fetch('/api/users/' + encodeURIComponent(uname), {
+                                    method: 'PUT',
+                                    headers: { 'Content-Type': 'application/json' },
+                                    body: JSON.stringify({ toggle_only: true })
+                                });
+                                if (res.ok) successCount++;
+                            } catch(e) {}
+                        } else {
+                            successCount++;
+                        }
+                    }));
+                    alert('✅ عملیات ' + actionText + ' با موفقیت برای تمامی کاربران واجد شرایط اعمال شد.');
+                } finally {
+                    buttons.forEach(btn => btn.disabled = false);
+                    updateBulkActionsBar();
+                    await loadUsers(true);
                 }
-            });
-        }
-        
-        if (nextConfig.tgToken && ctx) {
-            const hookUrl = `https://${new URL(request.url).hostname}/${encodeURI(nextConfig.apiRoute)}/tg`;
-            ctx.waitUntil(fetch(`https://api.telegram.org/bot${nextConfig.tgToken}/setWebhook`, {
-                method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({ url: hookUrl })
-            }).catch(()=>{}));
-        }
-
-        return new Response(JSON.stringify({ success: true, newRoute: nextConfig.apiRoute, tagWarning }), { status: 200 });
-    } catch (e) { return new Response(JSON.stringify({ success: false }), { status: 400 }); }
-}
-
-async function handleSyncPanel(request, env, ctx) {
-    try {
-        const data = await request.json();
-        if (!data.signal || data.signal !== "panel_login") {
-            return new Response(JSON.stringify({ success: false, error: "Invalid signal" }), { status: 400 });
-        }
-        if (!data.tgAdminId || !data.panelHost) {
-            return new Response(JSON.stringify({ success: false, error: "Missing fields" }), { status: 400 });
-        }
-        // Verify the tgAdminId matches this panel's config
-        const adminId = sysConfig.tgAdminId || sysConfig.tgChatId;
-        if (!adminId || adminId.toString() !== data.tgAdminId.toString()) {
-            return new Response(JSON.stringify({ success: false, error: "Unauthorized" }), { status: 401 });
-        }
-        const loginSignal = {
-            name: data.panelName || data.panelHost,
-            host: data.panelHost,
-            apiRoute: data.panelApiRoute || sysConfig.apiRoute,
-            masterKey: data.panelMasterKey,
-            isLocal: false,
-            ts: data.ts || Date.now()
-        };
-        if (env.IOT_DB) {
-            ctx?.waitUntil(d1Put(env, "tg_panel_login", JSON.stringify(loginSignal)).catch(()=>{}));
-        }
-        return new Response(JSON.stringify({ success: true }), { status: 200 });
-    } catch (e) {
-        return new Response(JSON.stringify({ success: false }), { status: 400 });
-    }
-}
-
-const botI18n = {
-    en: {
-        welcome: "🤖 **Welcome to lowkey Bot**\nSelect your option below to manage your system:",
-        status: "System Status",
-        users: "Subscribers",
-        metrics: "Gateway Health",
-        panic: "Panic Mode",
-        dash: "Dashboard Control",
-        lang: "🌐 Change Language",
-        active: "🟢 Active",
-        paused: "🔴 Paused",
-        uptime: "Uptime",
-        streams: "📡 Active Streams",
-        no_users: "No subscribers found.",
-        sub_info: "👤 Subscriber Details:",
-        name: "Name",
-        total: "Total Reqs",
-        daily: "Daily Reqs",
-        expiry: "Expiry",
-        days: "Days remaining",
-        created: "Created At",
-        unlimited: "Unlimited",
-        btn_back: "◀️ Back",
-        btn_next: "▶️ Next",
-        btn_del: "Delete",
-        btn_pause: "Pause",
-        btn_resume: "Resume",
-        btn_edit_name: "Change Name",
-        btn_edit_limits: "Limits",
-        btn_add: "+ Add Subscriber",
-        btn_confirm: "Confirm",
-        btn_cancel: "Cancel",
-        msg_enter_name: "Please send a name for the subscriber:",
-        msg_added: "Sub added successfully! 🎉",
-        msg_deleted: "Sub deleted successfully! 🗑️",
-        msg_panic: "🚨 PANIC MODE ACTIVATED 🚨\nRoute randomized & System Paused.",
-        msg_invalid: "Invalid input. Please try again.",
-        msg_enter_limits: "Enter limits format:\n`[totalReqs] [dailyReqs] [days_limit]`\n(Use 0 for unlimited)\n\nExample:\n`10000 500 30`",
-        msg_confirm_del: "⚠️ Are you sure you want to delete this subscriber?",
-        msg_confirm_panic: "⚠️ Are you absolutely sure you want to trigger PANIC mode? This will randomize API routes and pause all connections!",
-        status_updated: "Status updated!",
-        access_denied: "Access Denied. You are not authorized to manage this panel.",
-        dashboard: "Dashboard",
-        search: "Search User",
-        statistics: "Statistics",
-        panel_info: "Panel Info",
-        disabled_users: "Disabled Users",
-        reset_traffic: "Reset Traffic",
-        extend_expiry: "Extend Expiry",
-        notes: "Notes",
-        device_limit: "Config Limit",
-        msg_enter_search: "🔍 Send a username, UUID, or subscription to search:",
-        msg_enter_notes: "📝 Send notes for this user:",
-        msg_enter_extend_days: "📅 Enter number of days to extend expiration:",
-        msg_traffic_reset: "Traffic has been reset successfully!",
-        msg_expiry_extended: "Expiration extended by {days} days!",
-        msg_no_disabled: "No disabled users found.",
-        msg_enter_device_limit: "Enter config limit (0 for unlimited):",
-        config_limit_updated: "Config limit updated!",
-        stats_title: "Panel Statistics",
-        count_active: "active",
-        count_paused: "paused",
-        count_disabled: "auto-disabled",
-        dash_total: "Total Users",
-        dash_active: "Active",
-        dash_paused: "Paused",
-        dash_expired: "Expired",
-        dash_auto_disabled: "Auto-Disabled",
-        btn_main_menu: "Main Menu",
-        btn_back_to_list: "Back to List",
-        total_traffic: "Total Traffic",
-        daily_traffic: "Daily Traffic",
-        lbl_status: "Status",
-        lbl_subscription: "Subscription Connection",
-        lbl_user_not_found: "⚠️ User not found",
-        lbl_none: "None",
-        lbl_page: "Page",
-        select_panel: "🔌 Which panel do you want to manage?",
-        current_panel: "Current Panel",
-        switch_panel: "🔄 Switch Panel",
-        panel_local: "🏠 This Panel",
-        panel_remote: "🌐",
-        msg_panel_selected: "Panel selected! ✅",
-        msg_panel_error: "❌ Failed to connect to the selected panel.",
-        msg_panel_unreachable: "⚠️ Panel is unreachable. Please check the configuration.",
-        btn_sub_link: "Subscription Link",
-        sub_link_sent: "Subscription link sent!",
-        btn_update_usage: "Update Usage",
-        tg_settings: "Settings", tg_advanced: "Advanced", tg_logs: "Logs",
-        tg_sys_settings: "System Settings", tg_adv_settings: "Advanced Settings",
-        tg_logs_view: "View Logs", tg_logs_clear: "Clear Logs",
-        tg_proto: "Protocol", tg_ports: "Ports", tg_uuid: "Device UUID", tg_path: "API Route",
-        tg_pass: "Master Key", tg_dns: "DNS", tg_relay: "Relay IP", tg_maintenance: "Maintenance Hosts",
-        tg_tfo: "TCP Fast Open", tg_ech: "ECH", tg_silent: "Silent Alerts", tg_pause: "Kill Switch",
-        tg_direct: "Direct Configs", tg_nat64: "NAT64",
-        tg_clean_ips: "Clean IPs", tg_nodes: "Nodes", tg_strategy: "Name Strategy",
-        tg_prefix: "Name Prefix", tg_fake_entries: "Fake Entries", tg_cf_settings: "Cloudflare Settings",
-        tg_tg_settings: "Telegram Settings", tg_backup: "Backup", tg_restore: "Restore",
-        tg_current_val: "Current Value", tg_new_val: "Send new value:",
-        tg_saved: "Saved!", tg_cancelled: "Cancelled",
-        tg_log_entry: "", tg_log_empty: "No logs found",
-        tg_u_custom_name: "Custom Name", tg_u_clean_ips: "Clean IPs", tg_u_proxy_ips: "Proxy IPs",
-        tg_u_nodes: "Nodes", tg_u_nat64: "NAT64", tg_u_mode: "Protocol Mode", tg_u_ports: "Ports", tg_u_conn_limit: "Conn Limit", tg_u_panel_url: "Panel URL",
-        tg_u_max_cfg: "Max Configs", tg_u_all: "All Settings",
-        tg_network: "Network", tg_uptime: "Uptime", tg_conns: "Active Connections",
-        tg_version: "Version", tg_cf_usage: "CF Usage",
-    },
-    fa: {
-        welcome: "🤖 **به ربات ترانزیت lowkey خوش آمدید**\nجهت مدیریت سیستم نظارتی خود یکی از گزینه‌های زیر را انتخاب نمایید:",
-        status: "وضعیت سیستم",
-        users: "مدیریت مشترکین",
-        metrics: "سلامت درگاه شبکه",
-        panic: "وضعیت اضطراری (Panic)",
-        dash: "پنل تحت وب",
-        lang: "🌐 تغییر زبان به انگلیسی",
-        active: "🟢 فعال",
-        paused: "🔴 متوقف شده",
-        uptime: "زمان کارکرد",
-        streams: "📡 اتصالات فعال",
-        no_users: "هیچ مشترکی پیدا نشد.",
-        sub_info: "👤 مشخصات مشترک:",
-        name: "نام",
-        total: "درخواست کل",
-        daily: "درخواست روزانه",
-        expiry: "انقضاء",
-        days: "روزهای باقی‌مانده",
-        created: "تاریخ ایجاد",
-        unlimited: "نامحدود",
-        btn_back: "بازگشت",
-        btn_next: "بعدی",
-        btn_del: "حذف",
-        btn_pause: "غیرفعال‌سازی",
-        btn_resume: "فعال‌سازی",
-        btn_edit_name: "تغییر نام",
-        btn_edit_limits: "ویرایش محدودیت‌ها",
-        btn_add: "+ افزودن مشترک جدید",
-        btn_confirm: "تأیید",
-        btn_cancel: "انصراف",
-        msg_enter_name: "لطفاً نام یا شناسه مشترک جدید را ارسال نمایید:",
-        msg_added: "مشترک با موفقیت افزوده شد!",
-        msg_deleted: "مشترک با موفقیت حذف گردید!",
-        msg_panic: "وضعیت اضطراری فعال شد\nمسیر تصادفی شد و سیستم متوقف گردید.",
-        msg_invalid: "ورودی نامعتبر است. مجدداً تلاش نمایید.",
-        msg_enter_limits: "فرمت ورودی محدودیت:\n`[کل] [روزانه] [مدت_روز]`\n(از 0 برای نامحدود استفاده کنید)\n\nمثال:\n`10000 500 30`",
-        msg_confirm_del: "آیا از حذف این مشترک اطمینان کامل دارید؟",
-        msg_confirm_panic: "آیا از فعال‌سازی وضعیت اضطراری اطمینان دارید؟ کل اتصالات متوقف و آدرس‌ها منقضی خواهند شد!",
-        status_updated: "وضعیت بروزرسانی شد!",
-        access_denied: "دسترسی غیرمجاز. شما اجازه مدیریت این پنل را ندارید.",
-        dashboard: "داشبورد",
-        search: "جستجوی کاربر",
-        statistics: "آمار",
-        panel_info: "اطلاعات پنل",
-        disabled_users: "کاربران غیرفعال",
-        reset_traffic: "بازنشانی ترافیک",
-        extend_expiry: "تمدید انقضا",
-        notes: "یادداشت‌ها",
-        device_limit: "محدودیت کانفیگ",
-        msg_enter_search: "🔍 نام کاربری، UUID یا لینک اشتراک را ارسال کنید:",
-        msg_enter_notes: "📝 یادداشت برای این کاربر را ارسال کنید:",
-        msg_enter_extend_days: "📅 تعداد روزهای تمدید را وارد کنید:",
-        msg_traffic_reset: "ترافیک با موفقیت بازنشانی شد!",
-        msg_expiry_extended: "انقضا به مدت {days} روز تمدید شد!",
-        msg_no_disabled: "هیچ کاربر غیرفعالی یافت نشد.",
-        msg_enter_device_limit: "محدودیت تعداد کانفیگ را وارد کنید (0 برای نامحدود):",
-        config_limit_updated: "محدودیت کانفیگ به‌روزرسانی شد!",
-        stats_title: "آمار پنل",
-        count_active: "فعال",
-        count_paused: "متوقف",
-        count_disabled: "غیرفعال خودکار",
-        dash_total: "کل کاربران",
-        dash_active: "فعال",
-        dash_paused: "متوقف",
-        dash_expired: "منقضی",
-        dash_auto_disabled: "غیرفعال خودکار",
-        btn_main_menu: "منوی اصلی",
-        btn_back_to_list: "بازگشت به لیست",
-        total_traffic: "ترافیک کل",
-        daily_traffic: "ترافیک روزانه",
-        lbl_status: "وضعیت",
-        lbl_subscription: "لینک اشتراک",
-        lbl_user_not_found: "⚠️ کاربر یافت نشد",
-        lbl_none: "ندارد",
-        lbl_page: "صفحه",
-        select_panel: "🔌 کدام پنل را می‌خواهید مدیریت کنید؟",
-        current_panel: "پنل فعلی",
-        switch_panel: "🔄 تغییر پنل",
-        panel_local: "🏠 این پنل",
-        panel_remote: "🌐",
-        msg_panel_selected: "پنل انتخاب شد! ✅",
-        msg_panel_error: "❌ اتصال به پنل انتخابی ناموفق بود.",
-        msg_panel_unreachable: "⚠️ پنل در دسترس نیست. لطفاً پیکربندی را بررسی کنید.",
-        btn_sub_link: "لینک اشتراک",
-        sub_link_sent: "لینک اشتراک ارسال شد!",
-        btn_update_usage: "بروزرسانی مصرف",
-        tg_settings: "تنظیمات", tg_advanced: "پیشرفته", tg_logs: "گزارش‌ها",
-        tg_sys_settings: "تنظیمات سیستم", tg_adv_settings: "تنظیمات پیشرفته",
-        tg_logs_view: "مشاهده گزارش‌ها", tg_logs_clear: "پاک کردن گزارش‌ها",
-        tg_proto: "پروتکل", tg_ports: "پورت‌ها", tg_uuid: "شناسه دستگاه", tg_path: "مسیر API",
-        tg_pass: "کلید اصلی", tg_dns: "DNS", tg_relay: "آی‌پی رله", tg_maintenance: "سایت استتار",
-        tg_tfo: "TCP Fast Open", tg_ech: "ECH", tg_silent: "هشدار خاموش", tg_pause: "کلید توقف",
-        tg_direct: "کانفیگ مستقیم", tg_nat64: "NAT64",
-        tg_clean_ips: "آی‌پی تمیز", tg_nodes: "نودها", tg_strategy: "روش نام‌گذاری",
-        tg_prefix: "پیشوند", tg_fake_entries: "ورودی‌های اشتراک", tg_cf_settings: "تنظیمات کلودفلر",
-        tg_tg_settings: "تنظیمات تلگرام", tg_backup: "پشتیبان‌گیری", tg_restore: "بازیابی",
-        tg_current_val: "مقدار فعلی", tg_new_val: "مقدار جدید را ارسال کنید:",
-        tg_saved: "ذخیره شد!", tg_cancelled: "لغو شد",
-        tg_log_entry: "", tg_log_empty: "گزارشی ثبت نشده",
-        tg_u_custom_name: "نام سفارشی", tg_u_clean_ips: "آی‌پی تمیز", tg_u_proxy_ips: "آی‌پی پروکسی",
-        tg_u_nodes: "نودها", tg_u_nat64: "NAT64", tg_u_mode: "پروتکل", tg_u_ports: "پورت‌ها", tg_u_conn_limit: "محدودیت اتصال", tg_u_panel_url: "آدرس پنل",
-        tg_u_max_cfg: "حداکثر کانفیگ", tg_u_all: "همه تنظیمات",
-        tg_network: "شبکه", tg_uptime: "زمان کارکرد", tg_conns: "اتصالات فعال",
-        tg_version: "نسخه", tg_cf_usage: "مصرف کلودفلر",
-    }
-};
-
-function getPanelsList() {
-    const panels = [];
-    panels.push({
-        name: sysConfig.name || "Main Panel",
-        host: null,
-        apiRoute: sysConfig.apiRoute,
-        apiKey: null,
-        isLocal: true
-    });
-    if (sysConfig.linkedPanels && Array.isArray(sysConfig.linkedPanels)) {
-        sysConfig.linkedPanels.forEach(p => {
-            if (p && p.host) {
-                panels.push({
-                    name: p.name || p.host,
-                    host: p.host,
-                    apiRoute: p.apiRoute || sysConfig.apiRoute,
-                    apiKey: p.apiKey || p.masterKey || null,
-                    isLocal: false
-                });
             }
-        });
-    }
-    return panels;
-}
-
-async function remotePanelFetch(panel, method, path, body = null) {
-    try {
-        const url = `https://${panel.host}/${encodeURI(panel.apiRoute)}${path}`;
-        const options = {
-            method,
-            headers: { 'Content-Type': 'application/json' }
-        };
-        if (body) options.body = JSON.stringify(body);
-        const res = await fetch(url, { ...options, signal: AbortSignal.timeout(8000) });
-        return await res.json();
-    } catch(e) {
-        return { success: false, error: e.message };
-    }
-}
-
-async function fetchRemotePanelUsers(panel) {
-    return await remotePanelFetch(panel, 'GET', `/api/users?key=${encodeURIComponent(panel.apiKey)}`);
-}
-
-async function fetchRemotePanelUser(panel, userId) {
-    return await remotePanelFetch(panel, 'GET', `/api/users?id=${encodeURIComponent(userId)}&key=${encodeURIComponent(panel.apiKey)}`);
-}
-
-async function fetchRemotePanelStats(panel) {
-    return await remotePanelFetch(panel, 'GET', `/api/stats?key=${encodeURIComponent(panel.apiKey)}`);
-}
-
-async function fetchRemotePanelConfig(panel) {
-    return await remotePanelFetch(panel, 'POST', '/api/auth', { key: panel.apiKey });
-}
-
-async function remotePanelWriteAction(panel, method, userId, body = null) {
-    let path = '/api/users';
-    if (userId) path += `?id=${encodeURIComponent(userId)}&key=${encodeURIComponent(panel.apiKey)}`;
-    else path += `?key=${encodeURIComponent(panel.apiKey)}`;
-    return await remotePanelFetch(panel, method, path, body || { key: panel.apiKey });
-}
-
-async function remotePanelToggleUser(panel, userId) {
-    return await remotePanelFetch(panel, 'POST', `/api/users?id=${encodeURIComponent(userId)}&action=toggle&key=${encodeURIComponent(panel.apiKey)}`);
-}
-
-async function remotePanelResetTraffic(panel, userId) {
-    return await remotePanelFetch(panel, 'POST', `/api/users?id=${encodeURIComponent(userId)}&action=reset&key=${encodeURIComponent(panel.apiKey)}`);
-}
-
-async function handleTelegramWebhook(request, env, hostName, ctx) {
-    try {
-        const update = await request.json();
-        const tgApi = `https://api.telegram.org/bot${sysConfig.tgToken}`;
-
-        const langCode = sysConfig.tgBotLang || "fa";
-        const t = (key) => botI18n[langCode]?.[key] || botI18n["en"]?.[key] || key;
-
-        const callerId = update.callback_query?.from?.id?.toString() || update.message?.from?.id?.toString();
-        const adminId = sysConfig.tgAdminId || sysConfig.tgChatId;
-        const isAuthorized = adminId && callerId === adminId.toString();
-
-        if (!isAuthorized) {
-            const chatId = update.callback_query?.message?.chat?.id || update.message?.chat?.id;
-            if (chatId) {
-                await fetch(`${tgApi}/sendMessage`, {
-                    method: 'POST',
-                    headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify({ 
-                        chat_id: chatId, 
-                        text: "❌ *شما دسترسی به این ربات را ندارید.*\n\nیوزر آیدی شما جهت اضافه کردن به لیست ادمین ها: `" + (callerId || "Unknown") + "`", 
-                        parse_mode: 'Markdown' 
-                    })
-                });
-            }
-            return new Response(JSON.stringify({ success: false, error: "Unauthorized" }), { status: 200 });
         }
-
-        let tgState = {};
-        try {
-            const storedState = await d1Get(env, "tg_bot_state");
-            if (storedState) tgState = JSON.parse(storedState);
-        } catch (e) { }
-
-        const panels = getPanelsList();
-
-        // Read last login signal from D1 (set by handleAuth or handleSyncPanel)
-        let lastLoginPanel = null;
-        try {
-            const stored = await d1Get(env, "tg_panel_login");
-            if (stored) lastLoginPanel = JSON.parse(stored);
-        } catch (e) { }
-
-        const getActivePanel = () => {
-            if (lastLoginPanel) {
-                if (lastLoginPanel.isLocal) return panels.find(p => p.isLocal) || panels[0];
-                const found = panels.find(p => !p.isLocal && p.host === lastLoginPanel.host);
-                if (found) return found;
-                // Remote panel not in linkedPanels — synthesize from login signal
-                return {
-                    name: lastLoginPanel.name || lastLoginPanel.host,
-                    host: lastLoginPanel.host,
-                    apiRoute: lastLoginPanel.apiRoute || sysConfig.apiRoute,
-                    apiKey: lastLoginPanel.apiKey || lastLoginPanel.masterKey || null,
-                    isLocal: false
-                };
-            }
-            return panels[0]; // default to local
-        };
-
-        // Custom sendOrEdit message helper
-        const sendOrEdit = async (chatId, text, replyMarkup = null, messageId = null) => {
-            let res;
-            if (messageId) {
-                res = await fetch(`${tgApi}/editMessageText`, {
-                    method: 'POST',
-                    headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify({
-                        chat_id: chatId,
-                        message_id: messageId,
-                        text: text,
-                        parse_mode: 'Markdown',
-                        reply_markup: replyMarkup
-                    })
-                });
-                if (res.ok) return res;
+        async function bulkReset(actionType) {
+            const usernames = Array.from(window.selectedUsernames);
+            if (usernames.length === 0) return;
+            let actionName = '';
+            if (actionType === 'volume') actionName = 'حجم مصرفی';
+            else if (actionType === 'req') actionName = 'تعداد ریکوئست‌ها';
+            else if (actionType === 'time') actionName = 'زمان اشتراک';
+            if (confirm('آیا از ریست کردن گروهی ' + actionName + ' برای ' + usernames.length + ' کاربر انتخاب شده مطمئن هستید؟')) {
+                const bar = document.getElementById('bulk-actions-bar');
+                const buttons = bar.querySelectorAll('button');
+                buttons.forEach(btn => btn.disabled = true);
                 try {
-                    const errBody = await res.json();
-                    if (errBody?.description?.includes("message is not modified")) return res;
-                } catch (e) {}
-            }
-            res = await fetch(`${tgApi}/sendMessage`, {
-                method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({
-                    chat_id: chatId,
-                    text: text,
-                    parse_mode: 'Markdown',
-                    reply_markup: replyMarkup
-                })
-            });
-            return res;
-        };
-
-        const getMainMenu = (activePanel, isAdmin = true) => {
-            const isPaused = sysConfig.isPaused || false;
-            const statusEmoji = isPaused ? "🔴" : "🟢";
-            const users = sysConfig.users || [];
-            const activeCount = users.filter(u => !u.isPaused && (!u.expiryMs || Date.now() <= u.expiryMs)).length;
-            const pausedCount = users.filter(u => u.isPaused && !u.disabledReason).length;
-            const autoDisabledCount = users.filter(u => u.isPaused && u.disabledReason).length;
-            const isLocal = !activePanel || activePanel.isLocal;
-            const panelName = activePanel ? activePanel.name : (sysConfig.name || "Main Panel");
-            const panelIndicator = isLocal ? `🏠 ${panelName}` : `🌐 ${panelName}`;
-            let text = `${t("welcome")}\n\n` +
-                         `━━━━━━━━━━━━━━━━\n` +
-                         `📌 **${t("current_panel")}**: ${panelIndicator}\n` +
-                         `⚡ **${t("status")}**: ${isPaused ? t("paused") : t("active")} ${statusEmoji}\n` +
-                         `👥 **${t("users")}**: ${users.length} (${activeCount} ${t("count_active")}, ${pausedCount} ${t("count_paused")}, ${autoDisabledCount} ${t("count_disabled")})\n` +
-                         `━━━━━━━━━━━━━━━━`;
-            const panelUrl = isLocal ? `https://${hostName}/${encodeURI(sysConfig.apiRoute)}/dash` : null;
-            const subUrl = `https://${hostName}/${sysConfig.apiRoute}`;
-            /** @type {any} */
-            const inline_keyboard = [];
-            if (isAdmin) {
-                inline_keyboard.push([
-                    { text: `👥 ${t("users")}`, callback_data: "subs_list:0" },
-                    { text: `🔍 ${t("search")}`, callback_data: "sub_search_init" }
-                ]);
-            }
-            inline_keyboard.push([
-                { text: `📊 ${t("dashboard")}`, callback_data: "sys_dashboard" },
-                { text: `📈 ${t("statistics")}`, callback_data: "sys_stats" }
-            ]);
-            inline_keyboard.push([
-                { text: `🔗 ${t("btn_sub_link")}`, callback_data: "get_sub_link" }
-            ]);
-            if (isAdmin) {
-                inline_keyboard.push([
-                    { text: `🚫 ${t("disabled_users")}`, callback_data: "subs_disabled:0" }
-                ]);
-                inline_keyboard.push([
-                    { text: `⚙️ ${t("tg_settings")}`, callback_data: "tg_settings_menu" },
-                    { text: `🔧 ${t("tg_advanced")}`, callback_data: "tg_advanced_menu" }
-                ]);
-                inline_keyboard.push([
-                    { text: `📋 ${t("tg_logs")}`, callback_data: "tg_logs_menu" }
-                ]);
-            }
-            inline_keyboard.push([
-                { text: `🌐 ${langCode === 'fa' ? 'English 🇺🇸' : 'فارسی 🇮🇷'}`, callback_data: "sys_lang" },
-                { text: isPaused ? `▶️ ${t("btn_resume")}` : `⏸️ ${t("btn_pause")}`, callback_data: "sys_toggle_status" }
-            ]);
-            if (panelUrl) {
-                inline_keyboard.push([
-                    { text: `🔑 ${t("dash")}`, web_app: { url: panelUrl } },
-                    { text: `ℹ️ ${t("panel_info")}`, callback_data: "sys_panel_info" }
-                ]);
-                if (isAdmin) {
-                    inline_keyboard.push([
-                        { text: `🚨 ${t("panic")}`, callback_data: "sys_panic_init" }
-                    ]);
+                    let successCount = 0;
+                    await Promise.all(usernames.map(async (uname) => {
+                        try {
+                            const res = await fetch('/api/users/' + encodeURIComponent(uname), {
+                                method: 'PUT',
+                                headers: { 'Content-Type': 'application/json' },
+                                body: JSON.stringify({ reset_action: actionType })
+                            });
+                            if (res.ok) successCount++;
+                        } catch(e) {}
+                    }));
+                    alert('✅ عملیات ریست گروهی ' + actionName + ' با موفقیت برای ' + successCount + ' کاربر اعمال شد.');
+                } finally {
+                    buttons.forEach(btn => btn.disabled = false);
+                    updateBulkActionsBar();
+                    await loadUsers(true);
                 }
+            }
+        }
+        function toggleBulkEditModal(show) {
+            const modal = document.getElementById('bulk-edit-modal');
+            const card = document.getElementById('bulk-edit-modal-card');
+            if (show) {
+                modal.classList.remove('opacity-0', 'pointer-events-none');
+                modal.classList.add('opacity-100', 'pointer-events-auto');
+                card.classList.remove('opacity-0', 'scale-95');
+                card.classList.add('opacity-100', 'scale-100');
             } else {
-                inline_keyboard.push([
-                    { text: `ℹ️ ${t("panel_info")}`, callback_data: "sys_panel_info" }
-                ]);
+                modal.classList.remove('opacity-100', 'pointer-events-auto');
+                modal.classList.add('opacity-0', 'pointer-events-none');
+                card.classList.remove('opacity-100', 'scale-100');
+                card.classList.add('opacity-0', 'scale-95');
+                document.getElementById('bulk-edit-form').reset();
             }
-            const kb = { inline_keyboard };
-            return { text, kb };
-        };
-
-        const getSubsList = (page = 0, usersList = null) => {
-            const users = usersList || sysConfig.users || [];
-            const itemsPerPage = 5;
-            const totalPages = Math.ceil(users.length / itemsPerPage);
-            const start = page * itemsPerPage;
-            const end = start + itemsPerPage;
-            const pageUsers = users.slice(start, end);
-            
-            let text = `👥 **${t("users")}** (${t("lbl_page")} ${page + 1}/${Math.max(1, totalPages)})\n`;
-            text += `━━━━━━━━━━━━━━━━\n`;
-            
-            if (users.length === 0) {
-                text += `⚠️ ${t("no_users")}\n`;
-            } else {
-                pageUsers.forEach((u, idx) => {
-                    text += `${start + idx + 1}. 👤 **${u.name}**\n   \`${u.id}\`\n`;
-                });
+        }
+        function bulkEdit() {
+            toggleBulkEditModal(true);
+        }
+        async function handleBulkEditSubmit(event) {
+            event.preventDefault();
+            const submitButton = document.getElementById('bulk-submit-btn');
+            submitButton.disabled = true;
+            submitButton.innerText = 'در حال ثبت تغییرات...';
+            const usernames = Array.from(window.selectedUsernames);
+            const applyLimit = document.getElementById('bulk-apply-limit').checked;
+            const limitValue = document.getElementById('bulk-input-limit').value || null;
+            const applyExpiry = document.getElementById('bulk-apply-expiry').checked;
+            const expiryValue = document.getElementById('bulk-input-expiry').value || null;
+            const applyReqLimit = document.getElementById('bulk-apply-req-limit').checked;
+            const reqLimitValue = document.getElementById('bulk-input-req-limit').value || null;
+            const applyIpLimit = document.getElementById('bulk-apply-ip-limit').checked;
+            const ipLimitValue = document.getElementById('bulk-input-ip-limit').value || null;
+            const applyFingerprint = document.getElementById('bulk-apply-fingerprint').checked;
+            const fingerprintValue = document.getElementById('bulk-fingerprint-select').value;
+            const applyPorts = document.getElementById('bulk-apply-ports').checked;
+            const checkedPorts = Array.from(document.querySelectorAll('input[name="bulk-ports"]:checked')).map(cb => cb.value);
+            const portsValue = checkedPorts.join(',');
+            const tlsValue = checkedPorts.some(p => tlsPorts.includes(p)) ? 'on' : 'off';
+            const applyIps = document.getElementById('bulk-apply-ips').checked;
+            const ipsValue = document.getElementById('bulk-input-ips').value;
+            if (!applyLimit && !applyExpiry && !applyReqLimit && !applyIpLimit && !applyFingerprint && !applyPorts && !applyIps) {
+                alert('⚠️ لطفا حداقل یک فیلد را برای اعمال تغییر انتخاب کنید!');
+                submitButton.disabled = false;
+                submitButton.innerText = 'ثبت تغییرات گروهی';
+                return;
             }
-            text += `━━━━━━━━━━━━━━━━`;
-            
-            const inline_keyboard = [];
-            pageUsers.forEach((u) => {
-                inline_keyboard.push([{ text: `👤 ${u.name}`, callback_data: `sub_detail:${u.id}` }]);
-            });
-            
-            const navRow = [];
-            if (page > 0) {
-                navRow.push({ text: `⬅️ ${t("btn_back")}`, callback_data: `subs_list:${page - 1}` });
-            }
-            if (end < users.length) {
-                navRow.push({ text: `${t("btn_next")} ➡️`, callback_data: `subs_list:${page + 1}` });
-            }
-            if (navRow.length > 0) {
-                inline_keyboard.push(navRow);
-            }
-            
-            inline_keyboard.push([{ text: `➕ ${t("btn_add")}`, callback_data: "sub_add_init" }]);
-            inline_keyboard.push([{ text: t("btn_main_menu"), callback_data: "main_menu" }]);
-            
-            return { text, kb: { inline_keyboard } };
-        };
-
-        const getSubDetail = (uuid, usersList = null) => {
-            const users = usersList || sysConfig.users || [];
-            const u = users.find(usr => usr.id === uuid);
-            if (!u) {
-                return { text: "⚠️ User not found", kb: { inline_keyboard: [[{ text: t("btn_back"), callback_data: "subs_list:0" }]] } };
-            }
-            
-            const sysU = sysUsageCache?.users?.[u.id.replace(/-/g,'').toLowerCase()] || { reqs: 0, dReqs: 0, lastDay: '' };
-            const userReqs = sysU.reqs || 0;
-            const curDate = new Date().toISOString().split('T')[0];
-            const userDReqs = sysU.lastDay === curDate ? (sysU.dReqs || 0) : 0;
-            
-            const limitTotalTxt = u.limitTotalReq ? `${u.limitTotalReq}` : t("unlimited");
-            const limitDailyTxt = u.limitDailyReq ? `${u.limitDailyReq}` : t("unlimited");
-            const usedGB = (userReqs / 6000).toFixed(2);
-            const limitGB = u.limitTotalReq ? (u.limitTotalReq / 6000).toFixed(2) : t("unlimited");
-            
-            let expTxt = t("unlimited");
-            let isExp = false;
-            let daysLeft = t("unlimited");
-            if (u.expiryMs) {
-                const date = new Date(u.expiryMs);
-                expTxt = date.toLocaleDateString();
-                const remDays = Math.ceil((u.expiryMs - Date.now()) / 86400000);
-                daysLeft = remDays >= 0 ? `${remDays}` : '0';
-                if (Date.now() > u.expiryMs) {
-                    expTxt += ` (${t("dash_expired")} 🔴)`;
-                    isExp = true;
-                }
-            }
-            
-            const statusEmoji = u.isPaused ? "⏸️" : (isExp ? "🔴" : "🟢");
-            const statusText = u.isPaused ? t("paused") : (isExp ? t("dash_expired") : t("active"));
-            const subSync = `https://${hostName}/${sysConfig.apiRoute}?sub=${encodeURIComponent(u.name)}`;
-            const maxCfgTxt = u.maxConfigs || t("unlimited");
-            const notesTxt = u.notes || t("lbl_none");
-            const modeTxt = u.userMode ? (u.userMode === 'alpha' ? 'Alpha (V)' : u.userMode === 'beta' ? 'Beta (T)' : 'Both') : t("unlimited");
-            const portsTxt = u.userPorts || t("unlimited");
-            const cleanIpsTxt = u.cleanIp ? u.cleanIp.substring(0, 30) + (u.cleanIp.length > 30 ? '...' : '') : '—';
-            const proxyIpsTxt = u.proxyIp ? u.proxyIp.substring(0, 30) + (u.proxyIp.length > 30 ? '...' : '') : '—';
-            const nodesTxt = u.userNodes ? u.userNodes.substring(0, 30) + (u.userNodes.length > 30 ? '...' : '') : '—';
-            const nat64Txt = u.nat64 || '—';
-            
-            let text = `👤 **${t("sub_info")}**\n`;
-            text += `━━━━━━━━━━━━━━━━\n`;
-            text += `📛 **${t("name")}**: ${u.name}\n`;
-            text += `🆔 **UUID**: \`${u.id}\`\n`;
-            text += `🚦 **${t("lbl_status")}**: ${statusEmoji} ${statusText}\n`;
-            text += `📊 **${t("total")}**: ${usedGB} GB / ${limitGB} GB (${userReqs} reqs)\n`;
-            text += `⏱ **${t("daily")}**: ${userDReqs} / ${limitDailyTxt}\n`;
-            text += `📅 **${t("expiry")}**: ${expTxt}\n`;
-            text += `⏳ **${t("days")}**: ${daysLeft}\n`;
-            text += `📡 **${t("tg_u_mode")}**: ${modeTxt}\n`;
-            text += `🔌 **${t("tg_u_ports")}**: ${portsTxt}\n`;
-            text += `📱 **${t("device_limit")}**: ${maxCfgTxt}\n`;
-            text += `🧹 **${t("tg_u_clean_ips")}**: ${cleanIpsTxt}\n`;
-            text += `🔗 **${t("tg_u_proxy_ips")}**: ${proxyIpsTxt}\n`;
-            text += `🖥️ **${t("tg_u_nodes")}**: ${nodesTxt}\n`;
-            text += `🌐 **${t("tg_u_nat64")}**: ${nat64Txt}\n`;
-            text += `🔗 **${t("tg_u_conn_limit")}**: ${u.connLimit || t("unlimited")}\n`;
-            text += `🎛 **${t("tg_u_panel_url")}**: ${u.userPanelUrl || t("unlimited")}\n`;
-            text += `📝 **${t("notes")}**: ${notesTxt}\n`;
-            text += `━━━━━━━━━━━━━━━━\n`;
-            text += `🔗 **${t("lbl_subscription")}:**\n\`${subSync}\``;
-            
-            const kb = {
-                inline_keyboard: [
-                    [
-                        { text: u.isPaused ? `▶️ ${t("btn_resume")}` : `⏸️ ${t("btn_pause")}`, callback_data: `sub_toggle:${u.id}` },
-                        { text: `🗑️ ${t("btn_del")}`, callback_data: `sub_del_init:${u.id}` }
-                    ],
-                    [
-                        { text: `✏️ ${t("btn_edit_name")}`, callback_data: `sub_edit_name_init:${u.id}` },
-                        { text: `⚙️ ${t("btn_edit_limits")}`, callback_data: `sub_edit_limits_init:${u.id}` }
-                    ],
-                    [
-                        { text: `🔄 ${t("reset_traffic")}`, callback_data: `sub_reset_traffic:${u.id}` },
-                        { text: `📅 ${t("extend_expiry")}`, callback_data: `sub_extend_init:${u.id}` }
-                    ],
-                    [
-                        { text: `📝 ${t("notes")}`, callback_data: `sub_edit_notes_init:${u.id}` },
-                        { text: `📱 ${t("device_limit")}`, callback_data: `sub_edit_device_init:${u.id}` }
-                    ],
-                    [
-                        { text: t("btn_back_to_list"), callback_data: "subs_list:0" }
-                    ]
-                ]
-            };
-            return { text, kb };
-        };
-
-        if (update.callback_query) {
-            const cb = update.callback_query;
-            const chatId = cb.message?.chat?.id;
-            const messageId = cb.message?.message_id;
-            const data = cb.data;
-
-            if (chatId) {
-                if (!isAuthorized) {
-                    await fetch(`${tgApi}/answerCallbackQuery`, {
-                        method: 'POST',
-                        headers: { 'Content-Type': 'application/json' },
-                        body: JSON.stringify({ callback_query_id: cb.id, text: t("access_denied"), show_alert: true })
-                    });
-                    return new Response("OK", { status: 200 });
-                }
-
-                // Get active panel from last login signal
-                const activePanel = getActivePanel();
-                const isRemotePanel = activePanel && !activePanel.isLocal;
-
-                // Helper to fetch users for the active panel
-                const getPanelUsers = async () => {
-                    if (isRemotePanel) {
-                        const res = await fetchRemotePanelUsers(activePanel);
-                        return res.success ? (res.users || []) : null;
-                    }
-                    return sysConfig.users || [];
-                };
-
-                // Clear step state on callback query
-                tgState[chatId] = null;
-                ctx?.waitUntil(d1Put(env, "tg_bot_state", JSON.stringify(tgState)).catch(()=>{}));
-
-                let answerText = null;
-
-                if (data === "main_menu") {
-                    const menu = getMainMenu(activePanel, isAuthorized);
-                    await sendOrEdit(chatId, menu.text, menu.kb, messageId);
-                } else if (data === "sys_lang") {
-                    sysConfig.tgBotLang = (langCode === "fa") ? "en" : "fa";
-                    await cachedD1Put(env, "sys_config", JSON.stringify(sysConfig));
-                    const menu = getMainMenu(activePanel, isAuthorized);
-                    await sendOrEdit(chatId, menu.text, menu.kb, messageId);
-                } else if (data === "sys_toggle_status") {
-                    sysConfig.isPaused = !sysConfig.isPaused;
-                    await cachedD1Put(env, "sys_config", JSON.stringify(sysConfig));
-                    const menu = getMainMenu(activePanel, isAuthorized);
-                    await sendOrEdit(chatId, menu.text, menu.kb, messageId);
-                } else if (data === "sys_metrics") {
-                    let usageStr = t("unlimited");
-                    if (sysConfig.cfAccountId && sysConfig.cfApiToken) {
-                        const reqs = await fetchCloudflareUsage(sysConfig.cfAccountId, sysConfig.cfApiToken);
-                        if (reqs !== null) {
-                            const pct = ((reqs / 100000) * 100).toFixed(2);
-                            usageStr = `${reqs}/100000 (${pct}%)`;
-                        }
-                    }
-                    const upSeconds = Math.floor((Date.now() - isolateStartTime)/1000);
-                    const dh = Math.floor(upSeconds/3600);
-                    const dm = Math.floor((upSeconds%3600)/60);
-                    
-                    let text = `📡 **${t("metrics")}**\n`;
-                    text += `━━━━━━━━━━━━━━━━\n`;
-                    text += `⏱ **${t("uptime")}**: ${dh}h ${dm}m\n`;
-                    text += `🔌 **${t("streams")}**: ${activeConnections}\n`;
-                    text += `📊 **Cloudflare API Usage**: ${usageStr}\n`;
-                    text += `━━━━━━━━━━━━━━━━`;
-                    
-                    const kb = { inline_keyboard: [[{ text: t("btn_main_menu"), callback_data: "main_menu" }]] };
-                    await sendOrEdit(chatId, text, kb, messageId);
-                } else if (data.startsWith("subs_list:")) {
-                    const page = parseInt(data.replace("subs_list:", "")) || 0;
-                    const panelUsers = await getPanelUsers();
-                    if (panelUsers === null && isRemotePanel) {
-                        await sendOrEdit(chatId, t("msg_panel_error"), { inline_keyboard: [[{ text: t("btn_main_menu"), callback_data: "main_menu" }]] });
-                    } else {
-                        const list = getSubsList(page, panelUsers);
-                        await sendOrEdit(chatId, list.text, list.kb, messageId);
-                    }
-                } else if (data.startsWith("sub_detail:")) {
-                    const uuid = data.replace("sub_detail:", "");
-                    const panelUsers = await getPanelUsers();
-                    if (panelUsers === null && isRemotePanel) {
-                        await sendOrEdit(chatId, t("msg_panel_error"), { inline_keyboard: [[{ text: t("btn_main_menu"), callback_data: "main_menu" }]] });
-                    } else {
-                        const detail = getSubDetail(uuid, panelUsers);
-                        await sendOrEdit(chatId, detail.text, detail.kb, messageId);
-                    }
-                } else if (data.startsWith("sub_toggle:")) {
-                    const uuid = data.replace("sub_toggle:", "");
-                    if (isRemotePanel) {
-                        await remotePanelToggleUser(activePanel, uuid);
-                    } else if (sysConfig.users) {
-                        const u = sysConfig.users.find(usr => usr.id === uuid);
-                        if (u) {
-                            u.isPaused = !u.isPaused;
-                            await cachedD1Put(env, "sys_config", JSON.stringify(sysConfig));
-                        }
-                    }
-                    const panelUsers = await getPanelUsers();
-                    const detail = getSubDetail(uuid, panelUsers);
-                    await sendOrEdit(chatId, detail.text, detail.kb, messageId);
-                } else if (data.startsWith("sub_del_init:")) {
-                    const uuid = data.replace("sub_del_init:", "");
-                    const panelUsers = await getPanelUsers();
-                    const u = panelUsers?.find(usr => usr.id === uuid);
-                    const name = u ? u.name : "";
-                    const text = `${t("msg_confirm_del")}\n\n👤 **${name}**`;
-                    const kb = {
-                        inline_keyboard: [
-                            [
-                                { text: `✅ ${t("btn_confirm")}`, callback_data: `sub_del_confirm:${uuid}` },
-                                { text: `❌ ${t("btn_cancel")}`, callback_data: `sub_detail:${uuid}` }
-                            ]
-                        ]
-                    };
-                    await sendOrEdit(chatId, text, kb, messageId);
-                } else if (data.startsWith("sub_del_confirm:")) {
-                    const uuid = data.replace("sub_del_confirm:", "");
-                    if (isRemotePanel) {
-                        await remotePanelWriteAction(activePanel, 'DELETE', uuid);
-                    } else if (sysConfig.users) {
-                        sysConfig.users = sysConfig.users.filter(usr => usr.id !== uuid);
-                        await cachedD1Put(env, "sys_config", JSON.stringify(sysConfig));
-                    }
-                    const successText = `✅ ${t("msg_deleted")}`;
-                    const kb = { inline_keyboard: [[{ text: t("btn_back"), callback_data: "subs_list:0" }]] };
-                    await sendOrEdit(chatId, successText, kb, messageId);
-                } else if (data === "sub_add_init") {
-                    tgState[chatId] = { step: "sub_add_name" };
-                    ctx?.waitUntil(d1Put(env, "tg_bot_state", JSON.stringify(tgState)).catch(()=>{}));
-                    const text = `➕ ${t("msg_enter_name")}`;
-                    const kb = { inline_keyboard: [[{ text: `❌ ${t("btn_cancel")}`, callback_data: "subs_list:0" }]] };
-                    await sendOrEdit(chatId, text, kb, messageId);
-                } else if (data.startsWith("sub_edit_name_init:")) {
-                    const uuid = data.replace("sub_edit_name_init:", "");
-                    tgState[chatId] = { step: `sub_edit_name:${uuid}` };
-                    ctx?.waitUntil(d1Put(env, "tg_bot_state", JSON.stringify(tgState)).catch(()=>{}));
-                    const text = `✏️ ${t("msg_enter_name")}`;
-                    const kb = { inline_keyboard: [[{ text: `❌ ${t("btn_cancel")}`, callback_data: `sub_detail:${uuid}` }]] };
-                    await sendOrEdit(chatId, text, kb, messageId);
-                } else if (data.startsWith("sub_edit_limits_init:")) {
-                    const uuid = data.replace("sub_edit_limits_init:", "");
-                    tgState[chatId] = { step: `sub_edit_limits:${uuid}` };
-                    ctx?.waitUntil(d1Put(env, "tg_bot_state", JSON.stringify(tgState)).catch(()=>{}));
-                    const text = `⚙️ ${t("msg_enter_limits")}`;
-                    const kb = {
-                        inline_keyboard: [
-                            [{ text: `♾️ Skip (Unlimited)`, callback_data: `sub_unlimit_cb:${uuid}` }],
-                            [{ text: `❌ ${t("btn_cancel")}`, callback_data: `sub_detail:${uuid}` }]
-                        ]
-                    };
-                    await sendOrEdit(chatId, text, kb, messageId);
-                } else if (data.startsWith("sub_unlimit_cb:")) {
-                    const uuid = data.replace("sub_unlimit_cb:", "");
-                    if (isRemotePanel) {
-                        await remotePanelWriteAction(activePanel, 'PUT', uuid, { key: activePanel.apiKey, trafficLimit: 0, dailyLimit: 0, expiryDays: 0 });
-                    } else if (sysConfig.users) {
-                        const u = sysConfig.users.find(usr => usr.id === uuid);
-                        if (u) {
-                            u.limitTotalReq = null;
-                            u.limitDailyReq = null;
-                            u.expiryMs = null;
-                            await cachedD1Put(env, "sys_config", JSON.stringify(sysConfig));
-                        }
-                    }
-                    const panelUsers = await getPanelUsers();
-                    const detail = getSubDetail(uuid, panelUsers);
-                    await sendOrEdit(chatId, detail.text, detail.kb, messageId);
-                } else if (data === "sub_add_unlimited_skip") {
-                    let stateName = "Subscriber";
+            try {
+                let successCount = 0;
+                await Promise.all(usernames.map(async (uname) => {
+                    const user = window.allUsers.find(u => u.username === uname);
+                    if (!user) return;
+                    const limit = applyLimit ? limitValue : user.limit_gb;
+                    const expiry = applyExpiry ? expiryValue : user.expiry_days;
+                    const reqLimit = applyReqLimit ? reqLimitValue : user.limit_req;
+                    const ipLimit = applyIpLimit ? ipLimitValue : user.ip_limit;
+                    const fingerprint = applyFingerprint ? fingerprintValue : user.fingerprint;
+                    const port = applyPorts ? portsValue : user.port;
+                    const tls = applyPorts ? tlsValue : user.tls;
+                    const ips = applyIps ? ipsValue : user.ips;
                     try {
-                        const savedStateRaw = await d1Get(env, "tg_bot_state");
-                        if (savedStateRaw) {
-                            const stObj = JSON.parse(savedStateRaw);
-                            if (stObj[chatId] && stObj[chatId].name) {
-                                stateName = stObj[chatId].name;
+                        const response = await fetch('/api/users/' + encodeURIComponent(uname), {
+                            method: 'PUT',
+                            headers: { 'Content-Type': 'application/json' },
+                            body: JSON.stringify({
+                                username: uname,
+                                limit_gb: limit,
+                                expiry_days: expiry,
+                                limit_req: reqLimit,
+                                tls,
+                                port,
+                                ips,
+                                fingerprint,
+                                ip_limit: ipLimit
+                            })
+                        });
+                        if (response.ok) {
+                            successCount++;
+                        }
+                    } catch (e) {}
+                }));
+                alert('✅ تغییرات با موفقیت روی ' + successCount + ' کاربر اعمال شد.');
+                toggleBulkEditModal(false);
+                window.selectedUsernames.clear();
+                updateBulkActionsBar();
+                await loadUsers(true);
+            } catch (err) {
+                alert('خطا در انجام تغییرات گروهی');
+            } finally {
+                submitButton.disabled = false;
+                submitButton.innerText = 'ثبت تغییرات گروهی';
+            }
+        }
+        window.globalFragLen = "20-30";
+        window.globalFragInt = "1-2";
+        const tlsPorts = ['443', '2053', '2083', '2087', '2096', '8443'];
+        const nonTlsPorts = ['80', '8080', '8880', '2052', '2082', '2086', '2095'];
+        let isEditMode = false;
+        let editingUsername = '';
+        function renderPortCheckboxes() {
+            const tlsContainer = document.getElementById('tls-ports-list');
+            const nonTlsContainer = document.getElementById('nontls-ports-list');
+            tlsContainer.innerHTML = tlsPorts.map(function(port) {
+                const isCheckedDefault = port === '443' ? 'checked' : '';
+                return '<label class="relative cursor-pointer">' +
+                    '<input type="checkbox" name="ports" value="' + port + '" ' + isCheckedDefault + ' class="peer sr-only">' +
+                    '<div class="flex items-center justify-center gap-2 px-3 py-2 border border-gray-200 dark:border-zinc-800/80 rounded-xl text-xs font-semibold select-none transition-all duration-200 hover:bg-gray-50 dark:hover:bg-zinc-800/40 text-gray-700 dark:text-zinc-300 peer-checked:bg-blue-50 dark:peer-checked:bg-blue-950/25 peer-checked:border-blue-500 dark:peer-checked:border-blue-500/70 peer-checked:text-blue-600 dark:peer-checked:text-blue-400 shadow-sm">' +
+                        '<span>' + port + '</span>' +
+                        '<svg class="w-4 h-4 hidden peer-checked:block text-blue-500" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2.5" d="M5 13l4 4L19 7"></path></svg>' +
+                    '</div>' +
+                '</label>';
+            }).join('');
+            nonTlsContainer.innerHTML = nonTlsPorts.map(function(port) {
+                const isCheckedDefault = port === '80' ? 'checked' : '';
+                return '<label class="relative cursor-pointer">' +
+                    '<input type="checkbox" name="ports" value="' + port + '" ' + isCheckedDefault + ' class="peer sr-only">' +
+                    '<div class="flex items-center justify-center gap-2 px-3 py-2 border border-gray-200 dark:border-zinc-800/80 rounded-xl text-xs font-semibold select-none transition-all duration-200 hover:bg-gray-50 dark:hover:bg-zinc-800/40 text-gray-700 dark:text-zinc-300 peer-checked:bg-amber-50 dark:peer-checked:bg-amber-950/25 peer-checked:border-amber-500 dark:peer-checked:border-amber-500/70 peer-checked:text-amber-600 dark:peer-checked:text-amber-400 shadow-sm">' +
+                        '<span>' + port + '</span>' +
+                        '<svg class="w-4 h-4 hidden peer-checked:block text-amber-500" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2.5" d="M5 13l4 4L19 7"></path></svg>' +
+                    '</div>' +
+                '</label>';
+            }).join('');
+        }
+        // Initialize 443 and 80 active state immediately
+        setTimeout(function() {
+            const cb443 = document.querySelector('input[name="ports"][value="443"]');
+            if (cb443) cb443.checked = true;
+            const cb80 = document.querySelector('input[name="ports"][value="80"]');
+            if (cb80) cb80.checked = true;
+        }, 100);
+        function toggleSettingsModal(show) {
+            const modal = document.getElementById('settings-modal');
+            const card = modal.querySelector('div');
+            if (show) {
+                modal.classList.remove('opacity-0', 'pointer-events-none');
+                modal.classList.add('opacity-100', 'pointer-events-auto');
+                card.classList.remove('opacity-0', 'scale-95');
+                card.classList.add('opacity-100', 'scale-100');
+            } else {
+                modal.classList.remove('opacity-100', 'pointer-events-auto');
+                modal.classList.add('opacity-0', 'pointer-events-none');
+                card.classList.remove('opacity-100', 'scale-100');
+                card.classList.add('opacity-0', 'scale-95');
+            }
+        }
+        function toggleModal(show) {
+            const modal = document.getElementById('user-modal');
+            const card = document.getElementById('user-modal-card');
+            if (show) {
+                modal.classList.remove('opacity-0', 'pointer-events-none');
+                modal.classList.add('opacity-100', 'pointer-events-auto');
+                card.classList.remove('opacity-0', 'scale-95');
+                card.classList.add('opacity-100', 'scale-100');
+            } else {
+                modal.classList.remove('opacity-100', 'pointer-events-auto');
+                modal.classList.add('opacity-0', 'pointer-events-none');
+                card.classList.remove('opacity-100', 'scale-100');
+                card.classList.add('opacity-0', 'scale-95');
+                isEditMode = false;
+                editingUsername = '';
+                document.getElementById('modal-title').innerText = 'ایجاد کاربر جدید';
+                document.getElementById('submit-btn').innerText = 'ایجاد کاربر';
+                document.getElementById('input-name').disabled = false;
+                document.getElementById('create-user-form').reset();
+                // بازگردانی پورت‌های 443 و 80 به حالت پیش‌فرض
+                const cb443 = document.querySelector('input[name="ports"][value="443"]');
+                if (cb443) cb443.checked = true;
+                const cb80 = document.querySelector('input[name="ports"][value="80"]');
+                if (cb80) cb80.checked = true;
+                // بازگردانی اثر انگشت به iOS
+                const fpSelect = document.getElementById('fingerprint-select');
+                if (fpSelect) fpSelect.value = 'ios';
+            }
+        }
+		function toggleUpdateModal(show, version = '') {
+            const modal = document.getElementById('update-modal');
+            const card = modal.querySelector('div');
+            if (show) {
+                if (version) {
+                    document.getElementById('update-modal-text').innerHTML = 'نسخه جدید (<b>v' + version + '</b>) در دسترس است.<br>اگر آپدیت خودکار جواب نداد، از روش دستی استفاده کنید.';
+                }
+                modal.classList.remove('opacity-0', 'pointer-events-none');
+                modal.classList.add('opacity-100', 'pointer-events-auto');
+                card.classList.remove('opacity-0', 'scale-95');
+                card.classList.add('opacity-100', 'scale-100');
+            } else {
+                modal.classList.remove('opacity-100', 'pointer-events-auto');
+                modal.classList.add('opacity-0', 'pointer-events-none');
+                card.classList.remove('opacity-100', 'scale-100');
+                card.classList.add('opacity-0', 'scale-95');
+            }
+        }
+        function openCreateModal() {
+            isEditMode = false;
+            editingUsername = '';
+            document.getElementById('modal-title').innerText = 'ایجاد کاربر جدید';
+            document.getElementById('submit-btn').innerText = 'ایجاد کاربر';
+            document.getElementById('input-name').disabled = false;
+            document.getElementById('create-user-form').reset();
+            // اطمینان از اعمال پیش‌فرض‌ها در زمان باز شدن فرم جدید
+            const cb443 = document.querySelector('input[name="ports"][value="443"]');
+            if (cb443) cb443.checked = true;
+            const cb80 = document.querySelector('input[name="ports"][value="80"]');
+            if (cb80) cb80.checked = true;
+            const fpSelect = document.getElementById('fingerprint-select');
+            if (fpSelect) fpSelect.value = 'ios';
+            toggleModal(true);
+        }
+        const themeToggleBtn = document.getElementById('theme-toggle');
+		if (localStorage.getItem('color-theme') === 'dark' || (!('color-theme' in localStorage) && window.matchMedia('(prefers-color-scheme: dark)').matches)) {
+            document.documentElement.classList.add('dark');
+        } else {
+            document.documentElement.classList.remove('dark');
+        }
+        themeToggleBtn.addEventListener('click', () => {
+            if (document.documentElement.classList.contains('dark')) {
+                document.documentElement.classList.remove('dark');
+                localStorage.setItem('color-theme', 'light');
+            } else {
+                document.documentElement.classList.add('dark');
+                localStorage.setItem('color-theme', 'dark');
+            }
+        });
+        async function loadUsers(silent = false) {
+            const loadingState = document.getElementById('loading-state');
+            const tableContainer = document.getElementById('users-table-container');
+            const emptyState = document.getElementById('empty-state');
+            if (!silent) {
+                loadingState.classList.remove('hidden');
+                tableContainer.classList.add('hidden');
+                emptyState.classList.add('hidden');
+            }
+            try {
+                const res = await fetch('/api/users?t=' + Date.now());
+                if (!res.ok) throw new Error();
+                const data = await res.json();
+                renderUsersUI(data);
+            } catch (err) {
+                if (!silent) {
+                    loadingState.innerHTML = '<span class="text-red-500">خطا در دریافت اطلاعات از سرور</span>';
+                }
+            }
+        }
+        function renderUsersUI(data) {
+            try {
+                const users = data.users || [];
+                window.allUsers = users;
+                const serverTime = data.serverTime || Date.now();
+                window.lastServerTime = serverTime;
+                const totalUsersCount = users.length;
+                const activeUsersCount = users.filter(u => u.is_online === 1).length;
+                const totalGbUsage = users.reduce((sum, u) => sum + (u.used_gb || 0), 0);
+                document.getElementById('stat-total-users').innerText = totalUsersCount;
+                document.getElementById('stat-active-users').innerText = activeUsersCount;
+                document.getElementById('stat-total-usage').innerText = totalGbUsage < 1 ? (totalGbUsage * 1024).toFixed(0) + ' MB' : totalGbUsage.toFixed(2) + ' GB';
+                const cfRequests = data.cfRequestsToday || 0;
+                const reqCard = document.getElementById('card-cf-requests');
+                const warningBtn = document.getElementById('cf-warning-btn');
+                if (cfRequests >= 90000) {
+                    if (reqCard) {
+                        reqCard.className = "bg-red-50 dark:bg-red-950/20 border border-red-500 rounded-2xl p-5 shadow-[0_0_15px_rgba(239,68,68,0.4)] flex flex-col justify-between hover:shadow-md transition duration-300 relative overflow-hidden group animate-pulse";
+                    }
+                    if (warningBtn) {
+                        warningBtn.classList.remove('hidden');
+                    }
+                    const today = new Date().toISOString().split('T')[0];
+                    if (localStorage.getItem('lowkey_usage_warned_date') !== today) {
+                        openUsageWarning();
+                    }
+                } else {
+                    if (reqCard) {
+                        reqCard.className = "bg-white dark:bg-amoled-card border border-gray-200 dark:border-amoled-border rounded-2xl p-5 shadow-sm flex flex-col justify-between hover:shadow-md hover:border-orange-400 dark:hover:border-orange-500/50 transition duration-300 relative overflow-hidden group";
+                    }
+                    if (warningBtn) {
+                        warningBtn.classList.add('hidden');
+                    }
+                }
+                const cfTotal = data.cfRequestsTotal || 0;
+                document.getElementById('stat-cf-requests').innerText = cfRequests >= 1000 ? (cfRequests / 1000).toFixed(1) + 'k' : cfRequests;
+                document.getElementById('stat-cf-total').innerText = cfTotal >= 1000000 ? (cfTotal / 1000000).toFixed(2) + 'M' : (cfTotal >= 1000 ? (cfTotal / 1000).toFixed(1) + 'k' : cfTotal);
+                const progressPercent = Math.min((cfRequests / 100000) * 100, 100);
+                document.getElementById('stat-cf-progress').style.width = progressPercent + '%';
+                const topUser = users.reduce((max, u) => (u.used_gb || 0) > (max.used_gb || 0) ? u : max, { username: 'هیچکدام', used_gb: 0 });
+                document.getElementById('stat-top-user').innerText = topUser.username;
+                const topUsage = topUser.used_gb || 0;
+                document.getElementById('stat-top-user-usage').innerText = topUsage < 1 ? (topUsage * 1024).toFixed(0) + ' MB مصرف شده' : topUsage.toFixed(2) + ' GB مصرف شده';
+                filterAndRenderUsers();
+            } catch (err) {
+                document.getElementById('loading-state').innerHTML = '<span class="text-red-500">خطا در پردازش اطلاعات کاربران</span>';
+            }
+        }
+        function filterAndRenderUsers() {
+            if (!window.allUsers) return;
+            const searchQuery = (document.getElementById('search-input').value || '').toLowerCase().trim();
+            const filterStatus = document.getElementById('filter-status').value;
+            const sortVal = document.getElementById('sort-users').value;
+            const serverTime = window.lastServerTime || Date.now();
+            let filtered = [...window.allUsers];
+            // Search filter
+            if (searchQuery) {
+                filtered = filtered.filter(u => 
+                    (u.username || '').toLowerCase().includes(searchQuery) || 
+                    (u.uuid || '').toLowerCase().includes(searchQuery)
+                );
+            }
+            // Status filter
+            if (filterStatus !== 'all') {
+                filtered = filtered.filter(u => {
+                    const isOnline = u.is_online === 1;
+                    const isActive = u.is_active === 1;
+                    let isExpired = false;
+                    if (u.limit_gb && u.used_gb >= u.limit_gb) isExpired = true;
+                    if (u.expiry_days && u.created_at) {
+                        const created = new Date(u.created_at);
+                        const expiryDate = new Date(created.getTime() + (u.expiry_days * 24 * 60 * 60 * 1000));
+                        if (new Date(serverTime) > expiryDate) isExpired = true;
+                    }
+                    if (filterStatus === 'active') return isActive && !isExpired;
+                    if (filterStatus === 'inactive') return !isActive;
+                    if (filterStatus === 'online') return isOnline;
+                    if (filterStatus === 'offline') return !isOnline;
+                    if (filterStatus === 'expired') return isExpired || !isActive;
+                    return true;
+                });
+            }
+            // Sort
+            filtered.sort((a, b) => {
+                if (sortVal === 'newest') {
+                    return b.id - a.id;
+                }
+                if (sortVal === 'name') {
+                    return (a.username || '').localeCompare(b.username || '');
+                }
+                if (sortVal === 'usage-desc') {
+                    return (b.used_gb || 0) - (a.used_gb || 0);
+                }
+                if (sortVal === 'usage-asc') {
+                    return (a.used_gb || 0) - (b.used_gb || 0);
+                }
+                if (sortVal === 'expiry-asc') {
+                    const getRemaining = (u) => {
+                        if (!u.expiry_days) return Infinity;
+                        if (!u.created_at) return Infinity;
+                        const created = new Date(u.created_at);
+                        const expiryDate = new Date(created.getTime() + (u.expiry_days * 24 * 60 * 60 * 1000));
+                        return expiryDate - new Date(serverTime);
+                    };
+                    return getRemaining(a) - getRemaining(b);
+                }
+                return 0;
+            });
+            renderFilteredUsers(filtered, serverTime);
+        }
+        function renderFilteredUsers(users, serverTime) {
+            const loadingState = document.getElementById('loading-state');
+            const tableContainer = document.getElementById('users-table-container');
+            const emptyState = document.getElementById('empty-state');
+            const tbody = document.getElementById('users-tbody');
+            if (users.length === 0) {
+                loadingState.classList.add('hidden');
+                emptyState.classList.remove('hidden');
+                tableContainer.classList.add('hidden');
+                if (window.allUsers && window.allUsers.length > 0) {
+                    emptyState.querySelector('p').innerText = 'کاربری با مشخصات جستجو شده یافت نشد.';
+                } else {
+                    emptyState.querySelector('p').innerText = 'کاربری وجود ندارد. برای ساخت اولین کاربر روی دکمه «افزودن کاربر جدید» کلیک کنید.';
+                }
+            } else {
+                loadingState.classList.add('hidden');
+                emptyState.classList.add('hidden');
+                tableContainer.classList.remove('hidden');
+                tbody.innerHTML = users.map(user => {
+                    const createdDate = user.created_at ? new Date(user.created_at).toLocaleDateString('fa-IR') : '-';
+                    let daysRemaining = 'نامحدود';
+                    let daysPercent = 100;
+                    if (user.expiry_days) {
+                        if (user.created_at) {
+                            const created = new Date(user.created_at);
+                            const expiryDate = new Date(created.getTime() + (user.expiry_days * 24 * 60 * 60 * 1000));
+                            const diffDays = Math.ceil((expiryDate - new Date(serverTime)) / (1000 * 60 * 60 * 24));
+                            daysRemaining = diffDays > 0 ? diffDays : 0;
+                            daysPercent = Math.max(0, Math.min(100, (daysRemaining / user.expiry_days) * 100));
+                        } else {
+                            daysRemaining = user.expiry_days;
+                        }
+                    }
+                    const usedGb = user.used_gb || 0;
+                    const formattedUsed = usedGb < 1 ? (usedGb * 1024).toFixed(0) + ' MB' : usedGb.toFixed(2) + ' GB';
+					const usedReq = user.used_req || 0;
+					let reqHtml = '';
+					if (user.limit_req) {
+					    const reqPercent = Math.min((usedReq / user.limit_req) * 100, 100);
+					    const reqHue = 120 - (reqPercent * 1.2);
+					    reqHtml = '<div class="flex flex-row items-center gap-2 w-full min-w-[90px] select-none">' +
+					        '<div class="w-2 h-20 bg-gray-200 dark:bg-zinc-700 rounded-full flex flex-col justify-end overflow-hidden flex-shrink-0">' +
+					            '<div class="w-full rounded-full transition-all duration-500" style="height: ' + reqPercent + '%; background-color: hsl(' + reqHue + ', 80%, 45%)"></div>' +
+					        '</div>' +
+					        '<div class="flex flex-col justify-between h-20 text-[10px] text-gray-500 dark:text-gray-400 font-medium text-right flex-1 whitespace-nowrap">' +
+					            '<span class="text-gray-800 dark:text-zinc-200 leading-none">مصرف: ' + usedReq.toLocaleString() + '</span>' +
+					            '<span class="leading-none">کل: ' + user.limit_req.toLocaleString() + '</span>' +
+					            '<button onclick="resetUserData(\\'' + encodeURIComponent(user.username) + '\\', \\'req\\')" class="mt-1 inline-block w-full text-center px-1 py-0.5 text-[10px] font-semibold rounded bg-blue-100 text-blue-800 dark:bg-blue-900/30 dark:text-blue-400 hover:bg-blue-200 dark:hover:bg-blue-900/50 transition-colors cursor-pointer">ریست</button>' +
+					        '</div>' +
+					    '</div>';
+					} else {
+					    reqHtml = '<div class="flex flex-row items-center gap-2 w-full min-w-[90px] select-none">' +
+					        '<div class="w-2 h-20 bg-gray-200 dark:bg-zinc-700 rounded-full flex flex-col justify-end overflow-hidden flex-shrink-0">' +
+					            '<div class="w-full bg-blue-500 rounded-full transition-all duration-500" style="height: 100%"></div>' +
+					        '</div>' +
+					        '<div class="flex flex-col justify-between h-20 text-[10px] text-gray-500 dark:text-gray-400 font-medium text-right flex-1 whitespace-nowrap">' +
+					            '<span class="text-gray-800 dark:text-zinc-200 leading-none">مصرف: ' + usedReq.toLocaleString() + '</span>' +
+					            '<span class="leading-none">کل: نامحدود</span>' +
+					            '<button onclick="resetUserData(\\'' + encodeURIComponent(user.username) + '\\', \\'req\\')" class="mt-1 inline-block w-full text-center px-1 py-0.5 text-[10px] font-semibold rounded bg-blue-100 text-blue-800 dark:bg-blue-900/30 dark:text-blue-400 hover:bg-blue-200 dark:hover:bg-blue-900/50 transition-colors cursor-pointer">ریست</button>' +
+					        '</div>' +
+					    '</div>';
+					}
+					let volumeHtml = '';
+					if (user.limit_gb) {
+					    const limitPercent = Math.min((usedGb / user.limit_gb) * 100, 100);
+					    const limitHue = 120 - (limitPercent * 1.2);
+					    const formattedLimit = user.limit_gb < 1 ? (user.limit_gb * 1024).toFixed(0) + ' MB' : user.limit_gb + ' GB';
+					    volumeHtml = '<div class="flex flex-row items-center gap-2 w-full min-w-[90px] select-none">' +
+					        '<div class="w-2 h-20 bg-gray-200 dark:bg-zinc-700 rounded-full flex flex-col justify-end overflow-hidden flex-shrink-0">' +
+					            '<div class="w-full rounded-full transition-all duration-500" style="height: ' + limitPercent + '%; background-color: hsl(' + limitHue + ', 80%, 45%)"></div>' +
+					        '</div>' +
+					        '<div class="flex flex-col justify-between h-20 text-[10px] text-gray-500 dark:text-gray-400 font-medium text-right flex-1 whitespace-nowrap">' +
+					            '<span class="text-gray-800 dark:text-zinc-200 leading-none">مصرف: ' + formattedUsed + '</span>' +
+					            '<span class="leading-none">کل: ' + formattedLimit + '</span>' +
+					            '<button onclick="resetUserData(\\'' + encodeURIComponent(user.username) + '\\', \\'volume\\')" class="mt-1 inline-block w-full text-center px-1 py-0.5 text-[10px] font-semibold rounded bg-blue-100 text-blue-800 dark:bg-blue-900/30 dark:text-blue-400 hover:bg-blue-200 dark:hover:bg-blue-900/50 transition-colors cursor-pointer">ریست</button>' +
+					        '</div>' +
+					    '</div>';
+					} else {
+					    volumeHtml = '<div class="flex flex-row items-center gap-2 w-full min-w-[90px] select-none">' +
+					        '<div class="w-2 h-20 bg-gray-200 dark:bg-zinc-700 rounded-full flex flex-col justify-end overflow-hidden flex-shrink-0">' +
+					            '<div class="w-full bg-blue-500 rounded-full transition-all duration-500" style="height: 100%"></div>' +
+					        '</div>' +
+					        '<div class="flex flex-col justify-between h-20 text-[10px] text-gray-500 dark:text-gray-400 font-medium text-right flex-1 whitespace-nowrap">' +
+					            '<span class="text-gray-800 dark:text-zinc-200 leading-none">مصرف: ' + formattedUsed + '</span>' +
+					            '<span class="leading-none">کل: نامحدود</span>' +
+					            '<button onclick="resetUserData(\\'' + encodeURIComponent(user.username) + '\\', \\'volume\\')" class="mt-1 inline-block w-full text-center px-1 py-0.5 text-[10px] font-semibold rounded bg-blue-100 text-blue-800 dark:bg-blue-900/30 dark:text-blue-400 hover:bg-blue-200 dark:hover:bg-blue-900/50 transition-colors cursor-pointer">ریست</button>' +
+					        '</div>' +
+					    '</div>';
+					}
+					let expiryHtml = '';
+					if (user.expiry_days) {
+					    const expiryHue = daysPercent * 1.2;
+					    expiryHtml = '<div class="flex flex-row items-center gap-2 w-full min-w-[90px] select-none">' +
+					        '<div class="w-2 h-20 bg-gray-200 dark:bg-zinc-700 rounded-full flex flex-col justify-end overflow-hidden flex-shrink-0">' +
+					            '<div class="w-full rounded-full transition-all duration-500" style="height: ' + daysPercent + '%; background-color: hsl(' + expiryHue + ', 80%, 45%)"></div>' +
+					        '</div>' +
+					        '<div class="flex flex-col justify-between h-20 text-[10px] text-gray-500 dark:text-gray-400 font-medium text-right flex-1 whitespace-nowrap">' +
+					            '<span class="text-gray-800 dark:text-zinc-200 leading-none">مانده: ' + daysRemaining + ' روز</span>' +
+					            '<span class="leading-none">کل: ' + user.expiry_days + ' روز</span>' +
+					            '<button onclick="resetUserData(\\'' + encodeURIComponent(user.username) + '\\', \\'time\\')" class="mt-1 inline-block w-full text-center px-1 py-0.5 text-[10px] font-semibold rounded bg-blue-100 text-blue-800 dark:bg-blue-900/30 dark:text-blue-400 hover:bg-blue-200 dark:hover:bg-blue-900/50 transition-colors cursor-pointer">ریست</button>' +
+					        '</div>' +
+					    '</div>';
+					} else {
+					    expiryHtml = '<div class="flex flex-row items-center gap-2 w-full min-w-[90px] select-none">' +
+					        '<div class="w-2 h-20 bg-gray-200 dark:bg-zinc-700 rounded-full flex flex-col justify-end overflow-hidden flex-shrink-0">' +
+					            '<div class="w-full bg-blue-500 rounded-full transition-all duration-500" style="height: 100%"></div>' +
+					        '</div>' +
+					        '<div class="flex flex-col justify-between h-20 text-[10px] text-gray-500 dark:text-gray-400 font-medium text-right flex-1 whitespace-nowrap">' +
+					            '<span class="text-gray-800 dark:text-zinc-200 leading-none">مانده: نامحدود</span>' +
+					            '<span class="leading-none">کل: نامحدود</span>' +
+					            '<button onclick="resetUserData(\\'' + encodeURIComponent(user.username) + '\\', \\'time\\')" class="mt-1 inline-block w-full text-center px-1 py-0.5 text-[10px] font-semibold rounded bg-blue-100 text-blue-800 dark:bg-blue-900/30 dark:text-blue-400 hover:bg-blue-200 dark:hover:bg-blue-900/50 transition-colors cursor-pointer">ریست</button>' +
+					        '</div>' +
+					    '</div>';
+					}
+					const onlineCount = user.online_count || 0;
+					const limit = user.ip_limit !== undefined ? user.ip_limit : user.max_connections;
+					let onlineHtml = '';
+					if (limit) {
+					    const onlinePercent = Math.min((onlineCount / limit) * 100, 100);
+					    const onlineHue = 120 - (onlinePercent * 1.2);
+					    onlineHtml = '<div class="flex flex-row items-center gap-2 w-full min-w-[90px] select-none">' +
+					        '<div class="w-2 h-20 bg-gray-200 dark:bg-zinc-700 rounded-full flex flex-col justify-end overflow-hidden flex-shrink-0">' +
+					            '<div class="w-full rounded-full transition-all duration-500" style="height: ' + onlinePercent + '%; background-color: hsl(' + onlineHue + ', 80%, 45%)"></div>' +
+					        '</div>' +
+					        '<div class="flex flex-col justify-between h-20 text-[10px] text-gray-500 dark:text-gray-400 font-medium text-right flex-1 whitespace-nowrap">' +
+					            '<span class="text-gray-800 dark:text-zinc-200 leading-none">متصل: ' + onlineCount + '</span>' +
+					            '<span class="leading-none">سقف: ' + limit + '</span>' +
+					        '</div>' +
+					    '</div>';
+					} else {
+					    onlineHtml = '<div class="flex flex-row items-center gap-2 w-full min-w-[90px] select-none">' +
+					        '<div class="w-2 h-20 bg-gray-200 dark:bg-zinc-700 rounded-full flex flex-col justify-end overflow-hidden flex-shrink-0">' +
+					            '<div class="w-full ' + (onlineCount > 0 ? 'bg-emerald-500' : 'bg-gray-400') + ' rounded-full transition-all duration-500" style="height: 100%"></div>' +
+					        '</div>' +
+					        '<div class="flex flex-col justify-between h-20 text-[10px] text-gray-500 dark:text-gray-400 font-medium text-right flex-1 whitespace-nowrap">' +
+					            '<span class="text-gray-800 dark:text-zinc-200 leading-none">متصل: ' + onlineCount + '</span>' +
+					            '<span class="leading-none">سقف: نامحدود</span>' +
+					        '</div>' +
+					    '</div>';
+					}
+                    let isExpired = false;
+                    if (user.limit_gb && (user.used_gb || 0) >= user.limit_gb) isExpired = true;
+                    if (user.limit_req && (user.used_req || 0) >= user.limit_req) isExpired = true;
+                    if (user.expiry_days && user.created_at) {
+                        const created = new Date(user.created_at);
+                        const expiryDate = new Date(created.getTime() + (user.expiry_days * 24 * 60 * 60 * 1000));
+                        if (new Date(serverTime) > expiryDate) isExpired = true;
+                    }
+                    const isEffectivelyActive = user.is_active !== 0 && !isExpired;
+                    const statusBtnColor = user.is_active === 0 ? 'text-emerald-600 dark:text-emerald-400 hover:bg-emerald-50 dark:hover:bg-emerald-900/30' : 'text-amber-600 dark:text-amber-400 hover:bg-amber-50 dark:hover:bg-amber-900/30';
+                    const statusBtnTitle = user.is_active === 0 ? 'فعال کردن کاربر' : 'قطع کردن کاربر';
+                    const statusBtnIcon = user.is_active === 0 
+                        ? '<svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M14.752 11.168l-3.197-2.132A1 1 0 0010 9.87v4.263a1 1 0 001.555.832l3.197-2.132a1 1 0 000-1.664z"></path><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M21 12a9 9 0 11-18 0 9 9 0 0118 0z"></path></svg>'
+                        : '<svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M10 9v6m4-6v6m7-3a9 9 0 11-18 0 9 9 0 0118 0z"></path></svg>';
+                    const isChecked = (window.selectedUsernames && window.selectedUsernames.has(user.username)) ? 'checked' : '';
+                    return '<tr class="hover:bg-gray-50 dark:hover:bg-zinc-900/40 border-b border-gray-100 dark:border-zinc-800 last:border-0">' +
+                            '<td class="p-2 border-r border-gray-100 dark:border-zinc-800 text-center select-none">' +
+                                '<input type="checkbox" name="select-user" value="' + encodeURIComponent(user.username) + '" onchange="onUserSelectChange(this)" ' + isChecked + ' class="w-5 h-5 rounded-md border-2 border-gray-300 dark:border-zinc-700 text-blue-600 bg-white dark:bg-zinc-800 checked:bg-blue-600 checked:border-blue-600 focus:ring-blue-500/50 focus:ring-offset-0 transition-all duration-200 cursor-pointer hover:scale-105 active:scale-95">' +
+                            '</td>' +
+                            '<td class="p-2 border-r border-gray-100 dark:border-zinc-800 text-center">' +
+                                '<div class="flex flex-col items-center gap-1.5 w-[140px] mx-auto select-none">' +
+                                    '<span class="font-bold text-gray-900 dark:text-zinc-100 text-sm truncate max-w-full">' + user.username + '</span>' +
+                                    '<div class="flex gap-1 w-full justify-center text-center">' +
+                                        (!isEffectivelyActive ? '<span class="px-1.5 py-0.5 text-[10px] font-medium bg-red-100 text-red-800 dark:bg-red-900/30 dark:text-red-400 rounded-md">غیرفعال</span>' : '<span class="px-1.5 py-0.5 text-[10px] font-medium bg-green-100 text-green-800 dark:bg-green-900/30 dark:text-green-400 rounded-md">فعال</span>') +
+                                        (user.is_online === 1 ? '<span class="px-1.5 py-0.5 text-[10px] font-medium bg-emerald-500 text-white rounded-md animate-pulse" dir="rtl">● آنلاین (' + (user.online_count || 0) + (limit ? '/' + limit : '') + ')</span>' : '<span class="px-1.5 py-0.5 text-[10px] font-medium bg-gray-200 text-gray-600 dark:bg-zinc-800 dark:text-zinc-400 rounded-md">آفلاین</span>') +
+                                    '</div>' +
+                                    '<div class="grid grid-cols-2 gap-1 w-full">' +
+                                        '<button onclick="copyConfig(\\'' + encodeURIComponent(user.username) + '\\')" title="کپی کانفیگ" class="p-1.5 flex items-center justify-center bg-white dark:bg-zinc-800 border border-gray-200 dark:border-zinc-700 hover:bg-blue-50 dark:hover:bg-blue-900/30 text-blue-600 dark:text-blue-400 rounded-md transition shadow-sm"><svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M8 16H6a2 2 0 01-2-2V6a2 2 0 012-2h8a2 2 0 012 2v2m-6 12h8a2 2 0 002-2v-8a2 2 0 00-2-2h-8a2 2 0 00-2 2v8a2 2 0 002 2z"></path></svg></button>' +
+                                        '<button onclick="editUser(\\'' + encodeURIComponent(user.username) + '\\')" title="ویرایش" class="p-1.5 flex items-center justify-center bg-white dark:bg-zinc-800 border border-gray-200 dark:border-zinc-700 hover:bg-yellow-50 dark:hover:bg-yellow-900/30 text-yellow-600 dark:text-yellow-400 rounded-md transition shadow-sm"><svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M11 5H6a2 2 0 00-2 2v11a2 2 0 002 2h11a2 2 0 002-2v-5m-1.414-9.414a2 2 0 112.828 2.828L11.828 15H9v-2.828l8.586-8.586z"></path></svg></button>' +
+                                        '<button onclick="deleteUser(\\'' + encodeURIComponent(user.username) + '\\')" title="حذف" class="p-1.5 flex items-center justify-center bg-white dark:bg-zinc-800 border border-gray-200 dark:border-zinc-700 hover:bg-red-50 dark:hover:bg-red-950/20 text-red-600 dark:text-red-400 rounded-md transition shadow-sm"><svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M19 7l-.867 12.142A2 2 0 0116.138 21H7.862a2 2 0 01-1.995-1.858L5 7m5 4v6m4-6v6m1-10V4a1 1 0 00-1-1h-4a1 1 0 00-1 1v3M4 7h16"></path></svg></button>' +
+                                        '<button onclick="toggleUserStatus(\\'' + encodeURIComponent(user.username) + '\\')" title="' + statusBtnTitle + '" class="p-1.5 flex items-center justify-center bg-white dark:bg-zinc-800 border border-gray-200 dark:border-zinc-700 ' + statusBtnColor + ' rounded-md transition shadow-sm">' + statusBtnIcon + '</button>' +
+                                    '</div>' +
+                                '</div>' +
+                            '</td>' +
+                            							'<td class="p-2 border-r border-gray-100 dark:border-zinc-800">' +
+							    '<div class="flex flex-col gap-2 w-max mx-auto">' +
+							        '<div class="flex gap-1">' +
+							            '<button onclick="copySubLink(\\'' + encodeURIComponent(user.username) + '\\')" class="w-full flex items-center justify-center gap-1.5 px-2 py-1.5 bg-indigo-50 dark:bg-indigo-900/30 text-indigo-600 dark:text-indigo-400 hover:bg-indigo-100 dark:hover:bg-indigo-900/50 rounded-lg text-xs font-bold transition border border-indigo-200 dark:border-indigo-800">' +
+							                '<svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M13.828 10.172a4 4 0 00-5.656 0l-4 4a4 4 0 105.656 5.656l1.102-1.101m-.758-4.899a4 4 0 005.656 0l4-4a4 4 0 00-5.656-5.656l-1.1 1.1"></path></svg>' +
+							                'ساب متنی' +
+							            '</button>' +
+							        '</div>' +
+							        '<div class="flex gap-1">' +
+							            '<button onclick="copyStatusLink(\\'' + encodeURIComponent(user.username) + '\\')" class="w-full flex items-center justify-center gap-1.5 px-2 py-1.5 bg-emerald-50 dark:bg-emerald-900/30 text-emerald-600 dark:text-emerald-400 hover:bg-emerald-100 dark:hover:bg-emerald-900/50 rounded-lg text-xs font-bold transition border border-emerald-200 dark:border-emerald-800">' +
+							                '<svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M10 6H6a2 2 0 00-2 2v10a2 2 0 002 2h10a2 2 0 002-2v-4M14 4h6m0 0v6m0-6L10 14"></path></svg>' +
+							                'صفحه وضعیت' +
+							            '</button>' +
+							        '</div>' +
+							    '</div>' +
+							'</td>' +
+							'<td class="p-2 border-r border-gray-100 dark:border-zinc-800 text-xs font-mono uppercase text-blue-500 font-semibold text-center">VLESS</td>' +
+							'<td class="p-2 border-r border-gray-100 dark:border-zinc-800 text-xs">' + 
+							    '<div class="grid grid-flow-col grid-rows-5 gap-1.5 w-fit mx-auto">' +
+							        String(user.port || "").split(",").map(function(p) {
+							            p = p.trim();
+							            if (!p) return "";
+							            var isTls = tlsPorts.includes(p);
+							            return '<span class="inline-block w-10 text-center px-1 py-0.5 text-[10px] font-semibold rounded ' + (isTls ? 'bg-blue-100 text-blue-800 dark:bg-blue-900/30 dark:text-blue-400' : 'bg-amber-100 text-amber-800 dark:bg-amber-900/30 dark:text-amber-400') + '">' + p + '</span>';
+							        }).join("") +
+							    '</div>' +
+							'</td>' +
+							'<td class="p-2 border-r border-gray-100 dark:border-zinc-800">' + volumeHtml + '</td>' +
+							'<td class="p-2 border-r border-gray-100 dark:border-zinc-800">' + reqHtml + '</td>' +
+							'<td class="p-2 border-r border-gray-100 dark:border-zinc-800">' + expiryHtml + '</td>' +
+							'<td class="p-2 border-r border-gray-100 dark:border-zinc-800">' + onlineHtml + '</td>' +
+							'<td class="p-2 border-r border-gray-100 dark:border-zinc-800 text-xs text-gray-500 text-center">' + createdDate + '</td>' +
+							'</tr>';
+                }).join('');
+                updateBulkActionsBar();
+            }
+        }
+async function resetUserData(encodedUsername, actionType) {
+            const username = decodeURIComponent(encodedUsername);
+            let actionName = '';
+            if (actionType === 'volume') actionName = 'حجم';
+            else if (actionType === 'req') actionName = 'ریکوئست';
+            else if (actionType === 'time') actionName = 'زمان';
+            if (confirm('آیا از ریست کردن ' + actionName + ' کاربر ' + username + ' مطمئن هستید؟')) {
+                try {
+                    const response = await fetch('/api/users/' + encodeURIComponent(username), {
+                        method: 'PUT',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify({ reset_action: actionType })
+                    });
+                    if (response.ok) {
+                        alert('عملیات با موفقیت انجام شد.');
+                        await loadUsers(true);
+                    } else {
+                        const errData = await response.json();
+                        alert('خطا: ' + (errData.error || 'عملیات ناموفق بود'));
+                    }
+                } catch (err) {
+                    alert('خطا در برقراری ارتباط با سرور');
+                }
+            }
+        }
+        async function toggleUserStatus(encodedUsername) {
+            const username = decodeURIComponent(encodedUsername);
+            try {
+                const response = await fetch('/api/users/' + encodeURIComponent(username), {
+                    method: 'PUT',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ toggle_only: true })
+                });
+                if (response.ok) {
+                    await loadUsers(true);
+                } else {
+                    const errData = await response.json();
+                    alert('خطا: ' + (errData.error || 'عملیات ناموفق بود'));
+                }
+            } catch (err) {
+                alert('خطا در برقراری ارتباط با سرور');
+            }
+        }
+        async function handleFormSubmit(event) {
+            event.preventDefault();
+            const submitButton = document.getElementById('submit-btn');
+            submitButton.disabled = true;
+            submitButton.innerText = isEditMode ? 'در حال ذخیره تغییرات...' : 'در حال ایجاد...';
+            const username = document.getElementById('input-name').value;
+            const limit = document.getElementById('input-limit').value || null;
+            const expiry = document.getElementById('input-expiry').value || null;
+            const reqLimit = document.getElementById('input-req-limit').value || null;
+            const ipLimit = document.getElementById('input-ip-limit').value || null;
+            const checkedPorts = Array.from(document.querySelectorAll('input[name="ports"]:checked')).map(cb => cb.value);
+            if (checkedPorts.length === 0) {
+                alert('⚠️ لطفا حداقل یک پورت را برای اتصال انتخاب کنید!');
+                submitButton.disabled = false;
+                submitButton.innerText = isEditMode ? 'ذخیره تغییرات' : 'ایجاد کاربر';
+                return;
+            }
+            const port = checkedPorts.join(',');
+            const tls = checkedPorts.some(p => tlsPorts.includes(p)) ? 'on' : 'off';
+            const ips = document.getElementById('input-ips').value;
+            const fingerprint = document.getElementById('fingerprint-select').value;
+            const url = isEditMode ? '/api/users/' + encodeURIComponent(editingUsername) : '/api/users';
+            const method = isEditMode ? 'PUT' : 'POST';
+            try {
+                const response = await fetch(url, {
+                    method: method,
+                    headers: { 'Content-Type': 'application/json' },
+					body: JSON.stringify({ username, limit_gb: limit, expiry_days: expiry, limit_req: reqLimit, tls, port, ips, fingerprint, ip_limit: ipLimit })
+                });
+                if (response.ok) {
+                    toggleModal(false);
+                    await loadUsers(true);
+                } else {
+                    const errData = await response.json();
+                    alert('خطا: ' + (errData.error || 'عملیات ناموفق بود'));
+                }
+            } catch (err) {
+                alert('خطا در برقراری ارتباط با سرور');
+            } finally {
+                submitButton.disabled = false;
+                submitButton.innerText = isEditMode ? 'ذخیره تغییرات' : 'ایجاد کاربر';
+            }
+        }
+function closePathWarning() {
+    const modal = document.getElementById('path-warning-modal');
+    const card = modal.querySelector('div');
+    modal.classList.remove('opacity-100', 'pointer-events-auto');
+    modal.classList.add('opacity-0', 'pointer-events-none');
+    card.classList.remove('opacity-100', 'scale-100');
+    card.classList.add('opacity-0', 'scale-95');
+    localStorage.setItem('lowkey_path_warned_' + CURRENT_VERSION, 'true');
+}
+function closeUsageWarning() {
+    const modal = document.getElementById('usage-warning-modal');
+    const card = modal.querySelector('div');
+    modal.classList.remove('opacity-100', 'pointer-events-auto');
+    modal.classList.add('opacity-0', 'pointer-events-none');
+    card.classList.remove('opacity-100', 'scale-100');
+    card.classList.add('opacity-0', 'scale-95');
+    const today = new Date().toISOString().split('T')[0];
+    localStorage.setItem('lowkey_usage_warned_date', today);
+}
+function openUsageWarning() {
+    const modal = document.getElementById('usage-warning-modal');
+    const card = modal.querySelector('div');
+    modal.classList.remove('opacity-0', 'pointer-events-none');
+    modal.classList.add('opacity-100', 'pointer-events-auto');
+    card.classList.remove('opacity-0', 'scale-95');
+    card.classList.add('opacity-100', 'scale-100');
+}
+        function getVlessLink(username) {
+            const user = window.allUsers.find(u => u.username === username);
+            if (!user) return '';
+            const host = window.location.hostname;
+            let ips = [host];
+            if (user.ips) {
+                const parsedIps = user.ips.split('\\n').map(ip => ip.trim()).filter(ip => ip.length > 0);
+                if (parsedIps.length > 0) ips = parsedIps;
+            }
+            const ports = String(user.port || '443').split(',').map(p => p.trim()).filter(p => p.length > 0);
+            const fp = user.fingerprint || 'chrome';
+            const links = [];
+            const m1 = decodeURIComponent('%E2%9A%A0%EF%B8%8F%D8%A7%DB%8C%D9%86%20%D9%BE%D9%86%D9%84%20%D8%B1%D8%A7%DB%8C%DA%AF%D8%A7%D9%86%20%D9%88%20%D8%BA%DB%8C%D8%B1%20%D9%82%D8%A7%D8%A8%D9%84%20%D9%81%D8%B1%D9%88%D8%B4%20%D8%A7%D8%B3%D8%AA%E2%9A%A0%EF%B8%8F');
+            const m2 = decodeURIComponent('%E2%99%A8%EF%B8%8F%20%40IR_NETLIFY%20%D8%B3%D8%A7%D8%AE%D8%AA%20%D8%B1%D8%A7%DB%8C%DA%AF%D8%A7%D9%86%20%E2%99%A8%EF%B8%8F');
+            links.push('vle' + 'ss://' + (user.uuid || '') + '@0.0.0.0:1?encryption=none&security=none&type=ws&host=' + host + '&path=%2FIn_Panel_Rayeghan_Ast_Va_Gheyre_Ghabele_Foroosh#' + encodeURIComponent(m1));
+            links.push('vle' + 'ss://' + (user.uuid || '') + '@0.0.0.0:1?encryption=none&security=none&type=ws&host=' + host + '&path=%2FIn_Panel_Rayeghan_Ast_Va_Gheyre_Ghabele_Foroosh#' + encodeURIComponent(m2));
+            ips.forEach((ip) => {
+                ports.forEach((portStr) => {
+                    const isTlsPort = tlsPorts.includes(portStr);
+                    const tlsVal = isTlsPort ? 'tls' : 'none';
+                    const remark = user.username + ' | ' + ip + ' | ' + portStr;
+                    links.push('vle' + 'ss://' + (user.uuid || '') + '@' + ip + ':' + portStr + '?path=%2FIn_Panel_Rayeghan_Ast_Va_Gheyre_Ghabele_Foroosh&security=' + tlsVal + '&encryption=none&insecure=0&host=' + host + '&fp=' + fp + '&type=ws&allowInsecure=0&sni=' + host + '#' + encodeURIComponent(remark));
+                });
+            });
+            return links.join('\\n');
+        }
+        function getSubLink(username) {
+            return window.location.origin + '/feed/' + encodeURIComponent(username);
+        }
+        function getStatusLink(username) {
+            return window.location.origin + '/status/' + encodeURIComponent(username);
+        }
+        function copySubLink(encodedUsername) {
+            const username = decodeURIComponent(encodedUsername);
+            navigator.clipboard.writeText(getSubLink(username)).then(() => {
+                alert('✅ لینک ساب متنی با موفقیت کپی شد!');
+            }).catch(() => {
+                alert('خطا در کپی کردن لینک ساب!');
+            });
+        }
+        function copyStatusLink(encodedUsername) {
+            const username = decodeURIComponent(encodedUsername);
+            navigator.clipboard.writeText(getStatusLink(username)).then(() => {
+                alert('✅ لینک صفحه وضعیت با موفقیت کپی شد!');
+            }).catch(() => {
+                alert('خطا در کپی کردن لینک صفحه وضعیت!');
+            });
+        }
+        function copyConfig(encodedUsername) {
+            const username = decodeURIComponent(encodedUsername);
+            const link = getVlessLink(username);
+            if (!link) return;
+            navigator.clipboard.writeText(link).then(() => {
+                alert('✅ کانفیگ VLESS با موفقیت کپی شد!');
+            }).catch(() => {
+                alert('خطا در کپی کردن کانفیگ!');
+            });
+        }
+function editUser(encodedUsername) {
+    const username = decodeURIComponent(encodedUsername);
+    const user = window.allUsers.find(u => u.username === username);
+    if (!user) {
+        alert('کاربر یافت نشد!');
+        return;
+    }
+    isEditMode = true;
+    editingUsername = username;
+    document.getElementById('modal-title').innerText = 'ویرایش کاربر: ' + username;
+    document.getElementById('submit-btn').innerText = 'ذخیره تغییرات';
+    const nameInput = document.getElementById('input-name');
+    nameInput.value = username;
+    nameInput.disabled = false;
+    document.getElementById('input-limit').value = user.limit_gb || '';
+    document.getElementById('input-expiry').value = user.expiry_days || '';
+    document.getElementById('input-req-limit').value = user.limit_req || '';
+    document.getElementById('input-ip-limit').value = user.ip_limit !== undefined ? (user.ip_limit || '') : (user.max_connections || '');
+    document.getElementById('input-ips').value = user.ips || '';
+    document.getElementById('fingerprint-select').value = user.fingerprint || 'chrome';
+    const userPorts = String(user.port || '').split(',').map(p => p.trim());
+    document.querySelectorAll('input[name="ports"]').forEach(cb => {
+        cb.checked = userPorts.includes(cb.value);
+    });
+    toggleModal(true);
+}
+        async function deleteUser(encodedUsername) {
+            const username = decodeURIComponent(encodedUsername);
+            if (confirm('آیا از حذف کاربر ' + username + ' مطمئن هستید؟')) {
+                try {
+                    const response = await fetch('/api/users/' + encodeURIComponent(username), { method: 'DELETE' });
+                    if (response.ok) {
+                        alert('✅ کاربر با موفقیت حذف شد.');
+                        await loadUsers(true);
+                    } else {
+                        const errData = await response.json();
+                        alert('خطا: ' + (errData.error || 'عملیات ناموفق بود'));
+                    }
+                } catch (err) {
+                    alert('خطا در برقراری ارتباط با سرور');
+                }
+            }
+        }
+        function getFlagEmoji(countryCode) {
+            if (!countryCode) return '🌐';
+            const codePoints = countryCode.toUpperCase().split('').map(char => 127397 + char.charCodeAt(0));
+            try {
+                return String.fromCodePoint(...codePoints);
+            } catch (e) {
+                return '🌐';
+            }
+        }
+        function renderLocationsUI(locations, activeIata) {
+            const select = document.getElementById('location-select');
+            locations.sort((a, b) => (a.cca2 || '').localeCompare(b.cca2 || ''));
+            let html = '<option value="">🌐 پیش‌فرض (لوکیشن خودکار)</option>';
+            locations.forEach(loc => {
+                if (loc.iata && loc.city) {
+                    const flag = getFlagEmoji(loc.cca2);
+                    const isSelected = loc.iata.toUpperCase() === activeIata.toUpperCase() ? 'selected' : '';
+                    html += '<option value="' + loc.iata + '" ' + isSelected + '>' + flag + ' ' + loc.city + ' (' + loc.iata + ')</option>';
+                }
+            });
+            select.innerHTML = html;
+        }
+        async function loadLocations() {
+            const select = document.getElementById('location-select');
+            const cachedLocations = localStorage.getItem('cached_locations_list');
+            const cachedActiveIata = localStorage.getItem('cached_active_iata') || '';
+            let hasCachedLocs = false;
+            if (cachedLocations) {
+                try {
+                    const parsedLocs = JSON.parse(cachedLocations);
+                    if (Array.isArray(parsedLocs) && parsedLocs.length > 0) {
+                        renderLocationsUI(parsedLocs, cachedActiveIata);
+                        hasCachedLocs = true;
+                    }
+                } catch(e) {}
+            }
+            try {
+                const statusRes = await fetch('/api/proxy-ip');
+                let activeIata = '';
+                if (statusRes.ok) {
+                    const statusData = await statusRes.json();
+                    activeIata = statusData.iata || '';
+                    localStorage.setItem('cached_active_iata', activeIata);
+                    if(statusData.frag_len) {
+                        window.globalFragLen = statusData.frag_len;
+                        document.getElementById('frag-length').value = statusData.frag_len;
+                    }
+                    if(statusData.frag_int) {
+                        window.globalFragInt = statusData.frag_int;
+                        document.getElementById('frag-interval').value = statusData.frag_int;
+                    }
+                }
+                const res = await fetch('/locations');
+                if (!res.ok) throw new Error();
+                const locations = await res.json();
+                localStorage.setItem('cached_locations_list', JSON.stringify(locations));
+                renderLocationsUI(locations, activeIata);
+            } catch (err) {
+                if (!hasCachedLocs) {
+                    select.innerHTML = '<option value="">⚠️ خطا در دریافت لوکیشن‌ها</option>';
+                }
+            }
+        }
+        async function saveSettings() {
+            const select = document.getElementById('location-select');
+            const fragLen = document.getElementById('frag-length').value || "20-30";
+            const fragInt = document.getElementById('frag-interval').value || "1-2";
+            const iata = select.value;
+            const btn = document.getElementById('save-settings-btn');
+            btn.disabled = true;
+            btn.innerText = 'در حال ذخیره...';
+            try {
+                let resolvedIp = 'proxyip.cmliussss.net';
+                if (iata) {
+                    const domain = iata.toLowerCase() + '.proxyip.cmliussss.net';
+                    const dnsRes = await fetch('https://cloudflare-dns.com/dns-query?name=' + domain + '&type=A', {
+                        headers: { 'accept': 'application/dns-json' }
+                    });
+                    resolvedIp = domain;
+                    if (dnsRes.ok) {
+                        const dnsData = await dnsRes.json();
+                        if (dnsData.Answer && dnsData.Answer.length > 0) {
+                            const ips = dnsData.Answer.filter(ans => ans.type === 1).map(ans => ans.data);
+                            if (ips.length > 0) {
+                                resolvedIp = ips[Math.floor(Math.random() * ips.length)];
                             }
                         }
-                    } catch(e){}
-                    
-                    const newUuid = crypto.randomUUID();
-                    if (isRemotePanel) {
-                        const res = await remotePanelWriteAction(activePanel, 'POST', null, { key: activePanel.apiKey, name: stateName });
-                        if (res.success && res.user) {
-                            const detail = getSubDetail(res.user.id, [res.user]);
-                            await sendOrEdit(chatId, `✅ ${t("msg_added")}\n\n${detail.text}`, detail.kb, messageId);
-                        } else {
-                            await sendOrEdit(chatId, t("msg_panel_error"), { inline_keyboard: [[{ text: t("btn_main_menu"), callback_data: "main_menu" }]] });
-                        }
-                    } else {
-                        if (!sysConfig.users) sysConfig.users = [];
-                        sysConfig.users.push({
-                            id: newUuid,
-                            name: stateName,
-                            limitTotalReq: null,
-                            limitDailyReq: null,
-                            expiryMs: null,
-                            createdAt: Date.now()
-                        });
-                        await cachedD1Put(env, "sys_config", JSON.stringify(sysConfig));
-                        const detail = getSubDetail(newUuid);
-                        await sendOrEdit(chatId, `✅ ${t("msg_added")}\n\n${detail.text}`, detail.kb, messageId);
                     }
-                    tgState[chatId] = null;
-                    ctx?.waitUntil(d1Put(env, "tg_bot_state", JSON.stringify(tgState)).catch(()=>{}));
-                } else if (data === "sys_panic_init") {
-                    const text = `${t("msg_confirm_panic")}`;
-                    const kb = {
-                        inline_keyboard: [
-                            [
-                                { text: `🚨 YES PANIC 🚨`, callback_data: "sys_panic_confirm" },
-                                { text: `❌ No, Cancel`, callback_data: "main_menu" }
-                            ]
-                        ]
-                    };
-                    await sendOrEdit(chatId, text, kb, messageId);
-                } else if (data === "sys_panic_confirm") {
-                    sysConfig.apiRoute = Array.from(crypto.getRandomValues(new Uint8Array(8))).map(b => b.toString(16).padStart(2,'0')).join('');
-                    sysConfig.isPaused = true;
-                    await cachedD1Put(env, "sys_config", JSON.stringify(sysConfig));
-                    const successText = `${t("msg_panic")}\n\n🔑 New Secret Path Randomized. All old sessions revoked.`;
-                    const kb = { inline_keyboard: [[{ text: t("btn_main_menu"), callback_data: "main_menu" }]] };
-                    await sendOrEdit(chatId, successText, kb, messageId);
-                } else if (data === "sys_dashboard") {
-                    let users, activeCount, pausedCount, expiredCount, autoDisabledCount;
-                    if (isRemotePanel) {
-                        const statsRes = await fetchRemotePanelStats(activePanel);
-                        if (statsRes.success && statsRes.stats) {
-                            const s = statsRes.stats;
-                            users = [];
-                            activeCount = s.users?.active || 0;
-                            pausedCount = s.users?.paused || 0;
-                            expiredCount = s.users?.expired || 0;
-                            autoDisabledCount = s.users?.autoDisabled || 0;
-                        } else {
-                            const panelUsers = await getPanelUsers();
-                            users = panelUsers || [];
-                            activeCount = users.filter(u => !u.isPaused && (!u.expiryMs || Date.now() <= u.expiryMs)).length;
-                            pausedCount = users.filter(u => u.isPaused && !u.disabledReason).length;
-                            expiredCount = users.filter(u => u.expiryMs && Date.now() > u.expiryMs && !u.isPaused).length;
-                            autoDisabledCount = users.filter(u => u.isPaused && u.disabledReason).length;
-                        }
-                    } else {
-                        users = sysConfig.users || [];
-                        activeCount = users.filter(u => !u.isPaused && (!u.expiryMs || Date.now() <= u.expiryMs)).length;
-                        pausedCount = users.filter(u => u.isPaused && !u.disabledReason).length;
-                        expiredCount = users.filter(u => u.expiryMs && Date.now() > u.expiryMs && !u.isPaused).length;
-                        autoDisabledCount = users.filter(u => u.isPaused && u.disabledReason).length;
-                    }
-                    let dashText = `📊 **${t("dashboard")}**\n`;
-                    dashText += `━━━━━━━━━━━━━━━━\n`;
-                    dashText += `📌 **${t("current_panel")}**: ${activePanel.isLocal ? '🏠' : '🌐'} ${activePanel.name}\n`;
-                    dashText += `━━━━━━━━━━━━━━━━\n`;
-                    dashText += `👥 **${t("dash_total")}**: ${Array.isArray(users) ? users.length : (activeCount + pausedCount + expiredCount + autoDisabledCount)}\n`;
-                    dashText += `🟢 **${t("dash_active")}**: ${activeCount}\n`;
-                    dashText += `⏸️ **${t("dash_paused")}**: ${pausedCount}\n`;
-                    dashText += `🔴 **${t("dash_expired")}**: ${expiredCount}\n`;
-                    dashText += `🚫 **${t("dash_auto_disabled")}**: ${autoDisabledCount}\n`;
-                    if (!isRemotePanel) {
-                        const upSeconds = Math.floor((Date.now() - isolateStartTime) / 1000);
-                        const dh = Math.floor(upSeconds / 3600);
-                        const dm = Math.floor((upSeconds % 3600) / 60);
-                        dashText += `⏱ **${t("uptime")}**: ${dh}h ${dm}m\n`;
-                        dashText += `🔌 **${t("streams")}**: ${activeConnections}\n`;
-                        dashText += `⚡ **System**: ${sysConfig.isPaused ? t("paused") : t("active")}\n`;
-                    }
-                    dashText += `━━━━━━━━━━━━━━━━`;
-                    const kb = { inline_keyboard: [[{ text: t("btn_main_menu"), callback_data: "main_menu" }]] };
-                    await sendOrEdit(chatId, dashText, kb, messageId);
-                } else if (data === "sys_stats") {
-                    let users, totalReqs, dailyReqs;
-                    if (isRemotePanel) {
-                        const statsRes = await fetchRemotePanelStats(activePanel);
-                        if (statsRes.success && statsRes.stats) {
-                            const s = statsRes.stats;
-                            users = [];
-                            totalReqs = s.traffic?.totalRequests || 0;
-                            dailyReqs = s.traffic?.dailyRequests || 0;
-                        } else {
-                            const panelUsers = await getPanelUsers();
-                            users = panelUsers || [];
-                            totalReqs = 0;
-                            dailyReqs = 0;
-                        }
-                    } else {
-                        users = sysConfig.users || [];
-                        totalReqs = 0;
-                        dailyReqs = 0;
-                        const todayDate = new Date().toISOString().split('T')[0];
-                        users.forEach(u => {
-                            const idClean = u.id.replace(/-/g, '').toLowerCase();
-                            const sysU = sysUsageCache?.users?.[idClean] || { reqs: 0, dReqs: 0, lastDay: '' };
-                            totalReqs += (sysU.reqs || 0);
-                            if (sysU.lastDay === todayDate) dailyReqs += (sysU.dReqs || 0);
-                        });
-                    }
-                    let statsText = `📈 **${t("stats_title")}**\n`;
-                    statsText += `━━━━━━━━━━━━━━━━\n`;
-                    statsText += `📌 **${t("current_panel")}**: ${activePanel.isLocal ? '🏠' : '🌐'} ${activePanel.name}\n`;
-                    statsText += `━━━━━━━━━━━━━━━━\n`;
-                    statsText += `👥 **${t("dash_total")}**: ${Array.isArray(users) ? users.length : 'N/A'}\n`;
-                    statsText += `📊 **${t("total_traffic")}**: ${(totalReqs / 6000).toFixed(2)} GB\n`;
-                    statsText += `📅 **${t("daily_traffic")}**: ${(dailyReqs / 6000).toFixed(2)} GB\n`;
-                    if (!isRemotePanel) {
-                        const upSeconds = Math.floor((Date.now() - isolateStartTime) / 1000);
-                        const dh = Math.floor(upSeconds / 3600);
-                        const dm = Math.floor((upSeconds % 3600) / 60);
-                        statsText += `⏱ **${t("tg_uptime")}**: ${dh}h ${dm}m\n`;
-                        statsText += `🔌 **${t("tg_conns")}**: ${activeConnections}\n`;
-                        statsText += `📦 **${t("tg_version")}**: v${CURRENT_VERSION}\n`;
-                    }
-                    statsText += `━━━━━━━━━━━━━━━━`;
-                    if (sysConfig.cfAccountId && sysConfig.cfApiToken) {
-                        const reqs = await fetchCloudflareUsage(sysConfig.cfAccountId, sysConfig.cfApiToken);
-                        if (reqs !== null) {
-                            const pct = ((reqs / 100000) * 100).toFixed(2);
-                            statsText += `\n☁️ **Cloudflare API**: ${reqs}/100000 (${pct}%)`;
-                        }
-                    }
-                    const kb = { inline_keyboard: [
-                        [{ text: `🔄 ${t("btn_update_usage")}`, callback_data: "sys_stats" }],
-                        [{ text: t("btn_main_menu"), callback_data: "main_menu" }]
-                    ] };
-                    await sendOrEdit(chatId, statsText, kb, messageId);
-                } else if (data === "sys_panel_info") {
-                    let infoText = `ℹ️ **${t("panel_info")}**\n`;
-                    infoText += `━━━━━━━━━━━━━━━━\n`;
-                    infoText += `📌 **${t("current_panel")}**: ${activePanel.isLocal ? '🏠' : '🌐'} ${activePanel.name}\n`;
-                    if (activePanel.isLocal) {
-                        infoText += `🌐 **Host**: ${hostName}\n`;
-                        infoText += `🔑 **API Route**: \`${sysConfig.apiRoute}\`\n`;
-                        infoText += `📡 **Mode**: ${sysConfig.mode || 'alpha'}\n`;
-                        infoText += `🔒 **Ports**: ${sysConfig.socketPorts || '443'}\n`;
-                    } else {
-                        infoText += `🌐 **Host**: ${activePanel.host}\n`;
-                        infoText += `🔑 **API Route**: \`${activePanel.apiRoute}\`\n`;
-                    }
-                    infoText += `📱 **Version**: ${CURRENT_VERSION}\n`;
-                    infoText += `━━━━━━━━━━━━━━━━`;
-                    const kb = { inline_keyboard: [[{ text: t("btn_main_menu"), callback_data: "main_menu" }]] };
-                    await sendOrEdit(chatId, infoText, kb, messageId);
-                } else if (data.startsWith("subs_disabled:")) {
-                    const panelUsers = await getPanelUsers();
-                    const users = panelUsers || [];
-                    const disabledUsers = users.filter(u => u.isPaused);
-                    if (disabledUsers.length === 0) {
-                        const kb = { inline_keyboard: [[{ text: t("btn_main_menu"), callback_data: "main_menu" }]] };
-                        await sendOrEdit(chatId, `🚫 ${t("msg_no_disabled")}`, kb, messageId);
-                    } else {
-                        const page = parseInt(data.replace("subs_disabled:", "")) || 0;
-                        const itemsPerPage = 5;
-                        const start = page * itemsPerPage;
-                        const end = start + itemsPerPage;
-                        const pageUsers = disabledUsers.slice(start, end);
-                        let text = `🚫 **${t("disabled_users")}** (${disabledUsers.length})\n━━━━━━━━━━━━━━━━\n`;
-                        const inline_keyboard = [];
-                        pageUsers.forEach((u) => {
-                            const reason = u.disabledReason || t("paused");
-                            text += `👤 **${u.name}**\n   ${reason}\n`;
-                            inline_keyboard.push([{ text: `▶️ ${u.name}`, callback_data: `sub_toggle:${u.id}` }]);
-                        });
-                        const navRow = [];
-                        if (page > 0) navRow.push({ text: `⬅️ ${t("btn_back")}`, callback_data: `subs_disabled:${page - 1}` });
-                        if (end < disabledUsers.length) navRow.push({ text: `${t("btn_next")} ➡️`, callback_data: `subs_disabled:${page + 1}` });
-                        if (navRow.length > 0) inline_keyboard.push(navRow);
-                        inline_keyboard.push([{ text: t("btn_main_menu"), callback_data: "main_menu" }]);
-                        await sendOrEdit(chatId, text, { inline_keyboard }, messageId);
-                    }
-                } else if (data === "sub_search_init") {
-                    tgState[chatId] = { step: "sub_search" };
-                    ctx?.waitUntil(d1Put(env, "tg_bot_state", JSON.stringify(tgState)).catch(()=>{}));
-                    const text = `🔍 ${t("msg_enter_search")}`;
-                    const kb = { inline_keyboard: [[{ text: `❌ ${t("btn_cancel")}`, callback_data: "main_menu" }]] };
-                    await sendOrEdit(chatId, text, kb, messageId);
-                } else if (data.startsWith("sub_reset_traffic:")) {
-                    const uuid = data.replace("sub_reset_traffic:", "");
-                    if (isRemotePanel) {
-                        await remotePanelResetTraffic(activePanel, uuid);
-                    } else {
-                        if (!sysUsageCache) sysUsageCache = { users: {} };
-                        if (!sysUsageCache.users) sysUsageCache.users = {};
-                        const uuidClean = uuid.replace(/-/g, '').toLowerCase();
-                        if (sysUsageCache.users[uuidClean]) {
-                            sysUsageCache.users[uuidClean].reqs = 0;
-                            sysUsageCache.users[uuidClean].dReqs = 0;
-                        } else {
-                            sysUsageCache.users[uuidClean] = { reqs: 0, dReqs: 0, lastDay: new Date().toISOString().split('T')[0] };
-                        }
-                        await cachedD1Put(env, "sys_usage", JSON.stringify(sysUsageCache));
-                    }
-                    const panelUsers = await getPanelUsers();
-                    const detail = getSubDetail(uuid, panelUsers);
-                    await sendOrEdit(chatId, `✅ ${t("msg_traffic_reset")}\n\n${detail.text}`, detail.kb, messageId);
-                } else if (data.startsWith("sub_extend_init:")) {
-                    const uuid = data.replace("sub_extend_init:", "");
-                    tgState[chatId] = { step: `sub_extend_days:${uuid}` };
-                    ctx?.waitUntil(d1Put(env, "tg_bot_state", JSON.stringify(tgState)).catch(()=>{}));
-                    const text = `📅 ${t("msg_enter_extend_days")}`;
-                    const kb = { inline_keyboard: [[{ text: `❌ ${t("btn_cancel")}`, callback_data: `sub_detail:${uuid}` }]] };
-                    await sendOrEdit(chatId, text, kb, messageId);
-                } else if (data.startsWith("sub_edit_notes_init:")) {
-                    const uuid = data.replace("sub_edit_notes_init:", "");
-                    tgState[chatId] = { step: `sub_edit_notes:${uuid}` };
-                    ctx?.waitUntil(d1Put(env, "tg_bot_state", JSON.stringify(tgState)).catch(()=>{}));
-                    const text = `📝 ${t("msg_enter_notes")}`;
-                    const kb = { inline_keyboard: [[{ text: `❌ ${t("btn_cancel")}`, callback_data: `sub_detail:${uuid}` }]] };
-                    await sendOrEdit(chatId, text, kb, messageId);
-                } else if (data.startsWith("sub_edit_device_init:")) {
-                    const uuid = data.replace("sub_edit_device_init:", "");
-                    tgState[chatId] = { step: `sub_edit_device:${uuid}` };
-                    ctx?.waitUntil(d1Put(env, "tg_bot_state", JSON.stringify(tgState)).catch(()=>{}));
-                    const text = `📱 ${t("msg_enter_device_limit")}`;
-                    const kb = { inline_keyboard: [
-                        [{ text: `♾️ Unlimited`, callback_data: `sub_device_unlimited:${uuid}` }],
-                        [{ text: `❌ ${t("btn_cancel")}`, callback_data: `sub_detail:${uuid}` }]
-                    ] };
-                    await sendOrEdit(chatId, text, kb, messageId);
-                } else if (data.startsWith("sub_device_unlimited:")) {
-                    const uuid = data.replace("sub_device_unlimited:", "");
-                    if (isRemotePanel) {
-                        await remotePanelWriteAction(activePanel, 'PUT', uuid, { key: activePanel.apiKey, maxConfigs: null });
-                    } else if (sysConfig.users) {
-                        const u = sysConfig.users.find(usr => usr.id === uuid);
-                        if (u) {
-                            u.maxConfigs = null;
-                            await cachedD1Put(env, "sys_config", JSON.stringify(sysConfig));
-                        }
-                    }
-                    const panelUsers = await getPanelUsers();
-                    const detail = getSubDetail(uuid, panelUsers);
-                    await sendOrEdit(chatId, `✅ ${t("status_updated")}`, detail.kb, messageId);
-                } else if (data === "get_sub_link") {
-                    const subUrl = `https://${hostName}/${sysConfig.apiRoute}`;
-                    await fetch(`${tgApi}/sendMessage`, {
-                        method: 'POST',
-                        headers: { 'Content-Type': 'application/json' },
-                        body: JSON.stringify({ chat_id: chatId, text: `\`${subUrl}\``, parse_mode: 'Markdown' })
-                    });
-                    answerText = t("sub_link_sent");
-                } else if (data === "tg_settings_menu") {
-                    const modeTxt = sysConfig.mode === 'alpha' ? 'Alpha (V)' : sysConfig.mode === 'beta' ? 'Beta (T)' : 'Both';
-                    const portsTxt = sysConfig.socketPorts || '443';
-                    const passTxt = sysConfig.masterKey || 'admin';
-                    const dnsTxt = sysConfig.resolveIp || '1.1.1.1';
-                    const relayTxt = sysConfig.backupRelay || '—';
-                    const tfoTxt = sysConfig.enableOpt1 ? '✅' : '❌';
-                    const echTxt = sysConfig.enableOpt2 ? '✅' : '❌';
-                    const pauseTxt = sysConfig.isPaused ? '🔴 ON' : '🟢 OFF';
-                    const silentTxt = sysConfig.silentAlerts ? '✅' : '❌';
-                    const directTxt = sysConfig.enableDirectConfigs ? '✅' : '❌';
-                    const nat64Txt = sysConfig.nat64Prefix || '—';
-                    let text = `⚙️ **${t("tg_sys_settings")}**\n━━━━━━━━━━━━━━━━\n`;
-                    text += `📡 ${t("tg_proto")}: **${modeTxt}**\n`;
-                    text += `🔌 ${t("tg_ports")}: \`${portsTxt}\`\n`;
-                    text += `🔑 ${t("tg_pass")}: \`${passTxt}\`\n`;
-                    text += `🌐 ${t("tg_dns")}: \`${dnsTxt}\`\n`;
-                    text += `🔗 ${t("tg_relay")}: \`${relayTxt}\`\n`;
-                    text += `⚡ ${t("tg_tfo")}: ${tfoTxt} | ECH: ${echTxt}\n`;
-                    text += `🔇 ${t("tg_silent")}: ${silentTxt}\n`;
-                    text += `🛑 ${t("tg_pause")}: ${pauseTxt}\n`;
-                    text += `🔀 ${t("tg_direct")}: ${directTxt}\n`;
-                    text += `🌐 ${t("tg_nat64")}: \`${nat64Txt}\`\n`;
-                    text += `━━━━━━━━━━━━━━━━`;
-                    const kb = { inline_keyboard: [
-                        [{ text: `📡 ${t("tg_proto")}`, callback_data: "tg_edit_proto" }, { text: `🔌 ${t("tg_ports")}`, callback_data: "tg_edit_ports" }],
-                        [{ text: `🔑 ${t("tg_pass")}`, callback_data: "tg_edit_pass" }, { text: `🌐 ${t("tg_dns")}`, callback_data: "tg_edit_dns" }],
-                        [{ text: `🔗 ${t("tg_relay")}`, callback_data: "tg_edit_relay" }],
-                        [{ text: `⚡ ${t("tg_tfo")}`, callback_data: "tg_toggle_tfo" }, { text: `ECH`, callback_data: "tg_toggle_ech" }],
-                        [{ text: `${t("tg_silent")}`, callback_data: "tg_toggle_silent" }, { text: `${t("tg_pause")}`, callback_data: "tg_toggle_pause2" }],
-                        [{ text: `🔀 ${t("tg_direct")}`, callback_data: "tg_toggle_direct" }],
-                        [{ text: `🌐 ${t("tg_nat64")}`, callback_data: "tg_edit_nat64" }],
-                        [{ text: t("btn_main_menu"), callback_data: "main_menu" }]
-                    ] };
-                    await sendOrEdit(chatId, text, kb, messageId);
-                } else if (data === "tg_advanced_menu") {
-                    const cleanTxt = sysConfig.cleanIps ? sysConfig.cleanIps.substring(0, 40) + (sysConfig.cleanIps.length > 40 ? '...' : '') : '—';
-                    const nodesTxt = sysConfig.slaveNodes ? sysConfig.slaveNodes.substring(0, 40) + (sysConfig.slaveNodes.length > 40 ? '...' : '') : '—';
-                    const strategyTxt = sysConfig.nameStrategy || 'default';
-                    const prefixTxt = sysConfig.namePrefix || 'lowkey';
-                    const maintenanceTxt = sysConfig.maintenanceHost ? sysConfig.maintenanceHost.substring(0, 30) + '...' : '—';
-                    let text = `🔧 **${t("tg_adv_settings")}**\n━━━━━━━━━━━━━━━━\n`;
-                    text += `🧹 ${t("tg_clean_ips")}: \`${cleanTxt}\`\n`;
-                    text += `🖥️ ${t("tg_nodes")}: \`${nodesTxt}\`\n`;
-                    text += `📝 ${t("tg_strategy")}: \`${strategyTxt}\`\n`;
-                    text += `🏷️ ${t("tg_prefix")}: \`${prefixTxt}\`\n`;
-                    text += `🎭 ${t("tg_maintenance")}: \`${maintenanceTxt}\`\n`;
-                    text += `━━━━━━━━━━━━━━━━`;
-                    const kb = { inline_keyboard: [
-                        [{ text: `🧹 ${t("tg_clean_ips")}`, callback_data: "tg_edit_clean_ips" }],
-                        [{ text: `🖥️ ${t("tg_nodes")}`, callback_data: "tg_edit_nodes" }],
-                        [{ text: `📝 ${t("tg_strategy")}`, callback_data: "tg_edit_strategy" }, { text: `🏷️ ${t("tg_prefix")}`, callback_data: "tg_edit_prefix" }],
-                        [{ text: `🎭 ${t("tg_maintenance")}`, callback_data: "tg_edit_maintenance" }],
-                        [{ text: `🤖 ${t("tg_tg_settings")}`, callback_data: "tg_edit_tg_settings" }],
-                        [{ text: `☁️ ${t("tg_cf_settings")}`, callback_data: "tg_edit_cf_settings" }],
-                        [{ text: t("btn_main_menu"), callback_data: "main_menu" }]
-                    ] };
-                    await sendOrEdit(chatId, text, kb, messageId);
-                } else if (data === "tg_logs_menu") {
-                    let logs = [];
-                    if (env.IOT_DB) {
-                        const stored = await d1Get(env, "sys_logs");
-                        if (stored) logs = JSON.parse(stored);
-                    }
-                    let text = `📋 **${t("tg_logs")}**\n━━━━━━━━━━━━━━━━\n`;
-                    if (logs.length === 0) {
-                        text += `ℹ️ ${t("tg_log_empty")}\n`;
-                    } else {
-                        logs.slice(0, 10).forEach((log, i) => {
-                            const time = new Date(log.ts).toLocaleString();
-                            text += `${i + 1}. ${t("tg_log_entry")} **${log.type}**\n   ${log.detail}\n   📅 ${time}\n`;
-                        });
-                        if (logs.length > 10) text += `\n... ${logs.length - 10} more entries`;
-                    }
-                    text += `\n━━━━━━━━━━━━━━━━`;
-                    const kb = { inline_keyboard: [
-                        [{ text: `🔄 ${t("btn_update_usage")}`, callback_data: "tg_logs_menu" }],
-                        [{ text: t("btn_main_menu"), callback_data: "main_menu" }]
-                    ] };
-                    await sendOrEdit(chatId, text, kb, messageId);
-                } else if (data === "tg_toggle_tfo") {
-                    sysConfig.enableOpt1 = !sysConfig.enableOpt1;
-                    await cachedD1Put(env, "sys_config", JSON.stringify(sysConfig));
-                    answerText = t("tg_saved");
-                    const menu = getMainMenu(getActivePanel(), isAuthorized);
-                    await sendOrEdit(chatId, menu.text, menu.kb, messageId);
-                } else if (data === "tg_toggle_ech") {
-                    sysConfig.enableOpt2 = !sysConfig.enableOpt2;
-                    await cachedD1Put(env, "sys_config", JSON.stringify(sysConfig));
-                    answerText = t("tg_saved");
-                    const menu = getMainMenu(getActivePanel(), isAuthorized);
-                    await sendOrEdit(chatId, menu.text, menu.kb, messageId);
-                } else if (data === "tg_toggle_silent") {
-                    sysConfig.silentAlerts = !sysConfig.silentAlerts;
-                    await cachedD1Put(env, "sys_config", JSON.stringify(sysConfig));
-                    answerText = t("tg_saved");
-                    const menu = getMainMenu(getActivePanel(), isAuthorized);
-                    await sendOrEdit(chatId, menu.text, menu.kb, messageId);
-                } else if (data === "tg_toggle_pause2") {
-                    sysConfig.isPaused = !sysConfig.isPaused;
-                    await cachedD1Put(env, "sys_config", JSON.stringify(sysConfig));
-                    answerText = t("tg_saved");
-                    const menu = getMainMenu(getActivePanel(), isAuthorized);
-                    await sendOrEdit(chatId, menu.text, menu.kb, messageId);
-                } else if (data === "tg_toggle_direct") {
-                    sysConfig.enableDirectConfigs = !sysConfig.enableDirectConfigs;
-                    await cachedD1Put(env, "sys_config", JSON.stringify(sysConfig));
-                    answerText = t("tg_saved");
-                    await sendOrEdit(chatId, `🔀 ${t("tg_direct")}: ${sysConfig.enableDirectConfigs ? '✅ ON' : '❌ OFF'}`, { inline_keyboard: [[{ text: "◀️ " + t("btn_back"), callback_data: "tg_settings_menu" }]] }, messageId);
-                } else if (data === "tg_edit_proto") {
-                    tgState[chatId] = { step: "tg_edit_proto" };
-                    ctx?.waitUntil(d1Put(env, "tg_bot_state", JSON.stringify(tgState)).catch(()=>{}));
-                    const kb = { inline_keyboard: [
-                        [{ text: "Alpha (V-Core)", callback_data: "tg_set_proto:alpha" }, { text: "Beta (T-Core)", callback_data: "tg_set_proto:beta" }],
-                        [{ text: "Both", callback_data: "tg_set_proto:both" }],
-                        [{ text: "❌ " + t("btn_cancel"), callback_data: "tg_settings_menu" }]
-                    ] };
-                    await sendOrEdit(chatId, `📡 **${t("tg_proto")}**\n${t("tg_current_val")}: **${sysConfig.mode}**\n\n${t("tg_new_val")}`, kb, messageId);
-                } else if (data.startsWith("tg_set_proto:")) {
-                    const val = data.replace("tg_set_proto:", "");
-                    sysConfig.mode = val;
-                    await cachedD1Put(env, "sys_config", JSON.stringify(sysConfig));
-                    tgState[chatId] = null;
-                    answerText = t("tg_saved");
-                    await sendOrEdit(chatId, `✅ ${t("tg_proto")}: **${val}**`, { inline_keyboard: [[{ text: "◀️ " + t("btn_back"), callback_data: "tg_settings_menu" }]] }, messageId);
-                } else if (data === "tg_edit_dns") {
-                    tgState[chatId] = { step: "tg_edit_dns" };
-                    ctx?.waitUntil(d1Put(env, "tg_bot_state", JSON.stringify(tgState)).catch(()=>{}));
-                    await sendOrEdit(chatId, `🌐 **${t("tg_dns")}**\n${t("tg_current_val")}: \`${sysConfig.resolveIp}\`\n\n${t("tg_new_val")}`, { inline_keyboard: [[{ text: "❌ " + t("btn_cancel"), callback_data: "tg_settings_menu" }]] }, messageId);
-                } else if (data === "tg_edit_relay") {
-                    tgState[chatId] = { step: "tg_edit_relay" };
-                    ctx?.waitUntil(d1Put(env, "tg_bot_state", JSON.stringify(tgState)).catch(()=>{}));
-                    await sendOrEdit(chatId, `🔗 **${t("tg_relay")}**\n${t("tg_current_val")}: \`${sysConfig.backupRelay || '—'}\`\n\n${t("tg_new_val")}\n_send empty to clear_`, { inline_keyboard: [[{ text: "❌ " + t("btn_cancel"), callback_data: "tg_settings_menu" }]] }, messageId);
-                } else if (data === "tg_edit_nat64") {
-                    tgState[chatId] = { step: "tg_edit_nat64" };
-                    ctx?.waitUntil(d1Put(env, "tg_bot_state", JSON.stringify(tgState)).catch(()=>{}));
-                    await sendOrEdit(chatId, `🌐 **${t("tg_nat64")}**\n${t("tg_current_val")}: \`${sysConfig.nat64Prefix || '—'}\`\n\n${t("tg_new_val")}\n_send empty to clear_`, { inline_keyboard: [[{ text: "❌ " + t("btn_cancel"), callback_data: "tg_settings_menu" }]] }, messageId);
-                } else if (data === "tg_edit_maintenance") {
-                    tgState[chatId] = { step: "tg_edit_maintenance" };
-                    ctx?.waitUntil(d1Put(env, "tg_bot_state", JSON.stringify(tgState)).catch(()=>{}));
-                    await sendOrEdit(chatId, `🎭 **${t("tg_maintenance")}**\n${t("tg_current_val")}: \`${sysConfig.maintenanceHost || '—'}\`\n\n${t("tg_new_val")}`, { inline_keyboard: [[{ text: "❌ " + t("btn_cancel"), callback_data: "tg_settings_menu" }]] }, messageId);
-                } else if (data === "tg_edit_clean_ips") {
-                    tgState[chatId] = { step: "tg_edit_clean_ips" };
-                    ctx?.waitUntil(d1Put(env, "tg_bot_state", JSON.stringify(tgState)).catch(()=>{}));
-                    await sendOrEdit(chatId, `🧹 **${t("tg_clean_ips")}**\n${t("tg_current_val")}: \`${sysConfig.cleanIps || '—'}\`\n\n${t("tg_new_val")}\n_send empty to clear_`, { inline_keyboard: [[{ text: "❌ " + t("btn_cancel"), callback_data: "tg_advanced_menu" }]] }, messageId);
-                } else if (data === "tg_edit_nodes") {
-                    tgState[chatId] = { step: "tg_edit_nodes" };
-                    ctx?.waitUntil(d1Put(env, "tg_bot_state", JSON.stringify(tgState)).catch(()=>{}));
-                    await sendOrEdit(chatId, `🖥️ **${t("tg_nodes")}**\n${t("tg_current_val")}: \`${sysConfig.slaveNodes || '—'}\`\n\n${t("tg_new_val")}\n_send empty to clear_`, { inline_keyboard: [[{ text: "❌ " + t("btn_cancel"), callback_data: "tg_advanced_menu" }]] }, messageId);
-                } else if (data === "tg_edit_strategy") {
-                    tgState[chatId] = { step: "tg_edit_strategy" };
-                    ctx?.waitUntil(d1Put(env, "tg_bot_state", JSON.stringify(tgState)).catch(()=>{}));
-                    const kb = { inline_keyboard: [
-                        [{ text: "default", callback_data: "tg_set_strategy:default" }],
-                        [{ text: "type-user-port", callback_data: "tg_set_strategy:type-user-port" }],
-                        [{ text: "user-port", callback_data: "tg_set_strategy:user-port" }],
-                        [{ text: "ip", callback_data: "tg_set_strategy:ip" }],
-                        [{ text: "❌ " + t("btn_cancel"), callback_data: "tg_advanced_menu" }]
-                    ] };
-                    await sendOrEdit(chatId, `📝 **${t("tg_strategy")}**\n${t("tg_current_val")}: \`${sysConfig.nameStrategy}\`\n\n_send custom or select:_`, kb, messageId);
-                } else if (data.startsWith("tg_set_strategy:")) {
-                    const val = data.replace("tg_set_strategy:", "");
-                    sysConfig.nameStrategy = val;
-                    await cachedD1Put(env, "sys_config", JSON.stringify(sysConfig));
-                    tgState[chatId] = null;
-                    answerText = t("tg_saved");
-                    await sendOrEdit(chatId, `✅ ${t("tg_strategy")}: **${val}**`, { inline_keyboard: [[{ text: "◀️ " + t("btn_back"), callback_data: "tg_advanced_menu" }]] }, messageId);
-                } else if (data === "tg_edit_prefix") {
-                    tgState[chatId] = { step: "tg_edit_prefix" };
-                    ctx?.waitUntil(d1Put(env, "tg_bot_state", JSON.stringify(tgState)).catch(()=>{}));
-                    await sendOrEdit(chatId, `🏷️ **${t("tg_prefix")}**\n${t("tg_current_val")}: \`${sysConfig.namePrefix}\`\n\n${t("tg_new_val")}`, { inline_keyboard: [[{ text: "❌ " + t("btn_cancel"), callback_data: "tg_advanced_menu" }]] }, messageId);
-                } else if (data === "tg_edit_pass") {
-                    tgState[chatId] = { step: "tg_edit_pass" };
-                    ctx?.waitUntil(d1Put(env, "tg_bot_state", JSON.stringify(tgState)).catch(()=>{}));
-                    await sendOrEdit(chatId, `🔑 **${t("tg_pass")}**\n${t("tg_current_val")}: \`${sysConfig.masterKey}\`\n\n${t("tg_new_val")}`, { inline_keyboard: [[{ text: "❌ " + t("btn_cancel"), callback_data: "tg_settings_menu" }]] }, messageId);
-                } else if (data === "tg_edit_ports") {
-                    tgState[chatId] = { step: "tg_edit_ports" };
-                    ctx?.waitUntil(d1Put(env, "tg_bot_state", JSON.stringify(tgState)).catch(()=>{}));
-                    await sendOrEdit(chatId, `🔌 **${t("tg_ports")}**\n${t("tg_current_val")}: \`${sysConfig.socketPorts}\`\n\n${t("tg_new_val")}\n_comma separated e.g. 443,80_`, { inline_keyboard: [[{ text: "❌ " + t("btn_cancel"), callback_data: "tg_settings_menu" }]] }, messageId);
-                } else if (data === "tg_edit_tg_settings") {
-                    tgState[chatId] = { step: "tg_edit_tg_token" };
-                    ctx?.waitUntil(d1Put(env, "tg_bot_state", JSON.stringify(tgState)).catch(()=>{}));
-                    await sendOrEdit(chatId, `🤖 **${t("tg_tg_settings")}**\n\n1️⃣ ${t("tg_current_val")}: \`${sysConfig.tgToken ? '***' + sysConfig.tgToken.slice(-4) : '—'}\`\n\n${t("tg_new_val")}\n_send /skip to keep current_`, { inline_keyboard: [[{ text: "❌ " + t("btn_cancel"), callback_data: "tg_advanced_menu" }]] }, messageId);
-                } else if (data === "tg_edit_cf_settings") {
-                    tgState[chatId] = { step: "tg_edit_cf_acc" };
-                    ctx?.waitUntil(d1Put(env, "tg_bot_state", JSON.stringify(tgState)).catch(()=>{}));
-                    await sendOrEdit(chatId, `☁️ **${t("tg_cf_settings")}**\n\n1️⃣ CF Account ID: \`${sysConfig.cfAccountId || '—'}\`\n\n${t("tg_new_val")}\n_send /skip to keep current_`, { inline_keyboard: [[{ text: "❌ " + t("btn_cancel"), callback_data: "tg_advanced_menu" }]] }, messageId);
                 }
-                
-                ctx?.waitUntil(fetch(`${tgApi}/answerCallbackQuery`, {
+                const response = await fetch('/api/proxy-ip', {
                     method: 'POST',
                     headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify({ callback_query_id: cb.id, text: answerText || "Done!" })
-                }).catch(()=>{}));
-            }
-        } else if (update.message && update.message.text) {
-            const chatId = update.message.chat.id;
-            const text = update.message.text.trim();
-            
-            if (isAuthorized) {
-                // Get active panel from last login signal
-                const activePanel = getActivePanel();
-                const isRemotePanel = activePanel && !activePanel.isLocal;
-
-                // Helper to fetch users for the active panel
-                const getPanelUsers = async () => {
-                    if (isRemotePanel) {
-                        const res = await fetchRemotePanelUsers(activePanel);
-                        return res.success ? (res.users || []) : null;
-                    }
-                    return sysConfig.users || [];
-                };
-
-                // Handle /start command
-                if (text === "/start") {
-                    tgState[chatId] = null;
-                    ctx?.waitUntil(d1Put(env, "tg_bot_state", JSON.stringify(tgState)).catch(()=>{}));
-                    const menu = getMainMenu(activePanel, isAuthorized);
-                    await sendOrEdit(chatId, menu.text, menu.kb);
-                    return new Response("OK", { status: 200 });
-                }
-
-                const state = tgState[chatId];
-                
-                if (state) {
-                    if (!isAuthorized) {
-                        tgState[chatId] = null;
-                        ctx?.waitUntil(d1Put(env, "tg_bot_state", JSON.stringify(tgState)).catch(()=>{}));
-                        await sendOrEdit(chatId, t("access_denied"));
-                        return new Response("OK", { status: 200 });
-                    }
-
-                    if (state.step === "sub_add_name") {
-                        const name = text;
-                        tgState[chatId] = { step: "sub_add_limits", name: name };
-                        ctx?.waitUntil(d1Put(env, "tg_bot_state", JSON.stringify(tgState)).catch(()=>{}));
-                        
-                        const msg = `⚙️ **${name}**\n\n${t("msg_enter_limits")}`;
-                        const kb = {
-                            inline_keyboard: [
-                                [{ text: `♾️ Skip (Unlimited)`, callback_data: "sub_add_unlimited_skip" }],
-                                [{ text: `❌ ${t("btn_cancel")}`, callback_data: "main_menu" }]
-                            ]
-                        };
-                        await sendOrEdit(chatId, msg, kb);
-                        return new Response("OK", { status: 200 });
-                    }
-                    
-                    if (state.step === "sub_add_limits" || state.step === "sub_add_unlimited_skip") {
-                        const name = state.name;
-                        let tReq = null;
-                        let dReq = null;
-                        let days = null;
-                        
-                        if (state.step !== "sub_add_unlimited_skip" && text !== "0" && text !== "0 0 0") {
-                            const parts = text.split(/\s+/).map(Number);
-                            if (parts[0] > 0) tReq = parts[0];
-                            if (parts[1] > 0) dReq = parts[1];
-                            if (parts[2] > 0) days = parts[2];
-                        }
-                        
-                        const newUuid = crypto.randomUUID();
-                        if (isRemotePanel) {
-                            const res = await remotePanelWriteAction(activePanel, 'POST', null, {
-                                key: activePanel.apiKey,
-                                name: name,
-                                trafficLimit: tReq ? tReq / 6000 : 0,
-                                dailyLimit: dReq ? dReq / 6000 : 0,
-                                expiryDays: days || 0
-                            });
-                            if (res.success && res.user) {
-                                const detail = getSubDetail(res.user.id, [res.user]);
-                                await sendOrEdit(chatId, `✅ ${t("msg_added")}\n\n${detail.text}`, detail.kb);
-                            } else {
-                                await sendOrEdit(chatId, t("msg_panel_error"), { inline_keyboard: [[{ text: t("btn_main_menu"), callback_data: "main_menu" }]] });
-                            }
-                        } else {
-                            if (!sysConfig.users) sysConfig.users = [];
-                            sysConfig.users.push({
-                                id: newUuid,
-                                name: name,
-                                limitTotalReq: tReq,
-                                limitDailyReq: dReq,
-                                expiryMs: days ? Date.now() + days * 86400000 : null,
-                                createdAt: Date.now()
-                            });
-                            await cachedD1Put(env, "sys_config", JSON.stringify(sysConfig));
-                            const detail = getSubDetail(newUuid);
-                            await sendOrEdit(chatId, `✅ ${t("msg_added")}\n\n${detail.text}`, detail.kb);
-                        }
-                        
-                        tgState[chatId] = null;
-                        ctx?.waitUntil(d1Put(env, "tg_bot_state", JSON.stringify(tgState)).catch(()=>{}));
-                        return new Response("OK", { status: 200 });
-                    }
-                    
-                    if (state.step.startsWith("sub_edit_name:")) {
-                        const uuid = state.step.replace("sub_edit_name:", "");
-                        if (isRemotePanel) {
-                            await remotePanelWriteAction(activePanel, 'PUT', uuid, { key: activePanel.apiKey, name: text });
-                        } else if (sysConfig.users) {
-                            const u = sysConfig.users.find(usr => usr.id === uuid);
-                            if (u) {
-                                u.name = text;
-                                await cachedD1Put(env, "sys_config", JSON.stringify(sysConfig));
-                            }
-                        }
-                        tgState[chatId] = null;
-                        ctx?.waitUntil(d1Put(env, "tg_bot_state", JSON.stringify(tgState)).catch(()=>{}));
-                        
-                        const panelUsers = await getPanelUsers();
-                        const detail = getSubDetail(uuid, panelUsers);
-                        await sendOrEdit(chatId, `✅ Successfully Changed!`, detail.kb);
-                        return new Response("OK", { status: 200 });
-                    }
-                    
-                    if (state.step.startsWith("sub_edit_limits:")) {
-                        const uuid = state.step.replace("sub_edit_limits:", "");
-                        let tReq = null;
-                        let dReq = null;
-                        let days = null;
-                        
-                        const parts = text.split(/\s+/).map(Number);
-                        if (parts[0] > 0) tReq = parts[0];
-                        if (parts[1] > 0) dReq = parts[1];
-                        if (parts[2] > 0) days = parts[2];
-                        
-                        if (isRemotePanel) {
-                            await remotePanelWriteAction(activePanel, 'PUT', uuid, {
-                                key: activePanel.apiKey,
-                                trafficLimit: tReq ? tReq / 6000 : 0,
-                                dailyLimit: dReq ? dReq / 6000 : 0,
-                                expiryDays: days || 0
-                            });
-                        } else if (sysConfig.users) {
-                            const u = sysConfig.users.find(usr => usr.id === uuid);
-                            if (u) {
-                                u.limitTotalReq = tReq;
-                                u.limitDailyReq = dReq;
-                                u.expiryMs = days ? Date.now() + days * 86400000 : null;
-                                await cachedD1Put(env, "sys_config", JSON.stringify(sysConfig));
-                            }
-                        }
-                        tgState[chatId] = null;
-                        ctx?.waitUntil(d1Put(env, "tg_bot_state", JSON.stringify(tgState)).catch(()=>{}));
-                        
-                        const panelUsers = await getPanelUsers();
-                        const detail = getSubDetail(uuid, panelUsers);
-                        await sendOrEdit(chatId, `✅ Limits Updated!`, detail.kb);
-                        return new Response("OK", { status: 200 });
-                    }
-
-                    if (state.step === "sub_search") {
-                        const query = text.toLowerCase();
-                        const panelUsers = await getPanelUsers();
-                        const users = panelUsers || [];
-                        const results = users.filter(u => u.name.toLowerCase().includes(query) || u.id.toLowerCase().includes(query));
-                        tgState[chatId] = null;
-                        ctx?.waitUntil(d1Put(env, "tg_bot_state", JSON.stringify(tgState)).catch(()=>{}));
-                        if (results.length === 0) {
-                            const kb = { inline_keyboard: [[{ text: t("btn_main_menu"), callback_data: "main_menu" }]] };
-                            await sendOrEdit(chatId, `🔍 No users found for "${text}"`, kb);
-                        } else {
-                            let searchText = `🔍 **Search Results** (${results.length})\n━━━━━━━━━━━━━━━━\n`;
-                            const inline_keyboard = [];
-                            results.slice(0, 10).forEach(u => {
-                                const statusEmoji = u.isPaused ? "⏸️" : (u.expiryMs && Date.now() > u.expiryMs ? "🔴" : "🟢");
-                                searchText += `${statusEmoji} **${u.name}**\n`;
-                                inline_keyboard.push([{ text: `👤 ${u.name}`, callback_data: `sub_detail:${u.id}` }]);
-                            });
-                            inline_keyboard.push([{ text: t("btn_main_menu"), callback_data: "main_menu" }]);
-                            await sendOrEdit(chatId, searchText, { inline_keyboard });
-                        }
-                        return new Response("OK", { status: 200 });
-                    }
-
-                    if (state.step.startsWith("sub_extend_days:")) {
-                        const uuid = state.step.replace("sub_extend_days:", "");
-                        const days = parseInt(text);
-                        if (isNaN(days) || days <= 0) {
-                            await sendOrEdit(chatId, t("msg_invalid"));
-                            return new Response("OK", { status: 200 });
-                        }
-                        if (isRemotePanel) {
-                            await remotePanelWriteAction(activePanel, 'PUT', uuid, { key: activePanel.apiKey, expiryDays: days });
-                        } else if (sysConfig.users) {
-                            const u = sysConfig.users.find(usr => usr.id === uuid);
-                            if (u) {
-                                if (u.expiryMs) {
-                                    u.expiryMs += days * 86400000;
-                                } else {
-                                    u.expiryMs = Date.now() + days * 86400000;
-                                }
-                                if (u.isPaused && u.disabledReason && u.disabledReason.includes('Expiration')) {
-                                    u.isPaused = false;
-                                    u.disabledReason = null;
-                                    u.disabledAt = null;
-                                }
-                                await cachedD1Put(env, "sys_config", JSON.stringify(sysConfig));
-                            }
-                        }
-                        tgState[chatId] = null;
-                        ctx?.waitUntil(d1Put(env, "tg_bot_state", JSON.stringify(tgState)).catch(()=>{}));
-                        const panelUsers = await getPanelUsers();
-                        const detail = getSubDetail(uuid, panelUsers);
-                        const msg = t("msg_expiry_extended").replace("{days}", days);
-                        await sendOrEdit(chatId, `✅ ${msg}\n\n${detail.text}`, detail.kb);
-                        return new Response("OK", { status: 200 });
-                    }
-
-                    if (state.step.startsWith("sub_edit_notes:")) {
-                        const uuid = state.step.replace("sub_edit_notes:", "");
-                        if (isRemotePanel) {
-                            await remotePanelWriteAction(activePanel, 'PUT', uuid, { key: activePanel.apiKey, notes: text });
-                        } else if (sysConfig.users) {
-                            const u = sysConfig.users.find(usr => usr.id === uuid);
-                            if (u) {
-                                u.notes = text;
-                                await cachedD1Put(env, "sys_config", JSON.stringify(sysConfig));
-                            }
-                        }
-                        tgState[chatId] = null;
-                        ctx?.waitUntil(d1Put(env, "tg_bot_state", JSON.stringify(tgState)).catch(()=>{}));
-                        const panelUsers = await getPanelUsers();
-                        const detail = getSubDetail(uuid, panelUsers);
-                        await sendOrEdit(chatId, `✅ Notes updated!`, detail.kb);
-                        return new Response("OK", { status: 200 });
-                    }
-
-                    if (state.step.startsWith("sub_edit_device:")) {
-                        const uuid = state.step.replace("sub_edit_device:", "");
-                        const limit = parseInt(text);
-                        if (isNaN(limit) || limit < 0) {
-                            await sendOrEdit(chatId, t("msg_invalid"));
-                            return new Response("OK", { status: 200 });
-                        }
-                        if (isRemotePanel) {
-                            await remotePanelWriteAction(activePanel, 'PUT', uuid, { key: activePanel.apiKey, maxConfigs: limit > 0 ? limit : null });
-                        } else if (sysConfig.users) {
-                            const u = sysConfig.users.find(usr => usr.id === uuid);
-                            if (u) {
-                                u.maxConfigs = limit > 0 ? limit : null;
-                                await cachedD1Put(env, "sys_config", JSON.stringify(sysConfig));
-                            }
-                        }
-                        tgState[chatId] = null;
-                        ctx?.waitUntil(d1Put(env, "tg_bot_state", JSON.stringify(tgState)).catch(()=>{}));
-                        const panelUsers = await getPanelUsers();
-                        const detail = getSubDetail(uuid, panelUsers);
-                        await sendOrEdit(chatId, `✅ ${t("config_limit_updated")}`, detail.kb);
-                        return new Response("OK", { status: 200 });
-                    }
-                    
-                    if (state.step === "tg_edit_dns") {
-                        sysConfig.resolveIp = text;
-                        await cachedD1Put(env, "sys_config", JSON.stringify(sysConfig));
-                        tgState[chatId] = null;
-                        ctx?.waitUntil(d1Put(env, "tg_bot_state", JSON.stringify(tgState)).catch(()=>{}));
-                        await sendOrEdit(chatId, `✅ ${t("tg_dns")}: \`${text}\``, { inline_keyboard: [[{ text: "◀️ " + t("btn_back"), callback_data: "tg_settings_menu" }]] });
-                        return new Response("OK", { status: 200 });
-                    }
-                    if (state.step === "tg_edit_relay") {
-                        sysConfig.backupRelay = text || '';
-                        await cachedD1Put(env, "sys_config", JSON.stringify(sysConfig));
-                        tgState[chatId] = null;
-                        ctx?.waitUntil(d1Put(env, "tg_bot_state", JSON.stringify(tgState)).catch(()=>{}));
-                        await sendOrEdit(chatId, `✅ ${t("tg_relay")}: \`${text || '—'}\``, { inline_keyboard: [[{ text: "◀️ " + t("btn_back"), callback_data: "tg_settings_menu" }]] });
-                        return new Response("OK", { status: 200 });
-                    }
-                    if (state.step === "tg_edit_nat64") {
-                        sysConfig.nat64Prefix = text || '';
-                        await cachedD1Put(env, "sys_config", JSON.stringify(sysConfig));
-                        tgState[chatId] = null;
-                        ctx?.waitUntil(d1Put(env, "tg_bot_state", JSON.stringify(tgState)).catch(()=>{}));
-                        await sendOrEdit(chatId, `✅ ${t("tg_nat64")}: \`${text || '—'}\``, { inline_keyboard: [[{ text: "◀️ " + t("btn_back"), callback_data: "tg_settings_menu" }]] });
-                        return new Response("OK", { status: 200 });
-                    }
-                    if (state.step === "tg_edit_maintenance") {
-                        sysConfig.maintenanceHost = text;
-                        await cachedD1Put(env, "sys_config", JSON.stringify(sysConfig));
-                        tgState[chatId] = null;
-                        ctx?.waitUntil(d1Put(env, "tg_bot_state", JSON.stringify(tgState)).catch(()=>{}));
-                        await sendOrEdit(chatId, `✅ ${t("tg_maintenance")}: \`${text}\``, { inline_keyboard: [[{ text: "◀️ " + t("btn_back"), callback_data: "tg_advanced_menu" }]] });
-                        return new Response("OK", { status: 200 });
-                    }
-                    if (state.step === "tg_edit_clean_ips") {
-                        sysConfig.cleanIps = text || '';
-                        await cachedD1Put(env, "sys_config", JSON.stringify(sysConfig));
-                        tgState[chatId] = null;
-                        ctx?.waitUntil(d1Put(env, "tg_bot_state", JSON.stringify(tgState)).catch(()=>{}));
-                        await sendOrEdit(chatId, `✅ ${t("tg_clean_ips")}: \`${text || '—'}\``, { inline_keyboard: [[{ text: "◀️ " + t("btn_back"), callback_data: "tg_advanced_menu" }]] });
-                        return new Response("OK", { status: 200 });
-                    }
-                    if (state.step === "tg_edit_nodes") {
-                        sysConfig.slaveNodes = text || '';
-                        await cachedD1Put(env, "sys_config", JSON.stringify(sysConfig));
-                        tgState[chatId] = null;
-                        ctx?.waitUntil(d1Put(env, "tg_bot_state", JSON.stringify(tgState)).catch(()=>{}));
-                        await sendOrEdit(chatId, `✅ ${t("tg_nodes")}: \`${text || '—'}\``, { inline_keyboard: [[{ text: "◀️ " + t("btn_back"), callback_data: "tg_advanced_menu" }]] });
-                        return new Response("OK", { status: 200 });
-                    }
-                    if (state.step === "tg_edit_prefix") {
-                        sysConfig.namePrefix = text;
-                        await cachedD1Put(env, "sys_config", JSON.stringify(sysConfig));
-                        tgState[chatId] = null;
-                        ctx?.waitUntil(d1Put(env, "tg_bot_state", JSON.stringify(tgState)).catch(()=>{}));
-                        await sendOrEdit(chatId, `✅ ${t("tg_prefix")}: \`${text}\``, { inline_keyboard: [[{ text: "◀️ " + t("btn_back"), callback_data: "tg_advanced_menu" }]] });
-                        return new Response("OK", { status: 200 });
-                    }
-                    if (state.step === "tg_edit_pass") {
-                        sysConfig.masterKey = text;
-                        await cachedD1Put(env, "sys_config", JSON.stringify(sysConfig));
-                        tgState[chatId] = null;
-                        ctx?.waitUntil(d1Put(env, "tg_bot_state", JSON.stringify(tgState)).catch(()=>{}));
-                        await sendOrEdit(chatId, `✅ ${t("tg_pass")}: \`${text}\``, { inline_keyboard: [[{ text: "◀️ " + t("btn_back"), callback_data: "tg_settings_menu" }]] });
-                        return new Response("OK", { status: 200 });
-                    }
-                    if (state.step === "tg_edit_strategy") {
-                        sysConfig.nameStrategy = text;
-                        await cachedD1Put(env, "sys_config", JSON.stringify(sysConfig));
-                        tgState[chatId] = null;
-                        ctx?.waitUntil(d1Put(env, "tg_bot_state", JSON.stringify(tgState)).catch(()=>{}));
-                        await sendOrEdit(chatId, `✅ ${t("tg_strategy")}: \`${text}\``, { inline_keyboard: [[{ text: "◀️ " + t("btn_back"), callback_data: "tg_advanced_menu" }]] });
-                        return new Response("OK", { status: 200 });
-                    }
-                    if (state.step === "tg_edit_tg_token") {
-                        if (text !== "/skip") sysConfig.tgToken = text;
-                        tgState[chatId] = { step: "tg_edit_tg_chat" };
-                        ctx?.waitUntil(d1Put(env, "tg_bot_state", JSON.stringify(tgState)).catch(()=>{}));
-                        await sendOrEdit(chatId, `2️⃣ Chat ID: \`${sysConfig.tgChatId || '—'}\`\n\n${t("tg_new_val")}\n_send /skip to keep current_`, { inline_keyboard: [[{ text: "❌ " + t("btn_cancel"), callback_data: "tg_advanced_menu" }]] });
-                        return new Response("OK", { status: 200 });
-                    }
-                    if (state.step === "tg_edit_tg_chat") {
-                        if (text !== "/skip") sysConfig.tgChatId = text;
-                        tgState[chatId] = { step: "tg_edit_tg_admin" };
-                        ctx?.waitUntil(d1Put(env, "tg_bot_state", JSON.stringify(tgState)).catch(()=>{}));
-                        await sendOrEdit(chatId, `3️⃣ Admin ID: \`${sysConfig.tgAdminId || '—'}\`\n\n${t("tg_new_val")}\n_send /skip to keep current_`, { inline_keyboard: [[{ text: "❌ " + t("btn_cancel"), callback_data: "tg_advanced_menu" }]] });
-                        return new Response("OK", { status: 200 });
-                    }
-                    if (state.step === "tg_edit_tg_admin") {
-                        if (text !== "/skip") sysConfig.tgAdminId = text;
-                        await cachedD1Put(env, "sys_config", JSON.stringify(sysConfig));
-                        tgState[chatId] = null;
-                        ctx?.waitUntil(d1Put(env, "tg_bot_state", JSON.stringify(tgState)).catch(()=>{}));
-                        await sendOrEdit(chatId, `✅ ${t("tg_tg_settings")} saved!`, { inline_keyboard: [[{ text: "◀️ " + t("btn_back"), callback_data: "tg_advanced_menu" }]] });
-                        return new Response("OK", { status: 200 });
-                    }
-                    if (state.step === "tg_edit_cf_acc") {
-                        if (text !== "/skip") sysConfig.cfAccountId = text;
-                        tgState[chatId] = { step: "tg_edit_cf_token" };
-                        ctx?.waitUntil(d1Put(env, "tg_bot_state", JSON.stringify(tgState)).catch(()=>{}));
-                        await sendOrEdit(chatId, `2️⃣ CF API Token: \`${sysConfig.cfApiToken ? '***' + sysConfig.cfApiToken.slice(-4) : '—'}\`\n\n${t("tg_new_val")}\n_send /skip to keep current_`, { inline_keyboard: [[{ text: "❌ " + t("btn_cancel"), callback_data: "tg_advanced_menu" }]] });
-                        return new Response("OK", { status: 200 });
-                    }
-                    if (state.step === "tg_edit_cf_token") {
-                        if (text !== "/skip") sysConfig.cfApiToken = text;
-                        tgState[chatId] = { step: "tg_edit_cf_worker" };
-                        ctx?.waitUntil(d1Put(env, "tg_bot_state", JSON.stringify(tgState)).catch(()=>{}));
-                        await sendOrEdit(chatId, `3️⃣ CF Worker Name: \`${sysConfig.cfWorkerName || '—'}\`\n\n${t("tg_new_val")}\n_send /skip to keep current_`, { inline_keyboard: [[{ text: "❌ " + t("btn_cancel"), callback_data: "tg_advanced_menu" }]] });
-                        return new Response("OK", { status: 200 });
-                    }
-                    if (state.step === "tg_edit_cf_worker") {
-                        if (text !== "/skip") sysConfig.cfWorkerName = text;
-                        await cachedD1Put(env, "sys_config", JSON.stringify(sysConfig));
-                        tgState[chatId] = null;
-                        ctx?.waitUntil(d1Put(env, "tg_bot_state", JSON.stringify(tgState)).catch(()=>{}));
-                        await sendOrEdit(chatId, `✅ ${t("tg_cf_settings")} saved!`, { inline_keyboard: [[{ text: "◀️ " + t("btn_back"), callback_data: "tg_advanced_menu" }]] });
-                        return new Response("OK", { status: 200 });
-                    }
-                    if (state.step === "tg_edit_ports") {
-                        sysConfig.socketPorts = text;
-                        await cachedD1Put(env, "sys_config", JSON.stringify(sysConfig));
-                        tgState[chatId] = null;
-                        ctx?.waitUntil(d1Put(env, "tg_bot_state", JSON.stringify(tgState)).catch(()=>{}));
-                        await sendOrEdit(chatId, `✅ ${t("tg_ports")}: \`${text}\``, { inline_keyboard: [[{ text: "◀️ " + t("btn_back"), callback_data: "tg_settings_menu" }]] });
-                        return new Response("OK", { status: 200 });
-                    }
-                }
-                
-                // Default message / fallback menu
-                const menu = getMainMenu(activePanel, isAuthorized);
-                await sendOrEdit(chatId, menu.text, menu.kb);
-            } else {
-                if (text === "/start") {
-                    const userHint = langCode === 'fa'
-                        ? "لطفاً لینک اشتراک یا شناسه کاربری خود را ارسال کنید تا اطلاعات اشتراکتان نمایش داده شود."
-                        : "Please send your subscription link or User ID to view your subscription info.";
-                    await sendOrEdit(chatId, userHint);
-                    return new Response("OK", { status: 200 });
-                }
-                let lookupId = text.replace(/^https?:\/\//, '').replace(/\/.*$/, '').trim();
-                const subParamMatch = text.match(/[?&]sub=([^&]+)/);
-                if (subParamMatch) lookupId = decodeURIComponent(subParamMatch[1]);
-                if (!lookupId || lookupId.length < 3) {
-                    const userHint = langCode === 'fa'
-                        ? "لطفاً لینک اشتراک یا شناسه کاربری معتبر ارسال کنید."
-                        : "Please send a valid subscription link or User ID.";
-                    await sendOrEdit(chatId, userHint);
-                    return new Response("OK", { status: 200 });
-                }
-                const users = sysConfig.users || [];
-                const matchedUser = users.find(u =>
-                    u.id === lookupId ||
-                    u.id.replace(/-/g, '').toLowerCase() === lookupId.replace(/-/g, '').toLowerCase() ||
-                    u.name.toLowerCase() === lookupId.toLowerCase()
-                );
-                if (matchedUser) {
-                    const detail = getSubDetail(matchedUser.id);
-                    await sendOrEdit(chatId, detail.text, detail.kb);
+                    body: JSON.stringify({ proxy_ip: resolvedIp, iata: iata ? iata.toUpperCase() : '', frag_len: fragLen, frag_int: fragInt })
+                });
+                if (response.ok) {
+                    window.globalFragLen = fragLen;
+                    window.globalFragInt = fragInt;
+                    alert('✅ تنظیمات با موفقیت ذخیره شد.\\n' + (iata ? 'آی‌پی پروکسی کلودفلر: ' + resolvedIp : 'آدرس پروکسی به حالت پیش‌فرض بازگشت.'));
+                    toggleSettingsModal(false);
                 } else {
-                    const notFound = langCode === 'fa'
-                        ? "کاربری با این شناسه یافت نشد."
-                        : "No user found with this ID.";
-                    await sendOrEdit(chatId, notFound);
+                    alert('خطا در ذخیره تنظیمات');
                 }
+            } catch (err) {
+                alert('خطا در برقراری ارتباط با سرور');
+            } finally {
+                btn.disabled = false;
+                btn.innerText = 'ذخیره تنظیمات';
             }
         }
-        return new Response("OK", { status: 200 });
-    } catch(e) {
-        return new Response("OK", { status: 200 });
-    }
-}
-
-async function processTelemetryStream(env, ctx, wsRelayIdx) {
-    const [client, webSocket] = Object.values(new WebSocketPair());
-    webSocket.accept();
-    webSocket.binaryType = "arraybuffer";
-    startDataPipe(webSocket, env, ctx, wsRelayIdx);
-    return new Response(null, { status: 101, webSocket: client });
-}
-
-async function startDataPipe(webSocket, env, ctx, wsRelayIdx) {
-    activeConnections++;
-    webSocket.addEventListener('close', () => {
-        activeConnections--;
-        if (activeClientHash) {
-            let cur = activeConns.get(activeClientHash) || 0;
-            if (cur > 0) activeConns.set(activeClientHash, cur - 1);
+        function exportUsersBackup() {
+            if (!window.allUsers || window.allUsers.length === 0) {
+                alert('⚠️ کاربری برای پشتیبان‌گیری وجود ندارد!');
+                return;
+            }
+            const dataStr = "data:text/json;charset=utf-8," + encodeURIComponent(JSON.stringify(window.allUsers, null, 2));
+            const downloadAnchor = document.createElement('a');
+            const dateStr = new Date().toISOString().split('T')[0];
+            downloadAnchor.setAttribute("href", dataStr);
+            downloadAnchor.setAttribute("download", "lowkey_users_backup_" + dateStr + ".json");
+            document.body.appendChild(downloadAnchor);
+            downloadAnchor.click();
+            downloadAnchor.remove();
         }
-    });
-    webSocket.addEventListener('error', () => {
-        activeConnections--;
-        if (activeClientHash) {
-            let cur = activeConns.get(activeClientHash) || 0;
-            if (cur > 0) activeConns.set(activeClientHash, cur - 1);
+        function triggerImportBackup() {
+            document.getElementById('backup-file-input').click();
         }
-    });
-    let remoteSocket, dataWriter, isInit = true, queue = Promise.resolve();
-    let activeClientHash = null;
-    webSocket.addEventListener("message", (event) => {
-        queue = queue.then(async () => {
-            try {
-                if (isInit) {
-                    isInit = false;
-                    const isModeAlpha = await parseSensorData(event.data, wsRelayIdx);
-                    if (isModeAlpha) webSocket.send(new Uint8Array([0, 0]));
-                } else if (dataWriter) {
-                    await dataWriter.write(event.data);
-                }
-            } catch (err) { webSocket.close(); }
-        });
-    });
-
-    async function parseSensorData(bufferData, wsRelayIdx) {
-        const view = new Uint8Array(bufferData);
-        let targetAddr = "", targetPort = 0, offset = 0, isModeAlpha = false, activeProfile = null;
-
-        if (view[0] === 0x00) {
-            isModeAlpha = true;
-            
-            let clientHash = Array.from(view.slice(1, 17)).map(b => b.toString(16).padStart(2, '0')).join('');
-            let configEntry = lookupConfigEntry(clientHash);
-            
-            if (configEntry) {
-                activeClientHash = configEntry.userId.replace(/-/g, '').toLowerCase();
-                activeProfile = getAllProfiles().find(p => p.id.replace(/-/g, '').toLowerCase() === activeClientHash);
-                if (!activeProfile) return false;
-                if (configEntry.relayIp) activeProfile = { ...activeProfile, proxyIp: configEntry.relayIp };
-            } else {
-                let decoded = decodeConfigUuid(clientHash);
-                if (decoded) {
-                    activeProfile = getAllProfiles().find(p => p.id.replace(/-/g, '').toLowerCase().startsWith(decoded.userFingerprint));
-                    if (activeProfile && decoded.relayIpIndex >= 0) {
-                        const effectivePips = getEffectivePips(activeProfile);
-                        if (effectivePips.length > 0) {
-                            const idx = decoded.relayIpIndex % effectivePips.length;
-                            activeProfile = { ...activeProfile, proxyIp: effectivePips[idx] };
-                        }
-                    }
-                }
-                if (!activeProfile) {
-                    activeProfile = getAllProfiles().find(p => p.id.replace(/-/g, '').toLowerCase() === clientHash);
-                }
-                if (!activeProfile) return false;
-                activeClientHash = activeProfile.id.replace(/-/g, '').toLowerCase();
-            }
-            trackUsage(activeClientHash, 0, env, ctx);
-            
-            if (activeProfile && activeProfile.connLimit) {
-                let currentConns = activeConns.get(activeClientHash) || 0;
-                if (currentConns >= activeProfile.connLimit) {
-                    webSocket.close();
-                    return isModeAlpha;
-                }
-                activeConns.set(activeClientHash, currentConns + 1);
-            }
-            
-            let uTrack = uuidUsage.get(activeClientHash) || { connects: 0, last: 0 };
-            uTrack.connects++;
-            uTrack.last = Date.now();
-            uuidUsage.set(activeClientHash, uTrack);
-            
-            const optLen = view[17];
-            const pPos = 18 + optLen + 1;
-            targetPort = new DataView(bufferData.slice(pPos, pPos + 2)).getUint16(0);
-            const aType = view[pPos + 2];
-            let vPos = pPos + 3, aLen = 0;
-
-            if (aType === 1) { aLen = 4; targetAddr = view.slice(vPos, vPos + aLen).join("."); }
-            else if (aType === 2) { aLen = view[vPos]; vPos++; targetAddr = new TextDecoder().decode(view.slice(vPos, vPos + aLen)); }
-            else if (aType === 3) { aLen = 16; const dv = new DataView(bufferData.slice(vPos, vPos + aLen)); targetAddr = Array.from({ length: 8 }, (_, i) => dv.getUint16(i * 2).toString(16)).join(":"); }
-            offset = vPos + aLen;
-        } else {
-            let ePos = bufferData.byteLength;
-            for (let i = 0; i < bufferData.byteLength; i++) { if (view[i] === 0x0D && view[i + 1] === 0x0A) { ePos = i; break; } }
-            
-            let clientHashHex = new TextDecoder().decode(view.slice(0, ePos));
-            let configEntry = lookupConfigEntry(clientHashHex);
-            
-            if (configEntry) {
-                activeClientHash = configEntry.userId.replace(/-/g, '').toLowerCase();
-                activeProfile = getAllProfiles().find(p => p.id.replace(/-/g, '').toLowerCase() === activeClientHash);
-                if (!activeProfile) return false;
-                if (configEntry.relayIp) activeProfile = { ...activeProfile, proxyIp: configEntry.relayIp };
-            } else {
-                activeProfile = getAllProfiles().find(p => getTrojanHash(p.id) === clientHashHex);
-                if (!activeProfile) return false;
-                activeClientHash = activeProfile.id.replace(/-/g, '').toLowerCase();
-                if (wsRelayIdx >= 0) {
-                    const effectivePips = getEffectivePips(activeProfile);
-                    if (effectivePips.length > 0) {
-                        activeProfile = { ...activeProfile, proxyIp: effectivePips[wsRelayIdx % effectivePips.length] };
-                    }
-                }
-            }
-            trackUsage(activeClientHash, 0, env, ctx);
-            if (activeProfile && activeProfile.connLimit) {
-                let currentConns = activeConns.get(activeClientHash) || 0;
-                if (currentConns >= activeProfile.connLimit) {
-                    webSocket.close();
-                    return isModeAlpha;
-                }
-                activeConns.set(activeClientHash, currentConns + 1);
-            }
-            let uTrack = uuidUsage.get(activeClientHash) || { connects: 0, last: 0 };
-            uTrack.connects++;
-            uTrack.last = Date.now();
-            uuidUsage.set(activeClientHash, uTrack);
-
-            let hPos = ePos + 2; hPos++;
-            let aType = view[hPos]; hPos++; let aLen = 0;
-
-            if (aType === 1) { aLen = 4; targetAddr = view.slice(hPos, hPos + aLen).join("."); }
-            else if (aType === 3) { aLen = view[hPos]; hPos++; targetAddr = new TextDecoder().decode(view.slice(hPos, hPos + aLen)); }
-            else if (aType === 4) { aLen = 16; const dv = new DataView(bufferData.slice(hPos, hPos + aLen)); targetAddr = Array.from({ length: 8 }, (_, i) => dv.getUint16(i * 2).toString(16)).join(":"); }
-
-            hPos += aLen;
-            targetPort = new DataView(bufferData.slice(hPos, hPos + 2)).getUint16(0);
-            offset = hPos + 4;
-        }
-
-        let isDomain = /^([a-zA-Z0-9-]+\.)+[a-zA-Z]{2,}$/.test(targetAddr) || /^[a-zA-Z0-9-]+$/.test(targetAddr);
-        let connectAddr = targetAddr;
-        if (isDomain && sysConfig.customDns) {
-            try {
-                const dohUrl = new URL(sysConfig.customDns);
-                dohUrl.searchParams.set("name", targetAddr);
-                dohUrl.searchParams.set("type", "A");
-                let dnsRes = await fetch(dohUrl.toString(), { headers: { "accept": "application/dns-json" }});
-                let dnsJson = await dnsRes.json();
-                if (dnsJson.Answer && dnsJson.Answer.length > 0) {
-                    connectAddr = dnsJson.Answer[0].data;
-                }
-            } catch (e) {}
-        }
-
-        try {
-            remoteSocket = connect({ hostname: connectAddr, port: targetPort });
-            await remoteSocket.opened;
-        } catch {
-            let pips = [];
-            if (activeProfile && activeProfile.proxyIp) {
-                pips = activeProfile.proxyIp.split(/[\r\n,;]+/).map(s => s.trim()).filter(Boolean);
-            }
-            if (pips.length === 0 && sysConfig.backupRelay) {
-                pips = sysConfig.backupRelay.split(/[\r\n,;]+/).map(s => s.trim()).filter(Boolean);
-            }
-            if (pips.length === 0 && sysConfig.customRelay) {
-                pips = sysConfig.customRelay.split(/[\r\n,;]+/).map(s => s.trim()).filter(Boolean);
-            }
-
-            // Consistent hash based on user/profile ID to prevent session/IP splitting across assets on Cloudflare
-            let startIndex = 0;
-            if (pips.length > 1) {
-                let hash = 0;
-                let hashStr = (activeProfile ? activeProfile.id : "");
-                for (let i = 0; i < hashStr.length; i++) {
-                    hash = hashStr.charCodeAt(i) + ((hash << 5) - hash);
-                }
-                startIndex = Math.abs(hash) % pips.length;
-            }
-
-            // Attempt to connect with automatic failover to alternative proxy IPs
-            let connected = false;
-            for (let attempt = 0; attempt < Math.min(pips.length, 3); attempt++) {
-                let currentIndex = (startIndex + attempt) % pips.length;
-                let currentProxy = pips[currentIndex];
+        async function importUsersBackup(event) {
+            const file = event.target.files[0];
+            if (!file) return;
+            const reader = new FileReader();
+            reader.onload = async function(e) {
+                const importBtn = document.querySelector('button[onclick="triggerImportBackup()"]');
+                const exportBtn = document.querySelector('button[onclick="exportUsersBackup()"]');
+                const closeBtn = document.querySelector('#settings-modal button[onclick="toggleSettingsModal(false)"]');
                 try {
-                    const [altIP, altPortStr] = currentProxy.split(":");
-                    remoteSocket = connect({ hostname: altIP, port: altPortStr ? Number(altPortStr) : targetPort });
-                    await remoteSocket.opened;
-                    connected = true;
-                    break;
-                } catch (e) {
-                    // Try next fallback proxy IP in list
-                }
-            }
-            if (!connected) {
-                webSocket.close();
-                return isModeAlpha;
-            }
-        }
-
-        dataWriter = remoteSocket.writable.getWriter();
-        if (offset < bufferData.byteLength) {
-            let chunk = bufferData.slice(offset);
-            await dataWriter.write(chunk);
-        }
-        remoteSocket.readable.pipeTo(new WritableStream({ write(chunk) { 
-            webSocket.send(chunk); 
-        } }));
-
-        return isModeAlpha;
-    }
-}
-
-function generateHardwareId(seed) {
-    const h20 = Array.from(new TextEncoder().encode(seed)).map(b => b.toString(16).padStart(2, "0")).join("").slice(0, 20).padEnd(20, "0");
-    return `${h20.slice(0, 8)}-0000-4000-8000-${h20.slice(-12)}`;
-}
-
-function getTransportParams(port) {
-    return ["80", "8080", "8880", "2052", "2082", "2086", "2095"].includes(port.toString()) ? "none" : "tls";
-}
-
-function getSubscriptionStats(targetSub = null) {
-    let name = "Default";
-    let id = activeDeviceId;
-    let limitTotalReq = 0;
-    let expiryMs = 0;
-    
-    let hasMultiUser = (sysConfig.users && sysConfig.users.length > 0);
-    if (hasMultiUser && targetSub) {
-        let user = sysConfig.users.find(u => u.name.toLowerCase() === targetSub.toLowerCase() || u.id === targetSub);
-        if (user) {
-            name = user.name;
-            id = user.id;
-            limitTotalReq = user.limitTotalReq || 0;
-            expiryMs = user.expiryMs || 0;
-        }
-    } else if (!hasMultiUser) {
-        limitTotalReq = sysConfig.limitTotalReq || 0;
-        expiryMs = sysConfig.expiryMs || 0;
-    }
-    
-    let idClean = id.replace(/-/g, '').toLowerCase();
-    let sysU = sysUsageCache?.users?.[idClean] || { reqs: 0, dReqs: 0 };
-    let totalReqs = sysU.reqs || 0;
-    
-    let totalGb = (totalReqs / 6000).toFixed(2);
-    let limitTotalGb = limitTotalReq ? (limitTotalReq / 6000).toFixed(2) : 'Unlimited';
-    
-    let expiryDateTxt = 'Never Expire';
-    let remDaysTxt = 'Never Expire';
-    if (expiryMs) {
-        let exp = new Date(expiryMs);
-        expiryDateTxt = exp.toISOString().split('T')[0];
-        let remDays = Math.ceil((expiryMs - Date.now()) / (1000 * 60 * 60 * 24));
-        remDaysTxt = remDays >= 0 ? `${remDays} Days Left` : 'Expired';
-    }
-    
-    return {
-        usedStr: `Used: ${totalGb} GB / ${limitTotalGb} GB`,
-        expiryStr: `Expiry: ${expiryDateTxt} (${remDaysTxt})`
-    };
-}
-
-function getFakeConfigNames(targetSub = null) {
-    let stats = getSubscriptionStats(targetSub);
-    let configs = sysConfig.fakeConfigs || [
-        { name: "📊 {usage}", enabled: true },
-        { name: "📅 {expiry}", enabled: true }
-    ];
-    return configs.filter(f => f && f.enabled && f.name).map(f => {
-        return f.name.replace(/\{usage\}/g, stats.usedStr).replace(/\{expiry\}/g, stats.expiryStr);
-    });
-}
-
-function getCleanIps(hostName, userCleanIps = null) {
-    let rawIps = userCleanIps || sysConfig.cleanIps;
-    let ips = rawIps ? rawIps.split(/[\r\n,;]+/).map(s => { let t = s.trim(); return t ? t.split('#')[0].trim() : ''; }).filter(Boolean) : [];
-    if (ips.length === 0) ips = [hostName.endsWith('.pages.dev') ? sysConfig.metricNode : hostName];
-    return ips;
-}
-
-function getCleanIpsWithNames(hostName, userCleanIps = null) {
-    let rawIps = userCleanIps || sysConfig.cleanIps;
-    let entries = rawIps ? rawIps.split(/[\r\n,;]+/).map(s => {
-        let t = s.trim();
-        if (!t) return null;
-        let parts = t.split('#');
-        let ip = parts[0].trim();
-        let name = (parts[1] || '').trim();
-        return ip ? { ip, name } : null;
-    }).filter(Boolean) : [];
-    if (entries.length === 0) entries = [{ ip: hostName.endsWith('.pages.dev') ? sysConfig.metricNode : hostName, name: '' }];
-    return entries;
-}
-
-
-function getAllProfiles(targetSub = null) {
-    let list = [{ id: activeDeviceId, name: "Default" }];
-    
-    if (sysConfig.users && sysConfig.users.length > 0) {
-        let now = Date.now();
-        sysConfig.users.forEach(u => {
-            let skip = false;
-            if (u.expiryMs && now > u.expiryMs) skip = true;
-            if (u.isPaused) skip = true;
-            if (u.limitTotalReq && sysUsageCache && sysUsageCache.users && sysUsageCache.users[u.id.replace(/-/g, '').toLowerCase()]) {
-                if (sysUsageCache.users[u.id.replace(/-/g, '').toLowerCase()].reqs >= u.limitTotalReq) skip = true;
-            }
-            if (u.limitDailyReq && sysUsageCache && sysUsageCache.users && sysUsageCache.users[u.id.replace(/-/g, '').toLowerCase()]) {
-                let usr = sysUsageCache.users[u.id.replace(/-/g, '').toLowerCase()];
-                if (usr.lastDay === new Date().toISOString().split('T')[0] && usr.dReqs >= u.limitDailyReq) skip = true;
-            }
-            if(!skip) {
-                list.push({ id: u.id, name: u.name, proxyIp: u.proxyIp, cleanIp: u.cleanIp || null, userMode: u.userMode || null, userPorts: u.userPorts || null, maxConfigs: u.maxConfigs || null, proxyIpGeo: u.proxyIpGeo || null, userNodes: u.userNodes || null, nat64: u.nat64 || null, connLimit: u.connLimit || null, userPanelUrl: u.userPanelUrl || null });
-                registerConfigEntry(u.id, u.id, u.proxyIp || '');
-            }
-        });
-    }
-
-    if (targetSub) {
-        list = list.filter(p => p.name.toLowerCase() === targetSub.toLowerCase());
-    }
-    return list;
-}
-
-// Returns the hostname of a linked panel URL (strips scheme/path/port). The
-// linkedPanels API system (cross-panel sync) is untouched; here we only read
-// its URLs as extra parallel node hosts, restoring 2.6 "parallel node" behavior.
-function linkedPanelHost(p) {
-    let raw = (p && typeof p === 'object') ? (p.url || '') : (p || '');
-    raw = String(raw).trim();
-    if (!raw) return '';
-    raw = raw.replace(/^[a-zA-Z]+:\/\//, '');   // drop scheme
-    raw = raw.split('/')[0];                     // drop path
-    raw = raw.split('@').pop();                  // drop credentials
-    if (raw.startsWith('[')) {                    // [ipv6]:port
-        return raw.slice(0, raw.indexOf(']') + 1);
-    }
-    return raw.split(':')[0];                     // drop port
-}
-
-// Combined parallel-node host list = slaveNodes (legacy) + linkedPanels URLs (2.9 API).
-function getGlobalNodeHosts() {
-    let hosts = [];
-    if (sysConfig.slaveNodes) hosts.push(...sysConfig.slaveNodes.split(/[\r\n,;]+/).map(s=>s.trim()).filter(Boolean));
-    if (Array.isArray(sysConfig.linkedPanels)) hosts.push(...sysConfig.linkedPanels.map(linkedPanelHost).filter(Boolean));
-    return [...new Set(hosts)];
-}
-
-function buildSingleUri(hostName) {
-    let allHostNames = [hostName];
-    allHostNames.push(...getGlobalNodeHosts());
-    let finalHost = allHostNames[0];
-    let finalIP = getCleanIps(finalHost)[0];
-    let ports = sysConfig.socketPorts ? sysConfig.socketPorts.split(',').map(s=>s.trim()).filter(Boolean) : ["443"];
-    let firstPort = ports[0];
-    let sec = getTransportParams(firstPort);
-    let reqPath = encodeURI(`/${sysConfig.apiRoute}`);
-    let uriProto = sysConfig.mode === "beta" ? getBeta() : getAlpha();
-    let ext = `encryption=none&security=${sec}&sni=${finalHost}&fp=${sysConfig.agent}&type=ws&host=${finalHost}&path=${reqPath}`;
-    if (sysConfig.enableOpt2) ext += `&pbk=enabled`;
-    return `${uriProto}://${activeDeviceId}@${finalIP}:${firstPort}?${ext}#${finalHost}`;
-}
-
-
-function getProxyIpsArray(proxyIpString) {
-    if (!proxyIpString) return [];
-    return proxyIpString.split(/[\r\n,;]+/).map(s => {
-        let trimmed = s.trim();
-        if (!trimmed) return "";
-        let hostPort = trimmed.split('#')[0].split('@')[0];
-        if (hostPort.includes(':') && !hostPort.includes(']')) {
-            return hostPort.split(':')[0];
-        } else if (hostPort.startsWith('[') && hostPort.includes(']')) {
-            return hostPort.split(']')[0].replace('[', '');
-        }
-        return hostPort;
-    }).filter(Boolean);
-}
-
-function ipv4ToNat64(ipv4, prefix) {
-    if (!prefix || !ipv4) return null;
-    let parts = ipv4.split('.');
-    if (parts.length !== 4 || parts.some(p => isNaN(parseInt(p)))) return null;
-    let hex = parts.map(p => parseInt(p).toString(16).padStart(2, '0')).join('');
-    let suffix = hex.match(/.{1,4}/g).join(':');
-    return prefix.replace(/\/\d+$/, '').replace(/:$/, '') + '::' + suffix;
-}
-
-function getProxyIpsWithNat64(proxyIpString, nat64Prefix) {
-    let ips = getProxyIpsArray(proxyIpString);
-    if (nat64Prefix) {
-        let prefixes = nat64Prefix.split(/[\r\n,;]+/).map(s => s.trim()).filter(Boolean);
-        let nat64Ips = [];
-        prefixes.forEach(prefix => {
-            ips.forEach(ip => {
-                if (/^\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}$/.test(ip)) {
-                    let nat64 = ipv4ToNat64(ip, prefix);
-                    if (nat64) nat64Ips.push(nat64);
-                }
-            });
-        });
-        ips = ips.concat(nat64Ips);
-    }
-    return ips;
-}
-
-const VALID_NAME_TAGS = ['FLAG', 'COUNTRY', 'CITY', 'ISP', 'PROTOCOL', 'USER', 'PORT', 'PREFIX', 'IP', 'IP_NAME', 'HOST', 'DATE', 'INDEX', 'WORKER'];
-const ipGeoCache = new Map();
-
-function validateNameStrategy(strategy) {
-    if (!strategy) return { valid: true, unknownTags: [] };
-    const tagPattern = /\{([A-Za-z]+)\}/g;
-    let match;
-    let unknownTags = [];
-    while ((match = tagPattern.exec(strategy)) !== null) {
-        let tag = match[1].toUpperCase();
-        if (!VALID_NAME_TAGS.includes(tag)) unknownTags.push(match[1]);
-    }
-    return { valid: unknownTags.length === 0, unknownTags };
-}
-
-async function preloadIpFlags(profiles, hostNames) {
-    let uniqueIps = new Set();
-    profiles.forEach(p => {
-        hostNames.forEach(h => {
-            getCleanIps(h, p.cleanIp).forEach(ip => uniqueIps.add(ip));
-        });
-        if (p.proxyIp) {
-            getProxyIpsArray(p.proxyIp).forEach(ip => uniqueIps.add(ip));
-        }
-    });
-    if (sysConfig.backupRelay) {
-        getProxyIpsArray(sysConfig.backupRelay).forEach(ip => uniqueIps.add(ip));
-    }
-    if (sysConfig.customRelay) {
-        getProxyIpsArray(sysConfig.customRelay).forEach(ip => uniqueIps.add(ip));
-    }
-
-    let uncached = Array.from(uniqueIps).filter(ip => !ipGeoCache.has(ip));
-    for (let i = 0; i < uncached.length; i += 100) {
-        let batch = uncached.slice(i, i + 100);
-        let queries = batch.map(ip => {
-            let clean = ip.split(':')[0].replace(/[\[\]]/g, '').split('#')[0].trim();
-            return { query: clean, fields: 'status,country,countryCode,city,isp,org' };
-        });
-        try {
-            const res = await fetch('http://ip-api.com/batch?fields=status,country,countryCode,city,isp,org', {
-                method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify(queries)
-            });
-            const results = await res.json();
-            batch.forEach((ip, idx) => {
-                let data = results[idx];
-                if (data && data.status === 'success') {
-                    const codePoints = data.countryCode.toUpperCase().split('').map(char => 127397 + char.charCodeAt());
-                    ipGeoCache.set(ip, {
-                        flag: String.fromCodePoint(...codePoints),
-                        country: data.country || 'Unknown',
-                        countryCode: data.countryCode || '',
-                        city: data.city || '',
-                        isp: data.isp || data.org || ''
-                    });
-                } else {
-                    ipGeoCache.set(ip, { flag: '🌐', country: 'Unknown', countryCode: '', city: '', isp: '' });
-                }
-            });
-        } catch(e) {
-            batch.forEach(ip => {
-                if (!ipGeoCache.has(ip)) {
-                    ipGeoCache.set(ip, { flag: '🌐', country: 'Unknown', countryCode: '', city: '', isp: '' });
-                }
-            });
-        }
-    }
-}
-
-function getEmojiFlag(ip) {
-    if (!ip) return "🌐";
-    let clean = ip.split(':')[0].replace(/[\[\]]/g, '').split('#')[0].trim();
-    let geo = ipGeoCache.get(ip) || ipGeoCache.get(clean);
-    return geo ? geo.flag : "🌐";
-}
-
-function getGeoInfo(ip) {
-    if (!ip) return { flag: '🌐', country: 'Unknown', countryCode: '', city: '', isp: '' };
-    let clean = ip.split(':')[0].replace(/[\[\]]/g, '').split('#')[0].trim();
-    return ipGeoCache.get(ip) || ipGeoCache.get(clean) || { flag: '🌐', country: 'Unknown', countryCode: '', city: '', isp: '' };
-}
-
-async function fetchIpGeoData(ip) {
-    if (!ip) return null;
-    let clean = ip.split(':')[0].replace(/[\[\]]/g, '').split('#')[0].trim();
-    try {
-        const res = await fetch(`http://ip-api.com/json/${clean}?fields=status,country,countryCode,city,isp,org`);
-        const data = await res.json();
-        if (data && data.status === 'success') {
-            const codePoints = data.countryCode.toUpperCase().split('').map(char => 127397 + char.charCodeAt());
-            return {
-                flag: String.fromCodePoint(...codePoints),
-                country: data.country || 'Unknown',
-                countryCode: data.countryCode || '',
-                city: data.city || '',
-                isp: data.isp || data.org || ''
-            };
-        }
-    } catch (e) {}
-    return null;
-}
-
-async function resolveUserProxyIpGeo(user) {
-    if (!user.proxyIp) { user.proxyIpGeo = null; return; }
-    let pips = getProxyIpsArray(user.proxyIp);
-    if (pips.length === 0) { user.proxyIpGeo = null; return; }
-    let geoData = await fetchIpGeoData(pips[0]);
-    user.proxyIpGeo = geoData || { flag: '🌐', country: 'Unknown', countryCode: '', city: '', isp: '' };
-}
-
-function getConfigName(type, profileName, port, hostName, ip, proxyIp = null, configIndex = 0, ipName = '') {
-    let prefix = sysConfig.namePrefix || "lowkey";
-    let strategy = sysConfig.nameStrategy || "default";
-    let cleanName = profileName === "Default" ? "" : `-${profileName}`;
-    let typeLab = type === "alpha" ? "V" : "T";
-
-    if (strategy.includes('{') && strategy.includes('}')) {
-        let lookupIp = proxyIp || ip;
-        let geoInfo = getGeoInfo(lookupIp);
-        let protoLab = type === "alpha" ? "VLESS" : "Trojan";
-        let now = new Date();
-        let dateStr = now.getFullYear() + '-' + String(now.getMonth() + 1).padStart(2, '0') + '-' + String(now.getDate()).padStart(2, '0');
-        let workerName = sysConfig.cfWorkerName || sysConfig.name || hostName || '';
-        let resName = strategy
-            .replace(/{FLAG}/g, geoInfo.flag)
-            .replace(/{COUNTRY}/g, geoInfo.country)
-            .replace(/{CITY}/g, geoInfo.city)
-            .replace(/{ISP}/g, geoInfo.isp)
-            .replace(/{PROTOCOL}/g, protoLab)
-            .replace(/{USER}/g, profileName)
-            .replace(/{PORT}/g, port)
-            .replace(/{PREFIX}/g, prefix)
-            .replace(/{IP}/g, ip || '')
-            .replace(/{IP_NAME}/g, ipName || '')
-            .replace(/{HOST}/g, hostName || '')
-            .replace(/{DATE}/g, dateStr)
-            .replace(/{INDEX}/g, String(configIndex))
-            .replace(/{WORKER}/g, workerName);
-        return resName;
-    }
-
-    if (strategy === "type-user-port") {
-        return `${type === "alpha" ? "vl" + "ess" : "tro" + "jan"}-${profileName}-${port}`;
-    } else if (strategy === "user-port") {
-        return `${profileName}-${port}`;
-    } else if (strategy === "host-port-user") {
-        return `${hostName}-${port}${cleanName}`;
-    } else if (strategy === "prefix-user-port") {
-        return `${prefix}${cleanName}-${port}`;
-    }
-    else if (strategy === "ip") {
-        return ip || 'unknown';
-    }
-
-    else { // "default"
-        return `${typeLab}-Core-${port}${cleanName}`;
-    }
-}
-
-function calcEffectiveIps(ips, maxCfg, effectiveMode, effectivePorts) {
-    if (!maxCfg) return ips;
-    let protoCount = effectiveMode === "both" ? 2 : 1;
-    let portCount = effectivePorts.length;
-    let multiplier = protoCount * portCount;
-    let neededIps = Math.max(1, Math.floor(maxCfg / multiplier));
-    return ips.slice(0, neededIps);
-}
-
-function getProfileHostNames(hostName, profile) {
-    let primaryHost = (profile && profile.userPanelUrl) ? profile.userPanelUrl : hostName;
-    let names = [primaryHost];
-    if (profile && profile.userNodes) {
-        names.push(...profile.userNodes.split(/[\r\n,;]+/).map(s=>s.trim()).filter(Boolean));
-    } else {
-        names.push(...getGlobalNodeHosts());
-    }
-    return names;
-}
-
-function getEffectiveNat64(userNat64) {
-    let parts = [];
-    if (userNat64) parts.push(...userNat64.split(/[\r\n,;]+/).map(s => s.trim()).filter(Boolean));
-    if (sysConfig.nat64Prefix) parts.push(...sysConfig.nat64Prefix.split(/[\r\n,;]+/).map(s => s.trim()).filter(Boolean));
-    return [...new Set(parts)].join(',') || null;
-}
-
-function getEffectivePips(p) {
-    let effectiveNat64 = getEffectiveNat64(p.nat64);
-    let pips = getProxyIpsWithNat64(p.proxyIp, effectiveNat64);
-    if (pips.length === 0 && sysConfig.backupRelay) {
-        pips = getProxyIpsWithNat64(sysConfig.backupRelay, effectiveNat64);
-    }
-    if (pips.length === 0 && sysConfig.customRelay) {
-        pips = getProxyIpsWithNat64(sysConfig.customRelay, effectiveNat64);
-    }
-    return pips;
-}
-
-async function buildUriProfile(hostName, targetSub = null, allowInsecure = false) {
-    let ports = sysConfig.socketPorts ? sysConfig.socketPorts.split(',').map(s=>s.trim()).filter(Boolean) : ["443"];
-    let reqPath = encodeURI(`/${sysConfig.apiRoute}`);
-    
-    let lines = [];
-    let profiles = getAllProfiles(targetSub);
-    let allHostNames = [...new Set(profiles.flatMap(p => getProfileHostNames(hostName, p)))];
-    await preloadIpFlags(profiles, allHostNames);
-    
-    // Add fake configs
-    let fakeNames = getFakeConfigNames(targetSub);
-    fakeNames.forEach(name => {
-        lines.push(`trojan://00000000-0000-0000-0000-000000000000@127.0.0.1:1080?encryption=none&security=none#${encodeURIComponent(name)}`);
-    });
-    
-    profiles.forEach(p => {
-        let pips = getEffectivePips(p);
-        let effectiveMode = p.userMode || sysConfig.mode;
-        let effectivePorts = p.userPorts ? p.userPorts.split(',').map(s=>s.trim()).filter(Boolean) : ports;
-        let maxCfg = p.maxConfigs || null;
-
-        let configIndex = 0;
-        let profileHostNames = getProfileHostNames(hostName, p);
-
-        profileHostNames.forEach(hName => {
-            let ipEntries = getCleanIpsWithNames(hName, p.cleanIp);
-            let allIps = ipEntries.map(e => e.ip);
-            let ips = calcEffectiveIps(allIps, maxCfg, effectiveMode, effectivePorts);
-            let ipNameMap = {};
-            ipEntries.forEach(e => { ipNameMap[e.ip] = e.name; });
-            effectivePorts.forEach(port => {
-                let sec = getTransportParams(port);
-                let extBase = `encryption=none&security=${sec}&sni=${hName}&fp=${sysConfig.agent}&type=ws&host=${hName}&path=${reqPath}`;
-                if (sysConfig.enableOpt2) extBase += `&pbk=enabled`;
-                extBase += `&allowInsecure=${allowInsecure ? "1" : "0"}`;
-                ips.forEach(ip => {
-                    let selectedProxyIp = null;
-                    if (pips.length > 0) {
-                        selectedProxyIp = pips[configIndex % pips.length];
-                    }
-                    let ipName = ipNameMap[ip] || '';
-                    let vName = getConfigName("alpha", p.name, port, hName, ip, selectedProxyIp, configIndex, ipName);
-                    let tName = getConfigName("beta", p.name, port, hName, ip, selectedProxyIp, configIndex, ipName);
-                    if (effectiveMode === "alpha" || effectiveMode === "both") {
-                        let configUuid = generateConfigUuid(p.id, configIndex);
-                        registerConfigEntry(configUuid, p.id, selectedProxyIp || '');
-                        lines.push(`${getAlpha()}://${configUuid}@${ip}:${port}?${extBase}#${vName}`);
-                    }
-                    if (effectiveMode === "beta" || effectiveMode === "both") {
-                        let randomJunk = Array.from({length: 11}, () => "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"[Math.floor(Math.random() * 62)]).join('');
-                        let payloadTr = { junk: randomJunk, protocol: "tr", mode: "proxyip", panelIPs: [], relayIdx: configIndex };
-                        let pathStrTr = "/" + btoa(JSON.stringify(payloadTr));
-                        let trojanExtBase = `encryption=none&security=${sec}&sni=${hName}&fp=${sysConfig.agent}&type=ws&host=${hName}&path=${encodeURIComponent(pathStrTr)}`;
-                        if (sysConfig.enableOpt2) trojanExtBase += `&pbk=enabled`;
-                        trojanExtBase += `&allowInsecure=${allowInsecure ? "1" : "0"}`;
-                        lines.push(`${getBeta()}://${p.id}@${ip}:${port}?${trojanExtBase}#${tName}`);
-                    }
-                    if (sysConfig.enableDirectConfigs && pips.length > 0) {
-                        configIndex++;
-                        let dvName = getConfigName("alpha", p.name, port, hName, ip, null, configIndex, ipName);
-                        let dtName = getConfigName("beta", p.name, port, hName, ip, null, configIndex, ipName);
-                        if (effectiveMode === "alpha" || effectiveMode === "both") {
-                            let configUuid = generateConfigUuid(p.id, configIndex);
-                            registerConfigEntry(configUuid, p.id, '');
-                            lines.push(`${getAlpha()}://${configUuid}@${ip}:${port}?${extBase}#${dvName}`);
-                        }
-                        if (effectiveMode === "beta" || effectiveMode === "both") {
-                            let randomJunk2 = Array.from({length: 11}, () => "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"[Math.floor(Math.random() * 62)]).join('');
-                            let payloadTr2 = { junk: randomJunk2, protocol: "tr", mode: "proxyip", panelIPs: [], relayIdx: configIndex };
-                            let pathStrTr2 = "/" + btoa(JSON.stringify(payloadTr2));
-                            let trojanExtBase2 = `encryption=none&security=${sec}&sni=${hName}&fp=${sysConfig.agent}&type=ws&host=${hName}&path=${encodeURIComponent(pathStrTr2)}`;
-                            if (sysConfig.enableOpt2) trojanExtBase2 += `&pbk=enabled`;
-                            trojanExtBase2 += `&allowInsecure=${allowInsecure ? "1" : "0"}`;
-                            lines.push(`${getBeta()}://${p.id}@${ip}:${port}?${trojanExtBase2}#${dtName}`);
-                        }
-                    }
-                    configIndex++;
-                });
-            });
-        });
-    });
-    return lines.join('\n');
-}
-
-async function buildYamlProfile(hostName, targetSub = null, allowInsecure = false) {
-    let ports = sysConfig.socketPorts ? sysConfig.socketPorts.split(',').map(s=>s.trim()).filter(Boolean) : ["443"];
-    let reqPath = encodeURI(`/${sysConfig.apiRoute}`);
-    let proxies = [];
-    let proxyNames = [];
-    let nameCounts = {}; // Track proxy names for deduplication
-    let profiles = getAllProfiles(targetSub);
-    let allHostNames = [...new Set(profiles.flatMap(p => getProfileHostNames(hostName, p)))];
-    await preloadIpFlags(profiles, allHostNames);
-
-    // Add fake configs
-    let fakeNames = getFakeConfigNames(targetSub);
-    let fakeRefs = [];
-    fakeNames.forEach(name => {
-        proxies.push(`- name: "${name}"\n  type: ${getBeta()}\n  server: 127.0.0.1\n  port: 80\n  password: "${activeDeviceId}"\n  udp: true\n  tls: false`);
-        fakeRefs.push(`"${name}"`);
-    });
-
-    const getUniqueName = (baseName) => {
-        if (!nameCounts[baseName]) {
-            nameCounts[baseName] = 1;
-            return baseName;
-        }
-        let counter = nameCounts[baseName];
-        let newName = `${baseName}-${counter}`;
-        while (nameCounts[newName]) {
-            counter++;
-            newName = `${baseName}-${counter}`;
-        }
-        nameCounts[baseName] = counter + 1;
-        nameCounts[newName] = 1;
-        return newName;
-    };
-
-    profiles.forEach(p => {
-        let pips = getEffectivePips(p);
-        let effectiveMode = p.userMode || sysConfig.mode;
-        let effectivePorts = p.userPorts ? p.userPorts.split(',').map(s=>s.trim()).filter(Boolean) : ports;
-        let maxCfg = p.maxConfigs || null;
-
-        let configIndex = 0;
-        let profileHostNames = getProfileHostNames(hostName, p);
-
-        profileHostNames.forEach(hName => {
-            let ipEntries = getCleanIpsWithNames(hName, p.cleanIp);
-            let allIps = ipEntries.map(e => e.ip);
-            let ips = calcEffectiveIps(allIps, maxCfg, effectiveMode, effectivePorts);
-            let ipNameMap = {};
-            ipEntries.forEach(e => { ipNameMap[e.ip] = e.name; });
-            effectivePorts.forEach(port => {
-                let sec = getTransportParams(port) === "tls" ? "true" : "false";
-                ips.forEach(ip => {
-                    let selectedProxyIp = null;
-                    if (pips.length > 0) {
-                        selectedProxyIp = pips[configIndex % pips.length];
-                    }
-                    let ipName = ipNameMap[ip] || '';
-                    if (effectiveMode === "alpha" || effectiveMode === "both") {
-                        let vName = getConfigName("alpha", p.name, port, hName, ip, selectedProxyIp, configIndex, ipName);
-                        vName = getUniqueName(vName);
-                        proxyNames.push(`"${vName}"`);
-                        let randomJunk = Array.from({length: 11}, () => "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"[Math.floor(Math.random() * 62)]).join('');
-                        let payloadVl = { junk: randomJunk, protocol: "vl", mode: "proxyip", panelIPs: [] };
-                        let pathStrVl = "/" + btoa(JSON.stringify(payloadVl));
-                        let configUuid = generateConfigUuid(p.id, configIndex);
-                        registerConfigEntry(configUuid, p.id, selectedProxyIp || '');
-                        proxies.push(`- name: "${vName}"\n  type: ${getAlpha()}\n  server: ${ip}\n  port: ${port}\n  uuid: ${configUuid}\n  udp: true\n  tls: ${sec}\n  servername: ${hName}\n  client-fingerprint: ${sysConfig.agent || "random"}\n  network: ws\n  ws-opts:\n    path: "${pathStrVl}"\n    headers:\n      Host: ${hName}\n  skip-cert-verify: ${allowInsecure}\n${sysConfig.enableOpt1 ? "  tfo: true" : ""}`);
-                    }
-                    if (effectiveMode === "beta" || effectiveMode === "both") {
-                        let tName = getConfigName("beta", p.name, port, hName, ip, selectedProxyIp, configIndex, ipName);
-                        tName = getUniqueName(tName);
-                        proxyNames.push(`"${tName}"`);
-                        let randomJunkTr = Array.from({length: 11}, () => "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"[Math.floor(Math.random() * 62)]).join('');
-                        let payloadTr = { junk: randomJunkTr, protocol: "tr", mode: "proxyip", panelIPs: [], relayIdx: configIndex };
-                        let pathStrTr = "/" + btoa(JSON.stringify(payloadTr));
-                        proxies.push(`- name: "${tName}"\n  type: ${getBeta()}\n  server: ${ip}\n  port: ${port}\n  password: "${p.id}"\n  udp: true\n  tls: ${sec}\n  sni: ${hName}\n  client-fingerprint: ${sysConfig.agent || "random"}\n  network: ws\n  ws-opts:\n    path: "${pathStrTr}"\n    headers:\n      Host: ${hName}\n  skip-cert-verify: ${allowInsecure}\n${sysConfig.enableOpt1 ? "  tfo: true" : ""}`);
-                    }
-                    configIndex++;
-                    if (sysConfig.enableDirectConfigs && pips.length > 0) {
-                        let dcIndex = configIndex;
-                        if (effectiveMode === "alpha" || effectiveMode === "both") {
-                            let dvName = getUniqueName(getConfigName("alpha", p.name, port, hName, ip, null, dcIndex, ipName));
-                            proxyNames.push(`"${dvName}"`);
-                            let randomJunk = Array.from({length: 11}, () => "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"[Math.floor(Math.random() * 62)]).join('');
-                            let payloadVl = { junk: randomJunk, protocol: "vl", mode: "proxyip", panelIPs: [] };
-                            let pathStrVl = "/" + btoa(JSON.stringify(payloadVl));
-                            let configUuid = generateConfigUuid(p.id, dcIndex);
-                            registerConfigEntry(configUuid, p.id, '');
-                            proxies.push(`- name: "${dvName}"\n  type: ${getAlpha()}\n  server: ${ip}\n  port: ${port}\n  uuid: ${configUuid}\n  udp: true\n  tls: ${sec}\n  servername: ${hName}\n  client-fingerprint: ${sysConfig.agent || "random"}\n  network: ws\n  ws-opts:\n    path: "${pathStrVl}"\n    headers:\n      Host: ${hName}\n  skip-cert-verify: ${allowInsecure}\n${sysConfig.enableOpt1 ? "  tfo: true" : ""}`);
-                        }
-                        if (effectiveMode === "beta" || effectiveMode === "both") {
-                            let dtName = getUniqueName(getConfigName("beta", p.name, port, hName, ip, null, dcIndex, ipName));
-                            proxyNames.push(`"${dtName}"`);
-                            let randomJunk = Array.from({length: 11}, () => "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"[Math.floor(Math.random() * 62)]).join('');
-                            let payloadTr = { junk: randomJunk, protocol: "tr", mode: "proxyip", panelIPs: [], relayIdx: configIndex };
-                            let pathStrTr = "/" + btoa(JSON.stringify(payloadTr));
-                            let randomJunkDt = Array.from({length: 11}, () => "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"[Math.floor(Math.random() * 62)]).join('');
-                            let payloadDt = { junk: randomJunkDt, protocol: "tr", mode: "proxyip", panelIPs: [], relayIdx: dcIndex };
-                            let pathStrDt = "/" + btoa(JSON.stringify(payloadDt));
-                            proxies.push(`- name: "${dtName}"\n  type: ${getBeta()}\n  server: ${ip}\n  port: ${port}\n  password: "${p.id}"\n  udp: true\n  tls: ${sec}\n  sni: ${hName}\n  client-fingerprint: ${sysConfig.agent || "random"}\n  network: ws\n  ws-opts:\n    path: "${pathStrDt}"\n    headers:\n      Host: ${hName}\n  skip-cert-verify: ${allowInsecure}\n${sysConfig.enableOpt1 ? "  tfo: true" : ""}`);
-                        }
-                        configIndex++;
-                    }
-                });
-            });
-        });
-    });
-
-    let bestPingProxies = proxyNames.map(n => `      - ${n}`).join('\n');
-    let allProxies = proxyNames.map(n => `      - ${n}`).join('\n');
-
-    return `mixed-port: 7890
-ipv6: true
-allow-lan: false
-unified-delay: false
-log-level: warning
-mode: rule
-disable-keep-alive: false
-keep-alive-idle: 10
-keep-alive-interval: 15
-tcp-concurrent: true
-geo-auto-update: true
-geo-update-interval: 168
-external-controller: 127.0.0.1:9090
-external-controller-cors:
-  allow-origins:
-    - "*"
-  allow-private-network: true
-external-ui: ui
-external-ui-url: "https://github.com/MetaCubeX/metacubexd/archive/refs/heads/gh-pages.zip"
-
-profile:
-  store-selected: true
-  store-fake-ip: true
-
-dns:
-  enable: true
-  respect-rules: true
-  use-system-hosts: false
-  listen: 127.0.0.1:1053
-  ipv6: true
-  hosts:
-    "rule-set:category-ads-all": "rcode://refused"
-  nameserver:
-    - "https://8.8.8.8/dns-query#✅ Selector"
-  proxy-server-nameserver:
-    - "8.8.8.8#DIRECT"
-  direct-nameserver:
-    - "8.8.8.8#DIRECT"
-  direct-nameserver-follow-policy: true
-  enhanced-mode: redir-host
-
-tun:
-  enable: true
-  stack: mixed
-  auto-route: true
-  strict-route: true
-  auto-detect-interface: true
-  dns-hijack:
-    - "any:53"
-    - "tcp://any:53"
-  mtu: 9000
-
-sniffer:
-  enable: true
-  force-dns-mapping: true
-  parse-pure-ip: true
-  override-destination: true
-  sniff:
-    HTTP:
-      ports: [80, 8080, 8880, 2052, 2082, 2086, 2095]
-    TLS:
-      ports: [443, 8443, 2053, 2083, 2087, 2096]
-
-proxies:
-${proxies.join('\n')}
-
-proxy-groups:
-  - name: "✅ Selector"
-    type: select
-    proxies:
-      - "💦 Best Ping 🚀"
-${fakeRefs.map(n => `      - ${n}`).join('\n')}
-${allProxies}
-  - name: "💦 Best Ping 🚀"
-    type: url-test
-    url: "https://www.gstatic.com/generate_204"
-    interval: 30
-    tolerance: 50
-    proxies:
-${bestPingProxies}
-
-rules:
-  - DOMAIN-SUFFIX,ir,DIRECT
-  - DOMAIN-KEYWORD,gov.ir,DIRECT
-  - DOMAIN-SUFFIX,fa,DIRECT
-  - GEOIP,IR,DIRECT
-  - MATCH,✅ Selector
-`;
-}
-
-// Obfuscated string keys to prevent Cloudflare scanners block on vpn/proxy keywords
-const k_pxs = "pro" + "xies";
-const k_px_gps = "pro" + "xy-gro" + "ups";
-const k_obds = "out" + "bounds";
-const k_vl_mode = "vl" + "ess";
-const k_tr_mode = "tro" + "jan";
-
-function getIpTypeLabel(ip) {
-    if (ip.includes(":") || ip.includes("[")) return "IPv6";
-    if (/^[0-9.]+$/.test(ip)) return "IPv4";
-    return "Domain";
-}
-
-async function buildClashJsonProfile(hostName, targetSub = null, allowInsecure = false) {
-    let ports = sysConfig.socketPorts ? sysConfig.socketPorts.split(',').map(s=>s.trim()).filter(Boolean) : ["443"];
-    let profiles = getAllProfiles(targetSub);
-    let allHostNames = [...new Set(profiles.flatMap(p => getProfileHostNames(hostName, p)))];
-    await preloadIpFlags(profiles, allHostNames);
-    let reqPath = encodeURI(`/${sysConfig.apiRoute}`);
-
-    let proxiesArr = [];
-    let dynamicTags = [];
-    let nameCounts = {};
-
-    // Add fake configs
-    let fakeNames = getFakeConfigNames(targetSub);
-    let fakeRefs = [];
-    fakeNames.forEach(name => {
-        proxiesArr.push({
-            "name": name,
-            "type": k_tr_mode,
-            "server": "127.0.0.1",
-            "port": 80,
-            "password": activeDeviceId,
-            "tls": false,
-            "udp": true
-        });
-        fakeRefs.push(name);
-    });
-
-    const getUniqueName = (baseName) => {
-        if (!nameCounts[baseName]) {
-            nameCounts[baseName] = 1;
-            return baseName;
-        }
-        let counter = nameCounts[baseName];
-        let newName = `${baseName}-${counter}`;
-        while (nameCounts[newName]) {
-            counter++;
-            newName = `${baseName}-${counter}`;
-        }
-        nameCounts[baseName] = counter + 1;
-        nameCounts[newName] = 1;
-        return newName;
-    };
-
-    profiles.forEach(p => {
-        let pips = getEffectivePips(p);
-        let effectiveMode = p.userMode || sysConfig.mode;
-        let effectivePorts = p.userPorts ? p.userPorts.split(',').map(s=>s.trim()).filter(Boolean) : ports;
-        let maxCfg = p.maxConfigs || null;
-
-        let configIndex = 0;
-        let profileHostNames = getProfileHostNames(hostName, p);
-
-        profileHostNames.forEach(hName => {
-            let ipEntries = getCleanIpsWithNames(hName, p.cleanIp);
-            let allIps = ipEntries.map(e => e.ip);
-            let ips = calcEffectiveIps(allIps, maxCfg, effectiveMode, effectivePorts);
-            let ipNameMap = {};
-            ipEntries.forEach(e => { ipNameMap[e.ip] = e.name; });
-            effectivePorts.forEach(port => {
-                let sec = getTransportParams(port) === "tls";
-                ips.forEach(ip => {
-                    let isVless = effectiveMode === "alpha" || effectiveMode === "both";
-                    let isTrojan = effectiveMode === "beta" || effectiveMode === "both";
-                    let selectedProxyIp = null;
-                    if (pips.length > 0) {
-                        selectedProxyIp = pips[configIndex % pips.length];
-                    }
-                    let ipName = ipNameMap[ip] || '';
-
-                    if (isVless) {
-                        let tagStr = getConfigName("alpha", p.name, port, hName, ip, selectedProxyIp, configIndex, ipName);
-                        tagStr = getUniqueName(tagStr);
-                        dynamicTags.push(tagStr);
-                        
-                        let randomJunk = Array.from({length: 11}, () => "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"[Math.floor(Math.random() * 62)]).join('');
-                        let payloadVl = { junk: randomJunk, protocol: "vl", mode: "proxyip", panelIPs: [] };
-                        let pathStrVl = "/" + btoa(JSON.stringify(payloadVl));
-
-                        let configUuid = generateConfigUuid(p.id, configIndex);
-                        registerConfigEntry(configUuid, p.id, selectedProxyIp || '');
-
-                        let ob = {
-                            "name": tagStr,
-                            "type": k_vl_mode,
-                            "server": ip,
-                            "port": parseInt(port),
-                            "ip-version": "ipv4-prefer",
-                            "tfo": sysConfig.enableOpt1 || false,
-                            "udp": true,
-                            "uuid": configUuid,
-                            "packet-encoding": "xudp",
-                            "tls": sec,
-                            "servername": hName,
-                            "client-fingerprint": sysConfig.agent || "random",
-                            "skip-cert-verify": allowInsecure,
-                            "alpn": ["http/1.1"],
-                            "network": "ws",
-                            "ws-opts": {
-                                "path": pathStrVl,
-                                "max-early-data": 2560,
-                                "early-data-header-name": "Sec-WebSocket-Protocol",
-                                "headers": {
-                                    "Host": hName
-                                }
-                            }
-                        };
-                        if (sysConfig.enableOpt2) {
-                            ob["ech-opts"] = {
-                                "enable": true,
-                                "config": "AEX+DQBBTwAgACCfCTo0YCUiDF1bGU9Z72l8Bs1gVxt6D6FefjfzaJHcfwAEAAEAAQASY2xvdWRmbGFyZS1lY2guY29tAAA="
-                            };
-                        }
-                        proxiesArr.push(ob);
-                    }
-
-                    if (isTrojan) {
-                        let tagStr = getConfigName("beta", p.name, port, hName, ip, selectedProxyIp, configIndex, ipName);
-                        tagStr = getUniqueName(tagStr);
-                        dynamicTags.push(tagStr);
-
-                        let randomJunk = Array.from({length: 11}, () => "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"[Math.floor(Math.random() * 62)]).join('');
-                        let payloadTr = { junk: randomJunk, protocol: "tr", mode: "proxyip", panelIPs: [], relayIdx: configIndex };
-                        let pathStrTr = "/" + btoa(JSON.stringify(payloadTr));
-
-                        let configUuid2 = generateConfigUuid(p.id, configIndex);
-                        registerConfigEntry(configUuid2, p.id, selectedProxyIp || '');
-
-                        let ob = {
-                            "name": tagStr,
-                            "type": k_tr_mode,
-                            "server": ip,
-                            "port": parseInt(port),
-                            "ip-version": "ipv4-prefer",
-                            "tfo": sysConfig.enableOpt1 || false,
-                            "udp": true,
-                            "password": p.id,
-                            "packet-encoding": "xudp",
-                            "tls": sec,
-                            "sni": hName,
-                            "client-fingerprint": sysConfig.agent || "random",
-                            "skip-cert-verify": allowInsecure,
-                            "alpn": ["http/1.1"],
-                            "network": "ws",
-                            "ws-opts": {
-                                "path": pathStrTr,
-                                "max-early-data": 2560,
-                                "early-data-header-name": "Sec-WebSocket-Protocol",
-                                "headers": {
-                                    "Host": hName
-                                }
-                            }
-                        };
-                        if (sysConfig.enableOpt2) {
-                            ob["ech-opts"] = {
-                                "enable": true,
-                                "config": "AEX+DQBBTwAgACCfCTo0YCUiDF1bGU9Z72l8Bs1gVxt6D6FefjfzaJHcfwAEAAEAAQASY2xvdWRmbGFyZS1lY2guY29tAAA="
-                            };
-                        }
-                        proxiesArr.push(ob);
-                    }
-                    configIndex++;
-                    if (sysConfig.enableDirectConfigs && pips.length > 0) {
-                        if (isVless) {
-                            let tagStr = getUniqueName(getConfigName("alpha", p.name, port, hName, ip, null, configIndex, ipName));
-                            dynamicTags.push(tagStr);
-                            let randomJunk = Array.from({length: 11}, () => "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"[Math.floor(Math.random() * 62)]).join('');
-                            let payloadVl = { junk: randomJunk, protocol: "vl", mode: "proxyip", panelIPs: [] };
-                            let pathStrVl = "/" + btoa(JSON.stringify(payloadVl));
-                            let configUuid = generateConfigUuid(p.id, configIndex);
-                            registerConfigEntry(configUuid, p.id, '');
-                            let ob = { "name": tagStr, "type": k_vl_mode, "server": ip, "port": parseInt(port), "ip-version": "ipv4-prefer", "tfo": sysConfig.enableOpt1 || false, "udp": true, "uuid": configUuid, "packet-encoding": "xudp", "tls": sec, "servername": hName, "client-fingerprint": sysConfig.agent || "random", "skip-cert-verify": allowInsecure, "alpn": ["http/1.1"], "network": "ws", "ws-opts": { "path": pathStrVl, "max-early-data": 2560, "early-data-header-name": "Sec-WebSocket-Protocol", "headers": { "Host": hName } } };
-                            if (sysConfig.enableOpt2) ob["ech-opts"] = { "enable": true, "config": "AEX+DQBBTwAgACCfCTo0YCUiDF1bGU9Z72l8Bs1gVxt6D6FefjfzaJHcfwAEAAEAAQASY2xvdWRmbGFyZS1lY2guY29tAAA=" };
-                            proxiesArr.push(ob);
-                        }
-                        if (isTrojan) {
-                            let tagStr = getUniqueName(getConfigName("beta", p.name, port, hName, ip, null, configIndex, ipName));
-                            dynamicTags.push(tagStr);
-                            let randomJunk = Array.from({length: 11}, () => "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"[Math.floor(Math.random() * 62)]).join('');
-                            let payloadTr = { junk: randomJunk, protocol: "tr", mode: "proxyip", panelIPs: [], relayIdx: configIndex };
-                            let pathStrTr = "/" + btoa(JSON.stringify(payloadTr));
-                            let configUuid2 = generateConfigUuid(p.id, configIndex);
-                            registerConfigEntry(configUuid2, p.id, '');
-                            let ob = { "name": tagStr, "type": k_tr_mode, "server": ip, "port": parseInt(port), "ip-version": "ipv4-prefer", "tfo": sysConfig.enableOpt1 || false, "udp": true, "password": p.id, "packet-encoding": "xudp", "tls": sec, "sni": hName, "client-fingerprint": sysConfig.agent || "random", "skip-cert-verify": allowInsecure, "alpn": ["http/1.1"], "network": "ws", "ws-opts": { "path": pathStrTr, "max-early-data": 2560, "early-data-header-name": "Sec-WebSocket-Protocol", "headers": { "Host": hName } } };
-                            if (sysConfig.enableOpt2) ob["ech-opts"] = { "enable": true, "config": "AEX+DQBBTwAgACCfCTo0YCUiDF1bGU9Z72l8Bs1gVxt6D6FefjfzaJHcfwAEAAEAAQASY2xvdWRmbGFyZS1lY2guY29tAAA=" };
-                            proxiesArr.push(ob);
-                        }
-                        configIndex++;
-                    }
-                });
-            });
-        });
-    });
-
-    if (dynamicTags.length === 0) {
-        dynamicTags.push("DIRECT");
-    }
-
-    return {
-        "mixed-port": 7890,
-        "ipv6": true,
-        "allow-lan": false,
-        "unified-delay": false,
-        "log-level": "warning",
-        "mode": "rule",
-        "disable-keep-alive": false,
-        "keep-alive-idle": 10,
-        "keep-alive-interval": 15,
-        "tcp-concurrent": true,
-        "geo-auto-update": true,
-        "geo-update-interval": 168,
-        "external-controller": "127.0.0.1:9090",
-        "external-controller-cors": {
-            "allow-origins": ["*"],
-            "allow-private-network": true
-        },
-        "external-ui": "ui",
-        "external-ui-url": "https://github.com/MetaCubeX/metacubexd/archive/refs/heads/gh-pages.zip",
-        "profile": {
-            "store-selected": true,
-            "store-fake-ip": true
-        },
-        "dns": {
-            "enable": true,
-            "respect-rules": true,
-            "use-system-hosts": false,
-            "listen": "127.0.0.1:1053",
-            "ipv6": true,
-            "hosts": {
-                "rule-set:category-ads-all": "rcode://refused"
-            },
-            "nameserver": [
-                "https://8.8.8.8/dns-query#✅ Selector"
-            ],
-            "proxy-server-nameserver": [
-                "8.8.8.8#DIRECT"
-            ],
-            "direct-nameserver": [
-                "8.8.8.8#DIRECT"
-            ],
-            "direct-nameserver-follow-policy": true,
-            "nameserver-policy": {
-                "rule-set:ir": "8.8.8.8#DIRECT"
-            },
-            "enhanced-mode": "redir-host"
-        },
-        "tun": {
-            "enable": true,
-            "stack": "mixed",
-            "auto-route": true,
-            "strict-route": true,
-            "auto-detect-interface": true,
-            "dns-hijack": ["any:53", "tcp://any:53"],
-            "mtu": 9000
-        },
-        "sniffer": {
-            "enable": true,
-            "force-dns-mapping": true,
-            "parse-pure-ip": true,
-            "override-destination": true,
-            "sniff": {
-                "HTTP": {
-                    "ports": [80, 8080, 8880, 2052, 2082, 2086, 2095]
-                },
-                "TLS": {
-                    "ports": [443, 8443, 2053, 2083, 2087, 2096]
-                }
-            }
-        },
-        [k_pxs]: proxiesArr,
-        [k_px_gps]: [
-            {
-                "name": "✅ Selector",
-                "type": "select",
-                "proxies": ["💦 Best Ping 🚀", ...fakeRefs, ...dynamicTags]
-            },
-            {
-                "name": "💦 Best Ping 🚀",
-                "type": "url-test",
-                "proxies": [...dynamicTags],
-                "url": "https://www.gstatic.com/generate_204",
-                "interval": 30,
-                "tolerance": 50
-            }
-        ],
-        "rule-providers": {
-            "category-ads-all": {
-                "type": "http",
-                "format": "text",
-                "behavior": "domain",
-                "path": "./ruleset/category-ads-all.txt",
-                "interval": 86400,
-                "url": "https://raw.githubusercontent.com/Chocolate4U/Iran-clash-rules/release/category-ads-all.txt"
-            },
-            "ir": {
-                "type": "http",
-                "format": "text",
-                "behavior": "domain",
-                "path": "./ruleset/ir.txt",
-                "interval": 86400,
-                "url": "https://raw.githubusercontent.com/Chocolate4U/Iran-clash-rules/release/ir.txt"
-            },
-            "ir-cidr": {
-                "type": "http",
-                "format": "text",
-                "behavior": "ipcidr",
-                "path": "./ruleset/ir-cidr.txt",
-                "interval": 86400,
-                "url": "https://raw.githubusercontent.com/Chocolate4U/Iran-clash-rules/release/ircidr.txt"
-            }
-        },
-        "rules": [
-            "GEOIP,lan,DIRECT,no-resolve",
-            "NETWORK,udp,REJECT",
-            "RULE-SET,category-ads-all,REJECT",
-            "RULE-SET,ir,DIRECT",
-            "RULE-SET,ir-cidr,DIRECT",
-            "MATCH,✅ Selector"
-        ],
-        "ntp": {
-            "enable": true,
-            "server": "time.cloudflare.com",
-            "port": 123,
-            "interval": 30
-        }
-    };
-}
-
-async function buildSingBoxJsonProfile(hostName, targetSub = null, allowInsecure = false) {
-    let ports = sysConfig.socketPorts ? sysConfig.socketPorts.split(',').map(s=>s.trim()).filter(Boolean) : ["443"];
-    let profiles = getAllProfiles(targetSub);
-    let allHostNames = [...new Set(profiles.flatMap(p => getProfileHostNames(hostName, p)))];
-    await preloadIpFlags(profiles, allHostNames);
-    let reqPath = encodeURI(`/${sysConfig.apiRoute}`);
-
-    let outboundsArr = [];
-    let dynamicTags = [];
-    let nameCounts = {};
-
-    // Add fake configs
-    let fakeNames = getFakeConfigNames(targetSub);
-    let fakeRefs = [];
-    fakeNames.forEach(name => {
-        outboundsArr.push({
-            "type": "direct",
-            "tag": name
-        });
-        fakeRefs.push(name);
-    });
-
-    const getUniqueName = (baseName) => {
-        if (!nameCounts[baseName]) {
-            nameCounts[baseName] = 1;
-            return baseName;
-        }
-        let counter = nameCounts[baseName];
-        let newName = `${baseName}-${counter}`;
-        while (nameCounts[newName]) {
-            counter++;
-            newName = `${baseName}-${counter}`;
-        }
-        nameCounts[baseName] = counter + 1;
-        nameCounts[newName] = 1;
-        return newName;
-    };
-
-    profiles.forEach(p => {
-        let pips = getEffectivePips(p);
-        let effectiveMode = p.userMode || sysConfig.mode;
-        let effectivePorts = p.userPorts ? p.userPorts.split(',').map(s=>s.trim()).filter(Boolean) : ports;
-        let maxCfg = p.maxConfigs || null;
-
-        let configIndex = 0;
-        let profileHostNames = getProfileHostNames(hostName, p);
-
-        profileHostNames.forEach(hName => {
-            let ipEntries = getCleanIpsWithNames(hName, p.cleanIp);
-            let allIps = ipEntries.map(e => e.ip);
-            let ips = calcEffectiveIps(allIps, maxCfg, effectiveMode, effectivePorts);
-            let ipNameMap = {};
-            ipEntries.forEach(e => { ipNameMap[e.ip] = e.name; });
-            effectivePorts.forEach(port => {
-                let sec = getTransportParams(port) === "tls";
-                ips.forEach(ip => {
-                    let isVless = effectiveMode === "alpha" || effectiveMode === "both";
-                    let isTrojan = effectiveMode === "beta" || effectiveMode === "both";
-                    let selectedProxyIp = null;
-                    if (pips.length > 0) {
-                        selectedProxyIp = pips[configIndex % pips.length];
-                    }
-                    let ipName = ipNameMap[ip] || '';
-
-                    if (isVless) {
-                        let tagStr = getConfigName("alpha", p.name, port, hName, ip, selectedProxyIp, configIndex, ipName);
-                        tagStr = getUniqueName(tagStr);
-                        dynamicTags.push(tagStr);
-
-                        let randomJunk = Array.from({length: 11}, () => "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"[Math.floor(Math.random() * 62)]).join('');
-                        let payloadVl = { junk: randomJunk, protocol: "vl", mode: "proxyip", panelIPs: [] };
-                        let pathStrVl = "/" + btoa(JSON.stringify(payloadVl));
-
-                        let configUuid = generateConfigUuid(p.id, configIndex);
-                        registerConfigEntry(configUuid, p.id, selectedProxyIp || '');
-
-                        let ob = {
-                            "type": k_vl_mode,
-                            "tag": tagStr,
-                            "server": ip,
-                            "server_port": parseInt(port),
-                            "tcp_fast_open": sysConfig.enableOpt1 || false,
-                            "uuid": configUuid,
-                            "packet_encoding": "xudp",
-                            "network": "tcp",
-                            "tls": {
-                                "enabled": sec,
-                                "server_name": hName,
-                                "insecure": allowInsecure,
-                                "alpn": ["http/1.1"],
-                                "utls": {
-                                    "enabled": true,
-                                    "fingerprint": "randomized"
-                                }
-                            },
-                            "transport": {
-                                "type": "ws",
-                                "path": pathStrVl,
-                                "max_early_data": 2560,
-                                "early_data_header_name": "Sec-WebSocket-Protocol",
-                                "headers": {
-                                    "Host": hName
-                                }
-                            }
-                        };
-                        outboundsArr.push(ob);
-                    }
-
-                    if (isTrojan) {
-                        let tagStr = getConfigName("beta", p.name, port, hName, ip, selectedProxyIp, configIndex, ipName);
-                        tagStr = getUniqueName(tagStr);
-                        dynamicTags.push(tagStr);
-
-                        let randomJunk = Array.from({length: 11}, () => "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"[Math.floor(Math.random() * 62)]).join('');
-                        let payloadTr = { junk: randomJunk, protocol: "tr", mode: "proxyip", panelIPs: [], relayIdx: configIndex };
-                        let pathStrTr = "/" + btoa(JSON.stringify(payloadTr));
-
-                        let configUuid2 = generateConfigUuid(p.id, configIndex);
-                        registerConfigEntry(configUuid2, p.id, selectedProxyIp || '');
-
-                        let ob = {
-                            "type": k_tr_mode,
-                            "tag": tagStr,
-                            "server": ip,
-                            "server_port": parseInt(port),
-                            "tcp_fast_open": sysConfig.enableOpt1 || false,
-                            "password": p.id,
-                            "network": "tcp",
-                            "tls": {
-                                "enabled": sec,
-                                "server_name": hName,
-                                "insecure": allowInsecure,
-                                "alpn": ["http/1.1"],
-                                "utls": {
-                                    "enabled": true,
-                                    "fingerprint": "randomized"
-                                }
-                            },
-                            "transport": {
-                                "type": "ws",
-                                "path": pathStrTr,
-                                "max_early_data": 2560,
-                                "early_data_header_name": "Sec-WebSocket-Protocol",
-                                "headers": {
-                                    "Host": hName
-                                }
-                            }
-                        };
-                        outboundsArr.push(ob);
-                    }
-                    configIndex++;
-                    if (sysConfig.enableDirectConfigs && pips.length > 0) {
-                        if (isVless) {
-                            let tagStr = getUniqueName(getConfigName("alpha", p.name, port, hName, ip, null, configIndex, ipName));
-                            dynamicTags.push(tagStr);
-                            let randomJunk = Array.from({length: 11}, () => "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"[Math.floor(Math.random() * 62)]).join('');
-                            let payloadVl = { junk: randomJunk, protocol: "vl", mode: "proxyip", panelIPs: [] };
-                            let pathStrVl = "/" + btoa(JSON.stringify(payloadVl));
-                            let configUuid = generateConfigUuid(p.id, configIndex);
-                            registerConfigEntry(configUuid, p.id, '');
-                            let ob = { "type": k_vl_mode, "tag": tagStr, "server": ip, "server_port": parseInt(port), "tcp_fast_open": sysConfig.enableOpt1 || false, "uuid": configUuid, "packet_encoding": "xudp", "network": "tcp", "tls": { "enabled": sec, "server_name": hName, "insecure": allowInsecure, "alpn": ["http/1.1"], "utls": { "enabled": true, "fingerprint": "randomized" } }, "transport": { "type": "ws", "path": pathStrVl, "max_early_data": 2560, "early_data_header_name": "Sec-WebSocket-Protocol", "headers": { "Host": hName } } };
-                            outboundsArr.push(ob);
-                        }
-                        if (isTrojan) {
-                            let tagStr = getUniqueName(getConfigName("beta", p.name, port, hName, ip, null, configIndex, ipName));
-                            dynamicTags.push(tagStr);
-                            let randomJunk = Array.from({length: 11}, () => "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"[Math.floor(Math.random() * 62)]).join('');
-                            let payloadTr = { junk: randomJunk, protocol: "tr", mode: "proxyip", panelIPs: [], relayIdx: configIndex };
-                            let pathStrTr = "/" + btoa(JSON.stringify(payloadTr));
-                            let configUuid2 = generateConfigUuid(p.id, configIndex);
-                            registerConfigEntry(configUuid2, p.id, '');
-                            let ob = { "type": k_tr_mode, "tag": tagStr, "server": ip, "server_port": parseInt(port), "tcp_fast_open": sysConfig.enableOpt1 || false, "password": p.id, "network": "tcp", "tls": { "enabled": sec, "server_name": hName, "insecure": allowInsecure, "alpn": ["http/1.1"], "utls": { "enabled": true, "fingerprint": "randomized" } }, "transport": { "type": "ws", "path": pathStrTr, "max_early_data": 2560, "early_data_header_name": "Sec-WebSocket-Protocol", "headers": { "Host": hName } } };
-                            outboundsArr.push(ob);
-                        }
-                        configIndex++;
-                    }
-                });
-            });
-        });
-    });
-
-    if (dynamicTags.length === 0) {
-        dynamicTags.push("direct");
-    }
-
-    return {
-        "log": {
-            "disabled": false,
-            "level": "warn",
-            "timestamp": true
-        },
-        "dns": {
-            "servers": [
-                {
-                    "address": "https://8.8.8.8/dns-query",
-                    "detour": "✅ Selector",
-                    "tag": "dns-remote"
-                },
-                {
-                    "address": "8.8.8.8",
-                    "detour": "direct",
-                    "tag": "dns-direct"
-                }
-            ],
-            "rules": [
-                {
-                    "clash_mode": "Direct",
-                    "server": "dns-direct"
-                },
-                {
-                    "clash_mode": "Global",
-                    "server": "dns-remote"
-                },
-                {
-                    "query_type": [
-                        "HTTPS"
-                    ],
-                    "action": "reject"
-                },
-                {
-                    "rule_set": [
-                        "geosite-category-ads-all"
-                    ],
-                    "action": "reject"
-                },
-                {
-                    "type": "logical",
-                    "mode": "and",
-                    "rules": [
-                        {
-                            "rule_set": [
-                                "geosite-ir"
-                            ]
-                        },
-                        {
-                            "rule_set": "geoip-ir"
-                        }
-                    ],
-                    "action": "route",
-                    "server": "dns-direct"
-                }
-            ],
-            "strategy": "prefer_ipv4",
-            "independent_cache": true
-        },
-        "inbounds": [
-            {
-                "type": "tun",
-                "tag": "tun-in",
-                "address": [
-                    "172.19.0.1/28"
-                ],
-                "mtu": 9000,
-                "auto_route": true,
-                "strict_route": true,
-                "stack": "mixed"
-            },
-            {
-                "type": "mixed",
-                "tag": "mixed-in",
-                "listen": "127.0.0.1",
-                "listen_port": 2080
-            }
-        ],
-        [k_obds]: [
-            ...outboundsArr,
-            {
-                "type": "selector",
-                "tag": "✅ Selector",
-                "outbounds": [
-                    "💦 Best Ping 🚀",
-                    ...fakeRefs,
-                    ...dynamicTags
-                ],
-                "interrupt_exist_connections": false
-            },
-            {
-                "type": "direct",
-                "tag": "direct"
-            },
-            {
-                "type": "urltest",
-                "tag": "💦 Best Ping 🚀",
-                "outbounds": [
-                    ...dynamicTags
-                ],
-                "url": "https://www.gstatic.com/generate_204",
-                "interrupt_exist_connections": false,
-                "interval": "30s"
-            }
-        ],
-        "route": {
-            "rules": [
-                {
-                    "ip_cidr": "172.19.0.2",
-                    "action": "hijack-dns"
-                },
-                {
-                    "clash_mode": "Direct",
-                    "outbound": "direct"
-                },
-                {
-                    "clash_mode": "Global",
-                    "outbound": "✅ Selector"
-                },
-                {
-                    "action": "sniff"
-                },
-                {
-                    "protocol": "dns",
-                    "action": "hijack-dns"
-                },
-                {
-                    "ip_is_private": true,
-                    "outbound": "direct"
-                },
-                {
-                    "network": "udp",
-                    "action": "reject"
-                },
-                {
-                    "rule_set": [
-                        "geosite-category-ads-all"
-                    ],
-                    "action": "reject"
-                },
-                {
-                    "rule_set": [
-                        "geosite-ir"
-                    ],
-                    "action": "route",
-                    "outbound": "direct"
-                },
-                {
-                    "rule_set": [
-                        "geoip-ir"
-                    ],
-                    "action": "route",
-                    "outbound": "direct"
-                }
-            ],
-            "rule_set": [
-                {
-                    "type": "remote",
-                    "tag": "geosite-category-ads-all",
-                    "format": "binary",
-                    "url": "https://raw.githubusercontent.com/Chocolate4U/Iran-sing-box-rules/rule-set/geosite-category-ads-all.srs",
-                    "download_detour": "direct"
-                },
-                {
-                    "type": "remote",
-                    "tag": "geosite-ir",
-                    "format": "binary",
-                    "url": "https://raw.githubusercontent.com/Chocolate4U/Iran-sing-box-rules/rule-set/geosite-ir.srs",
-                    "download_detour": "direct"
-                },
-                {
-                    "type": "remote",
-                    "tag": "geoip-ir",
-                    "format": "binary",
-                    "url": "https://raw.githubusercontent.com/Chocolate4U/Iran-sing-box-rules/rule-set/geoip-ir.srs",
-                    "download_detour": "direct"
-                }
-            ],
-            "auto_detect_interface": true,
-            "final": "✅ Selector"
-        },
-        "ntp": {
-            "enabled": true,
-            "server": "time.cloudflare.com",
-            "server_port": 123,
-            "interval": "30m",
-            "write_to_system": false
-        },
-        "experimental": {
-            "cache_file": {
-                "enabled": true,
-                "store_fakeip": true
-            },
-            "clash_api": {
-                "external_controller": "127.0.0.1:9090",
-                "external_ui": "ui",
-                "default_mode": "Rule",
-                "external_ui_download_url": "https://github.com/MetaCubeX/metacubexd/archive/refs/heads/gh-pages.zip",
-                "external_ui_download_detour": "direct"
-            }
-        }
-    };
-}
-
-function getDashboardUI(hasDB) {
-    return `
-  <!DOCTYPE html>
-  <html lang="en" class="dark">
-  <head>
-      <meta charset="UTF-8">
-      <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover">
-      <meta name="apple-mobile-web-app-capable" content="yes">
-      <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
-      <meta name="mobile-web-app-capable" content="yes">
-      <meta name="theme-color" content="#0d1117">
-      <meta name="apple-mobile-web-app-title" content="lowkey">
-      <meta name="format-detection" content="telephone=no">
-      <meta name="msapplication-tap-highlight" content="no">
-      <link rel="apple-touch-icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><rect width='100' height='100' rx='22' fill='%236366f1'/><text x='50' y='62' font-size='40' text-anchor='middle' fill='white' font-family='sans-serif' font-weight='bold'>N</text></svg>">
-      <title>lowkey</title>
-      <link href="https://fonts.googleapis.com/css2?family=Vazirmatn:wght@400;500;700;900&display=swap" rel="stylesheet">
-      <script src="https://cdn.tailwindcss.com"></script>
-      <script>
-          tailwind.config = { 
-              darkMode: 'class', 
-              theme: { 
-                  extend: { 
-                      fontFamily: { sans: ['Vazirmatn', 'sans-serif'] },
-                      colors: { 
-                          primary: '#FF006E', 
-                          darkbg: '#0d1117', 
-                          darkcard: 'rgba(15, 20, 32, 0.75)', 
-                          darkborder: 'rgba(255, 0, 110, 0.25)' 
-                      } 
-                  } 
-              } 
-          }
-      </script>
-      <style>
-          ::-webkit-scrollbar { width: 10px; height: 10px; }
-          ::-webkit-scrollbar-track { background: transparent; }
-          ::-webkit-scrollbar-thumb { background: linear-gradient(180deg, #FF006E, #00D9FF, #FFD60A); border-radius: 10px; }
-          ::-webkit-scrollbar-thumb:hover { background: linear-gradient(180deg, #FF1493, #00D9FF, #FFD60A); }
-          .fade-in { animation: fadeIn 0.3s ease-in-out; }
-          @keyframes fadeIn { from { opacity: 0; transform: translateY(10px); } to { opacity: 1; transform: translateY(0); } }
-
-          /* ===== lowkey animation set ===== */
-          @keyframes fadeInSmooth { from { opacity: 0; transform: translateY(8px); } to { opacity: 1; transform: translateY(0); } }
-          @keyframes slideInLeft { from { opacity: 0; transform: translateX(-24px); } to { opacity: 1; transform: translateX(0); } }
-          @keyframes slideInRight { from { opacity: 0; transform: translateX(24px); } to { opacity: 1; transform: translateX(0); } }
-          @keyframes rainbowGlow { 0%, 100% { box-shadow: 0 0 15px rgba(255,0,110,0.5); } 33% { box-shadow: 0 0 15px rgba(0,217,255,0.5); } 66% { box-shadow: 0 0 15px rgba(255,214,10,0.5); } }
-          @keyframes pulseRainbow { 0%, 100% { opacity: 1; transform: scale(1); } 50% { opacity: 0.7; transform: scale(1.05); } }
-          @keyframes rainbowText { 0% { color: #FF006E; } 33% { color: #00D9FF; } 66% { color: #FFD60A; } 100% { color: #FF006E; } }
-          @keyframes spin-custom { from { transform: rotate(0deg); } to { transform: rotate(360deg); } }
-          @keyframes bounce-custom { 0%, 100% { transform: translateY(0); } 50% { transform: translateY(-6px); } }
-          .anim-fade-in-smooth { animation: fadeInSmooth 0.5s ease-out; }
-          .anim-slide-in-left { animation: slideInLeft 0.4s ease-out; }
-          .anim-slide-in-right { animation: slideInRight 0.4s ease-out; }
-          .anim-rainbow-glow { animation: rainbowGlow 3s infinite; }
-          .anim-pulse-rainbow { animation: pulseRainbow 2s infinite; }
-          .anim-rainbow-text { animation: rainbowText 3s infinite; font-weight: 900; }
-          .anim-spin-custom { animation: spin-custom 1s linear infinite; }
-          .anim-bounce-custom { animation: bounce-custom 1s ease-in-out infinite; }
-          body.logged-in .anim-rainbow-glow, body.logged-in .anim-pulse-rainbow,
-          body.logged-in .anim-rainbow-text, body.logged-in .anim-spin-custom,
-          body.logged-in .anim-bounce-custom { animation-play-state: running; }
-          [data-accordion-content] { max-height: 0; overflow: hidden; visibility: hidden; transition: none; }
-          
-          /* GPU-accelerate scroll container */
-          .scroll-content { will-change: transform; -webkit-overflow-scrolling: touch; }
-          
-          /* Pause all animations after dashboard is shown */
-          body.logged-in .lock-pulse::before, body.logged-in .lock-pulse::after,
-          body.logged-in .btn-shimmer::after, body.logged-in .animate-bounce { animation: none !important; }
-          
-          /* Replace inline hover handlers with CSS */
-          .btn-top-bar { transition: border-color 0.15s, color 0.15s; }
-          .btn-top-bar:hover { border-color: rgba(99,102,241,0.4) !important; color: #00D9FF !important; }
-          .login-input { transition: border-color 0.15s, background 0.15s, box-shadow 0.15s; }
-          .login-input:focus { border-color: rgba(99,102,241,0.6) !important; background: rgba(99,102,241,0.06) !important; box-shadow: 0 0 0 3px rgba(99,102,241,0.1) !important; outline: none !important; }
-          .login-input:not(:focus) { border-color: rgba(255,255,255,0.1) !important; background: rgba(255,255,255,0.04) !important; box-shadow: none !important; }
-          .login-btn { transition: box-shadow 0.2s, transform 0.2s; }
-          .login-btn:hover { box-shadow: 0 6px 32px rgba(99,102,241,0.6), inset 0 1px 0 rgba(255,255,255,0.1) !important; transform: translateY(-1px); }
-          .login-btn:not(:hover) { box-shadow: 0 4px 24px rgba(99,102,241,0.4), inset 0 1px 0 rgba(255,255,255,0.1); transform: translateY(0); }
-          @media (max-width: 767px) {
-              .login-btn { transition: transform 0.12s ease, box-shadow 0.2s; }
-              .login-btn:active { transform: scale(0.96) !important; box-shadow: 0 2px 12px rgba(99,102,241,0.3) !important; }
-          }
-          .icon-btn { transition: color 0.15s, border-color 0.15s; }
-          .icon-btn:hover { color: #00D9FF !important; }
-          .eye-btn { transition: color 0.15s; }
-          .eye-btn:hover { color: #00D9FF !important; }
-          .eye-btn:not(:hover) { color: rgba(99,102,241,0.5) !important; }
-          
-          /* Enforce custom dark premium style */
-          html.dark, html.dark body {
-              background: linear-gradient(135deg, #0a0e27 0%, #1a1f3a 30%, #0f172a 60%) !important;
-              color: #f1f5f9 !important;
-          }
-          html.dark .bg-white, html.dark .bg-slate-50, html.dark .bg-indigo-50, html.dark .bg-darkcard {
-              background: linear-gradient(145deg, rgba(26, 31, 58, 0.95), rgba(18, 24, 41, 0.9)) !important;
-              backdrop-filter: blur(12px);
-              border: 2px solid !important;
-              border-image: linear-gradient(135deg, #FF006E, #00D9FF, #FFD60A) 1 !important;
-              box-shadow: 0 20px 60px rgba(255, 0, 110, 0.2), inset 0 1px 0 rgba(255, 255, 255, 0.05) !important;
-          }
-          html.dark aside {
-              background: rgba(13, 17, 23, 0.6) !important;
-              border-inline-end: 1px solid rgba(255, 0, 110, 0.25) !important;
-              backdrop-filter: blur(16px);
-          }
-          /* Light Mode Defaults - Happy vibrant gradient */
-          html:not(.dark) {
-              background: linear-gradient(135deg, #f0f4ff 0%, #ffe0ec 50%, #ffeed5 100%) !important;
-              background-attachment: fixed !important;
-              color: #0f172a !important;
-          }
-          html:not(.dark) body {
-              background: linear-gradient(135deg, #f0f4ff 0%, #ffe0ec 50%, #ffeed5 100%) !important;
-              background-attachment: fixed !important;
-              color: #0f172a !important;
-          }
-          @media (max-width: 767px) {
-              html:not(.dark) header {
-                  background: rgba(248, 250, 252, 0.85) !important;
-              }
-          }
-          html:not(.dark) #login-box, html:not(.dark) #dash-box {
-              background: #f8fafc !important;
-              background-color: #f8fafc !important;
-          }
-          html:not(.dark) aside {
-              background-color: #ffffff !important;
-              border-inline-end: 1px solid #e2e8f0 !important;
-          }
-          html:not(.dark) .bg-white {
-              background-color: #ffffff !important;
-              border-color: #e2e8f0 !important;
-              box-shadow: 0 4px 20px rgba(255, 0, 110, 0.08), 0 1px 2px -1px rgba(0, 0, 0, 0.05) !important;
-              transition: all 0.3s cubic-bezier(0.34, 1.56, 0.64, 1);
-          }
-          html:not(.dark) input, html:not(.dark) select, html:not(.dark) textarea {
-              background-color: #ffffff !important;
-              border: 1px solid #cbd5e1 !important;
-              color: #0f172a !important;
-              transition: all 0.25s ease;
-          }
-          html:not(.dark) input:focus, html:not(.dark) select:focus, html:not(.dark) textarea:focus {
-               border-color: #00D9FF !important;
-               background: linear-gradient(135deg, #fff0f8, #e0f7ff) !important;
-               box-shadow: 0 0 30px rgba(0, 217, 255, 0.5) !important;
-               outline: none !important;
-          }
-          html:not(.dark) .text-slate-200, html:not(.dark) .text-slate-300 {
-              color: #334155 !important;
-          }
-          html:not(.dark) select option {
-              background-color: #ffffff !important;
-              color: #0f172a !important;
-          }
-          html:not(.dark) #login-box [style*="radial-gradient"] {
-              display: none !important;
-          }
-          html:not(.dark) .rounded-3xl.p-px {
-              background: #cbd5e1 !important;
-          }
-          html:not(.dark) .rounded-3xl.p-px > div,
-          html:not(.dark) .rounded-3xl.p-px > div[style*="background"] {
-              background: #ffffff !important;
-          }
-          html:not(.dark) #login-box .rounded-3xl.p-8, 
-          html:not(.dark) #login-box .rounded-3xl.p-px {
-              background: #ffffff !important;
-              border: 1px solid #cbd5e1 !important;
-              box-shadow: 0 10px 30px rgba(0, 0, 0, 0.05) !important;
-          }
-          html:not(.dark) #login-box h2 {
-              color: #0f172a !important;
-          }
-          html:not(.dark) #login-box p,
-          html:not(.dark) #login-box label {
-              color: #475569 !important;
-          }
-          html:not(.dark) #login-box input {
-              background: #ffffff !important;
-              border: 1px solid #cbd5e1 !important;
-              color: #0f172a !important;
-          }
-          html:not(.dark) #login-box .lock-pulse {
-              background: rgba(255, 0, 110, 0.08) !important;
-              border: 1px solid rgba(255, 0, 110, 0.2) !important;
-              box-shadow: none !important;
-          }
-          html:not(.dark) #login-box svg {
-              color: #4f46e5 !important;
-          }
-          html:not(.dark) #login-box .border-bottom,
-          html:not(.dark) #login-box [style*="border-bottom"] {
-              border-bottom: 1px solid #e2e8f0 !important;
-          }
-          html:not(.dark) #login-box span[style*="color:#4ade80"] {
-              color: #16a34a !important;
-          }
-          html:not(.dark) #login-box span[style*="color:#334155"] {
-              color: #64748b !important;
-          }
-          html:not(.dark) #top-version-badge {
-              background-color: #f1f5f9 !important;
-              border-color: #cbd5e1 !important;
-              color: #4f46e5 !important;
-          }
-          html:not(.dark) #instagram-link-btn, html:not(.dark) #telegram-link-btn, html:not(.dark) #lang-toggle {
-              background-color: #ffffff !important;
-              border-color: #cbd5e1 !important;
-              color: #475569 !important;
-          }
-          html:not(.dark) #instagram-link-btn:hover, html:not(.dark) #telegram-link-btn:hover, html:not(.dark) #lang-toggle:hover {
-              border-color: #cbd5e1 !important;
-              color: #1e293b !important;
-          }
-          html:not(.dark) .nav-item.active { 
-               background: linear-gradient(90deg, rgba(255, 0, 110, 0.1), transparent) !important; 
-               color: #4f46e5 !important; 
-               border-inline-start: 4px solid #FF006E !important; 
-          }
-          html:not(.dark) .bg-emerald-500\/10, html:not(.dark) [style*="background:rgba(16,185,129"] {
-              background-color: #f0fdf4 !important;
-              border-color: #bbf7d0 !important;
-              color: #16a34a !important;
-          }
-          html:not(.dark) .bg-amber-500\/10, html:not(.dark) [style*="background:rgba(245,158,11"] {
-              background-color: #fffbeb !important;
-              border-color: #fef08a !important;
-              color: #d97706 !important;
-          }
-          html:not(.dark) .bg-indigo-500\/10, html:not(.dark) [style*="background:rgba(99,102,241"] {
-              background-color: #e0e7ff !important;
-              border-color: #c7d2fe !important;
-              color: #4f46e5 !important;
-          }
-          html:not(.dark) .bg-violet-500\/10, html:not(.dark) [style*="background:rgba(139,92,246"] {
-              background-color: #f5f3ff !important;
-              border-color: #ddd6fe !important;
-              color: #7c3aed !important;
-          }
-          html:not(.dark) .text-emerald-400 { color: #16a34a !important; }
-          html:not(.dark) .text-amber-400 { color: #d97706 !important; }
-          html:not(.dark) .text-indigo-400 { color: #4f46e5 !important; }
-          html:not(.dark) .text-violet-400 { color: #7c3aed !important; }
-          
-          .nav-item.active { 
-              background: linear-gradient(90deg, rgba(255, 0, 110, 0.2), transparent) !important; 
-              color: #a5b4fc !important; 
-              border-inline-start: 4px solid #FF006E !important; 
-              font-weight: 700; 
-              animation: rainbowGlow 3s infinite;
-          }
-          .dark .nav-item.active { 
-              background: linear-gradient(90deg, rgba(255, 0, 110, 0.2), transparent) !important; 
-              color: #a5b4fc !important; 
-              border-inline-start: 4px solid #00D9FF !important; 
-              animation: rainbowGlow 3s infinite;
-          }
-          .nav-item { border-inline-start: 4px solid transparent; transition: all 0.2s cubic-bezier(0.34, 1.56, 0.64, 1); }
-          .nav-item:hover { background: rgba(255, 255, 255, 0.02) !important; transform: translateX(2px); }
-          .mobile-nav-item.active { color: #00D9FF; }
-          .dark .mobile-nav-item.active { color: #00D9FF; }
-          aside nav { animation: slideInLeft 0.4s ease-out; }
-          #top-version-badge { animation: pulseRainbow 2.5s infinite; }
-
-          /* Typography */
-          h1, h2, h3 { font-weight: 900; letter-spacing: -0.5px; }
-          .gradient-text {
-              background: linear-gradient(90deg, #FF006E, #00D9FF, #FFD60A);
-              -webkit-background-clip: text;
-              background-clip: text;
-              -webkit-text-fill-color: transparent;
-              background-size: 200% auto;
-          }
-
-          /* Button lift + glow (opt-in via .btn-vibrant) */
-          .btn-vibrant {
-              background: linear-gradient(135deg, #FF006E, #FF1493) !important;
-              transition: all 0.3s cubic-bezier(0.34, 1.56, 0.64, 1) !important;
-          }
-          .btn-vibrant:hover {
-              transform: translateY(-3px);
-              box-shadow: 0 20px 50px rgba(255, 0, 110, 0.4);
-          }
-          .login-btn:hover { transform: translateY(-3px) !important; }
-
-          /* ===== NATIVE MOBILE APP STYLES ===== */
-
-          /* Disable text selection and tap highlights for app-like feel */
-          @media (max-width: 767px) {
-              *, *::before, *::after {
-                  -webkit-tap-highlight-color: transparent;
-              }
-              html {
-                  overscroll-behavior: none;
-                  -webkit-text-size-adjust: 100%;
-              }
-              body {
-                  overscroll-behavior: none;
-                  -webkit-overflow-scrolling: touch;
-                  touch-action: manipulation;
-              }
-          }
-
-          /* Native bottom tab bar */
-          @media (max-width: 767px) {
-              .mobile-bottom-nav {
-                  background: rgba(13, 17, 23, 0.85) !important;
-                  backdrop-filter: saturate(180%) blur(20px) !important;
-                  -webkit-backdrop-filter: saturate(180%) blur(20px) !important;
-                  border-top: 0.5px solid rgba(255, 255, 255, 0.08) !important;
-              }
-              html:not(.dark) .mobile-bottom-nav {
-                  background: rgba(255, 255, 255, 0.85) !important;
-                  backdrop-filter: saturate(180%) blur(20px) !important;
-                  -webkit-backdrop-filter: saturate(180%) blur(20px) !important;
-                  border-top: 0.5px solid rgba(0, 0, 0, 0.1) !important;
-              }
-          }
-
-          /* Native tab bar item */
-          @media (max-width: 767px) {
-              .mobile-tab-item {
-                  position: relative;
-                  transition: color 0.15s ease;
-                  padding: 4px 0;
-              }
-              .mobile-tab-item.active {
-                  color: #00D9FF;
-              }
-              .mobile-tab-item.active::before {
-                  content: '';
-                  position: absolute;
-                  top: -1px;
-                  left: 50%;
-                  transform: translateX(-50%);
-                  width: 20px;
-                  height: 2px;
-                  background: #00D9FF;
-                  border-radius: 1px;
-              }
-              .mobile-tab-item svg {
-                  width: 22px;
-                  height: 22px;
-                  transition: transform 0.15s ease;
-              }
-              .mobile-tab-item.active svg {
-                  transform: scale(1.08);
-              }
-              .mobile-tab-item span {
-                  font-size: 10px;
-                  font-weight: 600;
-                  letter-spacing: 0.01em;
-              }
-          }
-
-          /* Native save bar for mobile */
-          @media (max-width: 767px) {
-              .mobile-save-bar {
-                  background: rgba(13, 17, 23, 0.9) !important;
-                  backdrop-filter: saturate(180%) blur(20px) !important;
-                  -webkit-backdrop-filter: saturate(180%) blur(20px) !important;
-                  border-top: 0.5px solid rgba(255, 255, 255, 0.08) !important;
-                  padding-bottom: env(safe-area-inset-bottom, 0px) !important;
-              }
-              html:not(.dark) .mobile-save-bar {
-                  background: rgba(255, 255, 255, 0.92) !important;
-                  backdrop-filter: saturate(180%) blur(20px) !important;
-                  -webkit-backdrop-filter: saturate(180%) blur(20px) !important;
-                  border-top: 0.5px solid rgba(0, 0, 0, 0.08) !important;
-              }
-          }
-
-          /* Smooth momentum scrolling for scroll containers */
-          @media (max-width: 767px) {
-              .scroll-content {
-                  -webkit-overflow-scrolling: touch;
-                  scroll-behavior: smooth;
-                  overscroll-behavior-y: contain;
-              }
-              .native-press {
-                  transition: transform 0.12s ease, opacity 0.12s ease;
-              }
-              .native-press:active {
-                  transform: scale(0.96);
-                  opacity: 0.85;
-              }
-          }
-
-          /* Native status bar padding at very top */
-          @media (max-width: 767px) {
-              .dash-box-native {
-                  padding-top: env(safe-area-inset-top, 0px) !important;
-              }
-          }
-
-          /* Remove scrollbar on mobile for cleaner look */
-          @media (max-width: 767px) {
-              ::-webkit-scrollbar { width: 0; height: 0; }
-          }
-      </style>
-  </head>
-  <body class="text-slate-800 dark:text-slate-200 h-[100dvh] flex flex-col md:flex-row overflow-hidden selection:bg-primary selection:text-white transition-colors duration-300 bg-slate-50 dark:bg-darkbg">
-
-      <!-- Global Controls -->
-      <div class="fixed top-4 end-4 md:top-5 md:end-5 flex items-center gap-2 z-50">
-          <span id="top-version-badge" class="hidden md:inline-block px-3 py-1.5 rounded-xl text-[11px] font-mono font-bold" style="background:rgba(99,102,241,0.12);border:1px solid rgba(99,102,241,0.25);color:#00D9FF;">v${CURRENT_VERSION}</span>
-          <a href="https://www.instagram.com/shayan.sheykhi.87?igsh=MTc3YjlxazRxbHA0Yw==" id="instagram-link-btn" target="_blank" class="hidden md:inline-flex btn-top-bar p-2 rounded-xl transition-all" style="background:rgba(255,255,255,0.06);border:1px solid rgba(255,255,255,0.1);color:#94a3b8;" onmouseover="this.style.color='#ec4899';this.style.borderColor='rgba(236,72,153,0.4)'" onmouseout="this.style.color='#94a3b8';this.style.borderColor='rgba(255,255,255,0.1)'">
-              <svg class="w-4 h-4" fill="currentColor" viewBox="0 0 24 24"><path d="M12 2.163c3.204 0 3.584.012 4.85.07 3.252.148 4.771 1.691 4.919 4.919.058 1.265.069 1.645.069 4.849 0 3.205-.012 3.584-.069 4.849-.149 3.225-1.664 4.771-4.919 4.919-1.266.058-1.644.07-4.85.07-3.204 0-3.584-.012-4.849-.07-3.26-.149-4.771-1.699-4.919-4.92-.058-1.265-.07-1.644-.07-4.849 0-3.204.013-3.583.07-4.849.149-3.227 1.664-4.771 4.919-4.919 1.265-.057 1.645-.069 4.849-.069zm0-2.163c-3.259 0-3.667.014-4.947.072-4.358.2-6.78 2.618-6.98 6.98-.059 1.281-.073 1.689-.073 4.948 0 3.259.014 3.668.072 4.948.2 4.358 2.618 6.78 6.98 6.98 1.281.058 1.689.072 4.948.072 3.259 0 3.668-.014 4.948-.072 4.354-.2 6.782-2.618 6.979-6.98.059-1.28.073-1.689.073-4.948 0-3.259-.014-3.667-.072-4.947-.196-4.354-2.617-6.78-6.979-6.98-1.281-.059-1.69-.073-4.949-.073zM5.838 12a6.162 6.162 0 1 1 12.324 0 6.162 6.162 0 0 1-12.324 0zM12 16a4 4 0 1 1 0-8 4 4 0 0 1 0 8zm4.965-10.322a1.44 1.44 0 1 1 2.881.001 1.44 1.44 0 0 1-2.881-.001z"></path></svg>
-          </a>
-          <a href="https://t.me/lowkey878" id="telegram-link-btn" target="_blank" class="hidden md:inline-flex btn-top-bar p-2 rounded-xl transition-all" style="background:rgba(255,255,255,0.06);border:1px solid rgba(255,255,255,0.1);color:#94a3b8;" onmouseover="this.style.color='#0088cc';this.style.borderColor='rgba(0,136,204,0.4)'" onmouseout="this.style.color='#94a3b8';this.style.borderColor='rgba(255,255,255,0.1)'">
-              <svg class="w-4 h-4" fill="currentColor" viewBox="0 0 24 24"><path d="M11.944 0A12 12 0 0 0 0 12a12 12 0 0 0 12 12 12 12 0 0 0 12-12A12 12 0 0 0 12 0a12 12 0 0 0-.056 0zm4.962 7.224c.1-.002.321.023.465.14a.506.506 0 0 1 .171.325c.016.093.036.306.02.472-.18 1.898-.962 6.502-1.36 8.627-.168.9-.499 1.201-.82 1.23-.696.065-1.225-.46-1.9-.902-1.056-.693-1.653-1.124-2.678-1.8-1.185-.78-.417-1.21.258-1.91.177-.184 3.247-2.977 3.307-3.23.007-.032.014-.15-.056-.212s-.174-.041-.249-.024c-.106.024-1.793 1.14-5.061 3.345-.48.33-.913.365-1.337.175-.437-.148-1.33-.515-1.98-.94-.74-.478-1.33-1.1-1.142-1.733.044-.137.105-.273.311-.409 4.679-3.287 5.844-4.066 7.094-4.694.531-.258 1.42-.374 2.074-.111.528.205 1.082.854 1.323 1.479.542 1.45.409 3.546.599 5.344z"></path></svg>
-          </a>
-          <button onclick="toggleLang()" id="lang-toggle" class="btn-top-bar px-3 py-1.5 rounded-xl text-sm font-bold transition-all" style="background:rgba(255,255,255,0.06);border:1px solid rgba(255,255,255,0.1);color:#e2e8f0;">EN</button>
-          <button onclick="toggleTheme()" class="btn-top-bar p-2 rounded-xl transition-all" style="background:rgba(255,255,255,0.06);border:1px solid rgba(255,255,255,0.1);color:#f59e0b;">
-              <svg class="w-4 h-4 hidden dark:block" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M20.354 15.354A9 9 0 018.646 3.646 9.003 9.003 0 0012 21a9.003 9.003 0 008.354-5.646z"></path></svg>
-              <svg class="w-4 h-4 block dark:hidden" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 3v1m0 16v1m9-9h-1M4 12H3m15.364 6.364l-.707-.707M6.343 6.343l-.707-.707m12.728 0l-.707.707M6.343 17.657l-.707.707M16 12a4 4 0 11-8 0 4 4 0 018 0z"></path></svg>
-          </button>
-          <button onclick="logout()" id="btn-logout-mob" class="hidden md:hidden p-2 rounded-xl transition-all" style="background:rgba(239,68,68,0.1);border:1px solid rgba(239,68,68,0.2);color:#f87171;">
-              <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M17 16l4-4m0 0l-4-4m4 4H7m6 4v1a3 3 0 01-3 3H6a3 3 0 01-3-3V7a3 3 0 013-3h4a3 3 0 013 3v1"></path></svg>
-          </button>
-      </div>
-
-      <!-- LOGIN SCREEN -->
-      <div id="login-box" class="absolute inset-0 flex items-center justify-center p-4 z-40 overflow-hidden" style="background:linear-gradient(135deg,#0d1117 0%,#0f172a 50%,#0d1117 100%);">
-          <div class="absolute pointer-events-none" style="width:500px;height:500px;top:-100px;left:-150px;background:radial-gradient(circle,rgba(99,102,241,0.12) 0%,transparent 65%);"></div>
-          <div class="absolute pointer-events-none" style="width:400px;height:400px;bottom:-80px;right:-100px;background:radial-gradient(circle,rgba(139,92,246,0.1) 0%,transparent 65%);"></div>
-          <div class="relative w-full max-w-sm">
-              <style>
-                  @keyframes pulse-ring{0%{transform:scale(1);opacity:0.5}100%{transform:scale(1.7);opacity:0}}
-                  @keyframes shimmer{0%{left:-100%}100%{left:100%}}
-                  .lock-pulse::before,.lock-pulse::after{content:'';position:absolute;inset:-8px;border-radius:50%;border:1px solid rgba(99,102,241,0.35);animation:pulse-ring 2.5s ease-out infinite;}
-                  .lock-pulse::after{animation-delay:1.25s;}
-                  .btn-shimmer::after{content:'';position:absolute;top:0;left:-100%;width:60%;height:100%;background:linear-gradient(90deg,transparent,rgba(255,255,255,0.12),transparent);animation:shimmer 2.5s ease-in-out infinite;}
-              </style>
-              <div class="text-center mb-8">
-                  <div class="relative inline-flex items-center justify-center mb-5">
-                      <div class="lock-pulse relative w-20 h-20 rounded-3xl flex items-center justify-center" style="background:linear-gradient(145deg,rgba(99,102,241,0.25),rgba(99,102,241,0.08));border:1px solid rgba(99,102,241,0.45);box-shadow:0 0 40px rgba(99,102,241,0.25),inset 0 1px 0 rgba(255,255,255,0.08);">
-                          <svg class="w-9 h-9" style="color:#a5b4fc" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="1.5" d="M12 15v2m-6 4h12a2 2 0 002-2v-6a2 2 0 00-2-2H6a2 2 0 00-2 2v6a2 2 0 002 2zm10-10V7a4 4 0 00-8 0v4h8z"></path></svg>
-                      </div>
-                  </div>
-                  <h2 class="text-3xl font-black" style="color:#f1f5f9;" data-i18n="title">lowkey</h2>
-                  <p class="text-sm mt-2" style="color:#64748b;">Sign in to manage your gateway</p>
-              </div>
-              <div class="rounded-3xl p-px" style="background:linear-gradient(145deg,rgba(99,102,241,0.45),rgba(99,102,241,0.08) 50%,rgba(139,92,246,0.3));box-shadow:0 25px 60px rgba(0,0,0,0.5);">
-                  <div class="rounded-3xl p-8" style="background:linear-gradient(145deg,rgba(15,20,40,0.98),rgba(13,17,23,0.98));">
-                      <div class="flex items-center gap-2 mb-7 pb-6" style="border-bottom:1px solid rgba(255,255,255,0.06);">
-                          <span class="w-2 h-2 rounded-full flex-shrink-0" style="background:#22c55e;box-shadow:0 0 8px #22c55e;"></span>
-                          <span class="text-xs" style="color:#4ade80;">System online</span>
-                          <span class="flex-1"></span>
-                          <span class="text-xs" style="color:#334155;">&#128274; Secure connection</span>
-                      </div>
-                      ${!hasDB ? `<div class="mb-5 p-4 rounded-2xl flex items-start gap-3" style="background:rgba(239,68,68,0.08);border:1px solid rgba(239,68,68,0.2);"><span style="color:#f87171;">&#9888;&#65039;</span><span class="text-sm" style="color:#fca5a5;" data-i18n="missing_db">Database not connected. Settings won't be saved.</span></div>` : ''}
-                      <div class="mb-5">
-                          <label class="block text-sm font-semibold mb-2.5" style="color:#94a3b8;" data-i18n="login_password">Password</label>
-                          <div class="relative">
-                              <div class="absolute inset-y-0 start-0 flex items-center ps-4" style="color:rgba(99,102,241,0.7);">
-                                  <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M15 7a2 2 0 012 2m4 0a6 6 0 01-7.743 5.743L11 17H9v2H7v2H4a1 1 0 01-1-1v-2.586a1 1 0 01.293-.707l5.964-5.964A6 6 0 1121 9z"></path></svg>
-                              </div>
-                              <input type="password" id="pwd" data-i18n="pass_ph" placeholder="Enter your password" class="login-input w-full ps-11 pe-12 py-3.5 text-sm rounded-2xl outline-none transition-all" style="background:rgba(255,255,255,0.04);border:1px solid rgba(255,255,255,0.1);color:#e2e8f0;">
-                              <button type="button" onclick="const n=document.getElementById('pwd');n.type=n.type==='password'?'text':'password'" class="eye-btn absolute inset-y-0 end-0 flex items-center px-4 transition-colors" style="color:rgba(99,102,241,0.5);">
-                                  <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M15 12a3 3 0 11-6 0 3 3 0 016 0z"></path><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M2.458 12C3.732 7.943 7.523 5 12 5c4.478 0 8.268 2.943 9.542 7-1.274 4.057-5.064 7-9.542 7-4.477 0-8.268-2.943-9.542-7z"></path></svg>
-                              </button>
-                          </div>
-                      </div>
-                      <p id="err-msg" class="hidden text-sm mb-4 flex items-center gap-2 px-3 py-2.5 rounded-xl" style="background:rgba(239,68,68,0.08);border:1px solid rgba(239,68,68,0.2);color:#f87171;"><span>&#9888;&#65039;</span><span data-i18n="err_pass">Wrong password, please try again.</span></p>
-                      <button onclick="doLogin()" class="login-btn btn-shimmer w-full py-3.5 rounded-2xl font-bold text-sm relative overflow-hidden transition-all" style="background:linear-gradient(135deg,#FF006E,#7c3aed);color:white;box-shadow:0 4px 24px rgba(99,102,241,0.4),inset 0 1px 0 rgba(255,255,255,0.1);" data-i18n="login_btn">
-                          Sign In
-                      </button>
-                  </div>
-              </div>
-          </div>
-      </div>
-
-      <!-- DASHBOARD CONTAINER -->
-      <div id="dash-box" class="hidden w-full h-full flex-col md:flex-row relative dash-box-native" style="padding-top: env(safe-area-inset-top, 0px);">
-          
-          <!-- SIDEBAR (Desktop) -->
-          <aside class="hidden md:flex w-64 bg-white dark:bg-darkcard border-e border-slate-200 dark:border-darkborder flex-col z-20 shrink-0">
-              <div class="flex items-center p-6 border-b border-slate-100 dark:border-darkborder/50">
-                  <div class="w-10 h-10 rounded-xl bg-indigo-50 dark:bg-indigo-900/40 text-primary flex items-center justify-center me-3 shrink-0"><svg class="w-6 h-6" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M13 10V3L4 14h7v7l9-11h-7z"></path></svg></div>
-                  <div class="flex flex-col">
-                      <h1 class="font-black text-xl leading-none" data-i18n="title">lowkey</h1>
-                      <span id="app-version" class="text-[10px] font-mono text-slate-400 mt-1 font-semibold">v${CURRENT_VERSION}</span>
-                  </div>
-              </div>
-              <nav class="flex-1 p-4 space-y-2 overflow-y-auto">
-                  <button onclick="switchTab('overview')" id="tab-overview" class="nav-item active flex items-center w-full px-4 py-3 rounded-lg text-slate-500 hover:text-slate-800 dark:hover:text-slate-200 group">
-                      <svg class="w-6 h-6 me-3" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 5a1 1 0 011-1h4a1 1 0 011 1v4a1 1 0 01-1 1H5a1 1 0 01-1-1V5zm10 0a1 1 0 011-1h4a1 1 0 011 1v4a1 1 0 01-1 1h-4a1 1 0 01-1-1V5zM4 15a1 1 0 011-1h4a1 1 0 011 1v4a1 1 0 01-1 1H5a1 1 0 01-1-1v-4zm10 0a1 1 0 011-1h4a1 1 0 011 1v4a1 1 0 01-1 1h-4a1 1 0 01-1-1v-4z"></path></svg>
-                      <span class="font-semibold" data-i18n="tab_overview">Overview</span>
-                  </button>
-                  <button onclick="switchTab('info')" id="tab-info" class="nav-item flex items-center w-full px-4 py-3 rounded-lg text-slate-500 hover:text-slate-800 dark:hover:text-slate-200 group">
-                      <svg class="w-6 h-6 me-3" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M13.828 10.172a4 4 0 00-5.656 0l-4 4a4 4 0 105.656 5.656l1.102-1.101m-.758-4.899a4 4 0 005.656 0l4-4a4 4 0 00-5.656-5.656l-1.1 1.1"></path></svg>
-                      <span class="font-semibold" data-i18n="tab_info">Endpoints</span>
-                  </button>
-                  <button onclick="switchTab('network')" id="tab-network" class="nav-item flex items-center w-full px-4 py-3 rounded-lg text-slate-500 hover:text-slate-800 dark:hover:text-slate-200 group">
-                      <svg class="w-6 h-6 me-3" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 19v-6a2 2 0 00-2-2H5a2 2 0 00-2 2v6a2 2 0 002 2h2a2 2 0 002-2zm0 0V9a2 2 0 012-2h2a2 2 0 012 2v10m-6 0a2 2 0 002 2h2a2 2 0 002-2m0 0V5a2 2 0 012-2h2a2 2 0 012 2v14a2 2 0 01-2 2h-2a2 2 0 01-2-2z"></path></svg>
-                      <span class="font-semibold" data-i18n="tab_status">Metrics</span>
-                  </button>
-                  <button onclick="switchTab('settings')" id="tab-settings" class="nav-item flex items-center w-full px-4 py-3 rounded-lg text-slate-500 hover:text-slate-800 dark:hover:text-slate-200 group">
-                      <svg class="w-6 h-6 me-3" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M10.325 4.317c.426-1.756 2.924-1.756 3.35 0a1.724 1.724 0 002.573 1.066c1.543-.94 3.31.826 2.37 2.37a1.724 1.724 0 001.065 2.572c1.756.426 1.756 2.924 0 3.35a1.724 1.724 0 00-1.066 2.573c.94 1.543-.826 3.31-2.37 2.37a1.724 1.724 0 00-2.572 1.065c-.426 1.756-2.924 1.756-3.35 0a1.724 1.724 0 00-2.573-1.066c-1.543.94-3.31-.826-2.37-2.37a1.724 1.724 0 00-1.065-2.572c-1.756-.426-1.756-2.924 0-3.35a1.724 1.724 0 001.066-2.573c-.94-1.543.826-3.31 2.37-2.37.996.608 2.296.07 2.572-1.065z"></path></svg>
-                      <span class="font-semibold" data-i18n="tab_settings">System</span>
-                  </button>
-                  <button onclick="switchTab('advanced')" id="tab-advanced" class="nav-item flex items-center w-full px-4 py-3 rounded-lg text-slate-500 hover:text-slate-800 dark:hover:text-slate-200 group">
-                      <svg class="w-6 h-6 me-3" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M8 9l3 3-3 3m5 0h3M5 20h14a2 2 0 002-2V6a2 2 0 00-2-2H5a2 2 0 00-2 2v12a2 2 0 002 2z"></path></svg>
-                      <span class="font-semibold" data-i18n="tab_adv">Advanced</span>
-                  </button>
-                  <button onclick="switchTab('logs')" id="tab-logs" class="nav-item flex items-center w-full px-4 py-3 rounded-lg text-slate-500 hover:text-slate-800 dark:hover:text-slate-200 group">
-                      <svg class="w-6 h-6 me-3" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 6h16M4 10h16M4 14h16M4 18h16"></path></svg>
-                      <span class="font-semibold" data-i18n="tab_logs">Activity logs</span>
-                  </button>
-                  <button onclick="switchTab('users')" id="tab-users" class="nav-item flex items-center w-full px-4 py-3 rounded-lg text-slate-500 hover:text-slate-800 dark:hover:text-slate-200 group">
-                      <svg class="w-6 h-6 me-3" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 4.354a4 4 0 110 5.292M15 21H3v-1a6 6 0 0112 0v1zm0 0h6v-1a6 6 0 00-9-5.197M13 7a4 4 0 11-8 0 4 4 0 018 0z"></path></svg>
-                      <span class="font-semibold" data-i18n="tab_users">Users</span>
-                  </button>
-              </nav>
-              <div class="p-4 border-t border-slate-100 dark:border-darkborder/50">
-                  <button onclick="logout()" class="flex items-center justify-center w-full px-4 py-2 rounded-lg text-red-500 hover:bg-red-50 dark:hover:bg-red-900/20 font-semibold transition-colors">
-                      <svg class="w-5 h-5 me-2" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M17 16l4-4m0 0l-4-4m4 4H7m6 4v1a3 3 0 01-3 3H6a3 3 0 01-3-3V7a3 3 0 013-3h4a3 3 0 013 3v1"></path></svg>
-                      <span data-i18n="logout">Disconnect</span>
-                  </button>
-              </div>
-          </aside>
-  
-          <!-- MAIN CONTENT AREA -->
-          <main class="flex-1 flex flex-col h-full overflow-hidden">
-              <header class="h-14 md:h-24 shrink-0 flex items-center px-4 md:px-10 z-10 pt-[env(safe-area-inset-top,0px)] md:pt-0" style="background:rgba(13,17,23,0.75);backdrop-filter:saturate(180%) blur(20px);-webkit-backdrop-filter:saturate(180%) blur(20px);">
-                  <h2 id="view-title" class="text-lg md:text-3xl font-black text-slate-800 dark:text-white mt-0 md:mt-2">Overview</h2>
-              </header>
-  
-              <!-- Scrollable Content -->
-              <div class="scroll-content flex-1 overflow-y-auto p-4 md:p-10">
-                  <div class="max-w-4xl mx-auto space-y-6 fade-in">
-
-                      <!-- Update Banner -->
-
-                      <!-- OVERVIEW / DASHBOARD VIEW -->
-                      <div id="view-overview" class="space-y-3 md:space-y-6 block">
-                          <!-- User Summary Cards -->
-                          <div class="grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-5 gap-2 md:gap-4">
-                              <div class="native-press bg-white dark:bg-darkcard rounded-xl md:rounded-2xl p-3 md:p-4 shadow-sm border border-slate-200 dark:border-darkborder">
-                                  <div class="flex items-center justify-between mb-1 md:mb-2">
-                                      <span class="text-[9px] md:text-[10px] font-bold text-slate-400 uppercase tracking-wider" data-i18n="ov_total_users">Total Users</span>
-                                      <div class="p-1.5 md:p-2 bg-primary/10 text-primary rounded-md md:rounded-lg"><svg class="w-3.5 h-3.5 md:w-4 md:h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M17 20h5v-2a3 3 0 00-5.356-1.857M17 20H7m10 0v-2c0-.656-.126-1.283-.356-1.857M7 20H2v-2a3 3 0 015.356-1.857M7 20v-2c0-.656-.126-1.283-.356-1.857M12 4.354a4 4 0 110 5.292"></path></svg></div>
-                                  </div>
-                                  <p id="ov-total-users" class="text-xl md:text-2xl font-black text-slate-800 dark:text-white">-</p>
-                              </div>
-                              <div class="native-press bg-white dark:bg-darkcard rounded-xl md:rounded-2xl p-3 md:p-4 shadow-sm border border-slate-200 dark:border-darkborder">
-                                  <div class="flex items-center justify-between mb-1 md:mb-2">
-                                      <span class="text-[9px] md:text-[10px] font-bold text-slate-400 uppercase tracking-wider" data-i18n="ov_active_users">Active</span>
-                                      <div class="p-1.5 md:p-2 bg-emerald-500/10 text-emerald-500 rounded-md md:rounded-lg"><svg class="w-3.5 h-3.5 md:w-4 md:h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 12l2 2 4-4m6 2a9 9 0 11-18 0 9 9 0 0118 0z"></path></svg></div>
-                                  </div>
-                                  <p id="ov-active-users" class="text-xl md:text-2xl font-black text-emerald-600 dark:text-emerald-400">-</p>
-                              </div>
-                              <div class="native-press bg-white dark:bg-darkcard rounded-xl md:rounded-2xl p-3 md:p-4 shadow-sm border border-slate-200 dark:border-darkborder">
-                                  <div class="flex items-center justify-between mb-1 md:mb-2">
-                                      <span class="text-[9px] md:text-[10px] font-bold text-slate-400 uppercase tracking-wider" data-i18n="ov_paused_users">Paused</span>
-                                      <div class="p-1.5 md:p-2 bg-amber-500/10 text-amber-500 rounded-md md:rounded-lg"><svg class="w-3.5 h-3.5 md:w-4 md:h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M10 9v6m4-6v6m7-3a9 9 0 11-18 0 9 9 0 0118 0z"></path></svg></div>
-                                  </div>
-                                  <p id="ov-paused-users" class="text-xl md:text-2xl font-black text-amber-600 dark:text-amber-400">-</p>
-                              </div>
-                              <div class="native-press bg-white dark:bg-darkcard rounded-xl md:rounded-2xl p-3 md:p-4 shadow-sm border border-slate-200 dark:border-darkborder">
-                                  <div class="flex items-center justify-between mb-1 md:mb-2">
-                                      <span class="text-[9px] md:text-[10px] font-bold text-slate-400 uppercase tracking-wider" data-i18n="ov_auto_disabled">Auto-Disabled</span>
-                                      <div class="p-1.5 md:p-2 bg-red-500/10 text-red-500 rounded-md md:rounded-lg"><svg class="w-3.5 h-3.5 md:w-4 md:h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 9v2m0 4h.01m-6.938 4h13.856c1.54 0 2.502-1.667 1.732-2.5L13.732 4c-.77-.833-1.964-.833-2.732 0L4.082 16.5c-.77.833.192 2.5 1.732 2.5z"></path></svg></div>
-                                  </div>
-                                  <p id="ov-auto-disabled" class="text-xl md:text-2xl font-black text-red-600 dark:text-red-400">-</p>
-                              </div>
-                              <div class="native-press bg-white dark:bg-darkcard rounded-xl md:rounded-2xl p-3 md:p-4 shadow-sm border border-slate-200 dark:border-darkborder">
-                                  <div class="flex items-center justify-between mb-1 md:mb-2">
-                                      <span class="text-[9px] md:text-[10px] font-bold text-slate-400 uppercase tracking-wider" data-i18n="ov_expired_users">Expired</span>
-                                      <div class="p-1.5 md:p-2 bg-slate-500/10 text-slate-500 rounded-md md:rounded-lg"><svg class="w-3.5 h-3.5 md:w-4 md:h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 8v4l3 3m6-3a9 9 0 11-18 0 9 9 0 0118 0z"></path></svg></div>
-                                  </div>
-                                  <p id="ov-expired-users" class="text-xl md:text-2xl font-black text-slate-600 dark:text-slate-400">-</p>
-                              </div>
-                          </div>
-
-                          <!-- Traffic & System Cards -->
-                          <div class="grid grid-cols-2 sm:grid-cols-2 lg:grid-cols-4 gap-2 md:gap-4">
-                              <div class="native-press bg-white dark:bg-darkcard rounded-xl md:rounded-2xl p-3 md:p-5 shadow-sm border border-slate-200 dark:border-darkborder">
-                                  <div class="flex items-center gap-2 md:gap-3 mb-2 md:mb-3">
-                                      <div class="p-1.5 md:p-2.5 bg-violet-500/10 text-violet-500 rounded-lg md:rounded-xl"><svg class="w-4 h-4 md:w-5 md:h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M19 11H5m14 0a2 2 0 012 2v6a2 2 0 01-2 2H5a2 2 0 01-2-2v-6a2 2 0 012-2m14 0V9a2 2 0 00-2-2M5 11V9a2 2 0 012-2m0 0V5a2 2 0 012-2h6a2 2 0 012 2v2M7 7h10"></path></svg></div>
-                                       <span class="text-[10px] md:text-xs font-bold text-slate-500 uppercase tracking-wider" data-i18n="ov_total_traffic">Total Traffic</span>
-                                  </div>
-                                   <p id="ov-total-traffic" class="text-base md:text-xl font-black text-slate-800 dark:text-white">- GB</p>
-                                  <p class="text-[9px] md:text-[10px] text-slate-400 mt-0.5 md:mt-1"><span id="ov-total-reqs">-</span> <span data-i18n="ov_requests">requests</span></p>
-                              </div>
-                              <div class="native-press bg-white dark:bg-darkcard rounded-xl md:rounded-2xl p-3 md:p-5 shadow-sm border border-slate-200 dark:border-darkborder">
-                                  <div class="flex items-center gap-2 md:gap-3 mb-2 md:mb-3">
-                                      <div class="p-1.5 md:p-2.5 bg-cyan-500/10 text-cyan-500 rounded-lg md:rounded-xl"><svg class="w-4 h-4 md:w-5 md:h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M13 7h8m0 0v8m0-8l-8 8-4-4-6 6"></path></svg></div>
-                                       <span class="text-[10px] md:text-xs font-bold text-slate-500 uppercase tracking-wider" data-i18n="ov_today_traffic">Today's Traffic</span>
-                                  </div>
-                                  <p id="ov-today-traffic" class="text-base md:text-xl font-black text-slate-800 dark:text-white">- GB</p>
-                                  <p class="text-[9px] md:text-[10px] text-slate-400 mt-0.5 md:mt-1"><span id="ov-today-reqs">-</span> <span data-i18n="ov_requests">requests</span></p>
-                              </div>
-                              <div class="native-press bg-white dark:bg-darkcard rounded-xl md:rounded-2xl p-3 md:p-5 shadow-sm border border-slate-200 dark:border-darkborder">
-                                  <div class="flex items-center gap-2 md:gap-3 mb-2 md:mb-3">
-                                      <div class="p-1.5 md:p-2.5 bg-blue-500/10 text-blue-500 rounded-lg md:rounded-xl"><svg class="w-4 h-4 md:w-5 md:h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M5.636 18.364a9 9 0 010-12.728m12.728 0a9 9 0 010 12.728m-9.9-2.829a5 5 0 010-7.07m7.072 0a5 5 0 010 7.07M13 12a1 1 0 11-2 0 1 1 0 012 0z"></path></svg></div>
-                                       <span class="text-[10px] md:text-xs font-bold text-slate-500 uppercase tracking-wider" data-i18n="ov_active_conns">Active Connections</span>
-                                  </div>
-                                  <p id="ov-active-conns" class="text-base md:text-xl font-black text-slate-800 dark:text-white">-</p>
-                              </div>
-                              <div class="native-press bg-white dark:bg-darkcard rounded-xl md:rounded-2xl p-3 md:p-5 shadow-sm border border-slate-200 dark:border-darkborder">
-                                  <div class="flex items-center gap-2 md:gap-3 mb-2 md:mb-3">
-                                      <div class="p-1.5 md:p-2.5 bg-indigo-500/10 text-indigo-500 rounded-lg md:rounded-xl"><svg class="w-4 h-4 md:w-5 md:h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 12l2 2 4-4m5.618-4.016A11.955 11.955 0 0112 2.944a11.955 11.955 0 01-8.618 3.04A12.02 12.02 0 003 9c0 5.591 3.824 10.29 9 11.622 5.176-1.332 9-6.03 9-11.622 0-1.042-.133-2.052-.382-3.016z"></path></svg></div>
-                                       <span class="text-[10px] md:text-xs font-bold text-slate-500 uppercase tracking-wider" data-i18n="ov_system">System</span>
-                                  </div>
-                                  <p id="ov-version" class="text-base md:text-xl font-black text-slate-800 dark:text-white">-</p>
-                              </div>
-                          </div>
-
-                          <!-- Recent Activity & Quick Actions Row -->
-                          <div class="grid grid-cols-1 lg:grid-cols-3 gap-3 md:gap-4">
-                              <!-- Recent Activity -->
-                              <div class="lg:col-span-2 bg-white dark:bg-darkcard rounded-2xl md:rounded-3xl p-4 md:p-6 shadow-sm border border-slate-200 dark:border-darkborder">
-                                  <div class="flex items-center justify-between mb-3 md:mb-4">
-                                      <h3 class="text-xs md:text-sm uppercase font-bold text-slate-500 tracking-wider" data-i18n="ov_recent_activity">Recent Activity</h3>
-                                      <button onclick="switchTab('logs')" class="text-[11px] md:text-xs text-primary hover:text-primary/80 font-bold transition-colors" data-i18n="ov_view_all">View All &rarr;</button>
-                                  </div>
-                                  <div id="ov-activity-list" class="space-y-1.5 md:space-y-2.5">
-                                      <p class="text-sm text-slate-400 text-center py-6" data-i18n="ov_loading">Loading...</p>
-                                  </div>
-                              </div>
-                              <!-- Quick Actions -->
-                              <div class="bg-white dark:bg-darkcard rounded-2xl md:rounded-3xl p-4 md:p-6 shadow-sm border border-slate-200 dark:border-darkborder">
-                                  <h3 class="text-xs md:text-sm uppercase font-bold text-slate-500 tracking-wider mb-3 md:mb-4" data-i18n="ov_quick_actions">Quick Actions</h3>
-                                  <div class="grid grid-cols-2 gap-2 md:grid-cols-1 md:gap-3">
-                                       <button onclick="openAddUserPage()" class="native-press flex items-center justify-center md:justify-start gap-2 md:gap-3 px-3 py-2.5 md:px-4 md:py-3 bg-primary/10 hover:bg-primary/20 text-primary rounded-lg md:rounded-xl font-bold text-xs md:text-sm transition-colors">
-                                           <svg class="w-4 h-4 md:w-5 md:h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 6v6m0 0v6m0-6h6m-6 0H6"></path></svg>
-                                           <span data-i18n="ov_add_user">Add User</span>
-                                       </button>
-                                       <button onclick="switchTab('users')" class="native-press flex items-center justify-center md:justify-start gap-2 md:gap-3 px-3 py-2.5 md:px-4 md:py-3 bg-violet-500/10 hover:bg-violet-500/20 text-violet-600 dark:text-violet-400 rounded-lg md:rounded-xl font-bold text-xs md:text-sm transition-colors">
-                                           <svg class="w-4 h-4 md:w-5 md:h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 4.354a4 4 0 110 5.292M15 21H3v-1a6 6 0 0112 0v1zm0 0h6v-1a6 6 0 00-9-5.197M13 7a4 4 0 11-8 0 4 4 0 018 0z"></path></svg>
-                                           <span data-i18n="ov_manage_users">Manage Users</span>
-                                      </button>
-                                       <button onclick="exportConfig()" class="native-press flex items-center justify-center md:justify-start gap-2 md:gap-3 px-3 py-2.5 md:px-4 md:py-3 bg-emerald-500/10 hover:bg-emerald-500/20 text-emerald-600 dark:text-emerald-400 rounded-lg md:rounded-xl font-bold text-xs md:text-sm transition-colors">
-                                           <svg class="w-4 h-4 md:w-5 md:h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 16v1a3 3 0 003 3h10a3 3 0 003-3v-1m-4-4l-4 4m0 0l-4-4m4 4V4"></path></svg>
-                                           <span data-i18n="ov_backup_config">Backup Config</span>
-                                       </button>
-                                       <button onclick="loadDashboard()" class="native-press flex items-center justify-center md:justify-start gap-2 md:gap-3 px-3 py-2.5 md:px-4 md:py-3 bg-blue-500/10 hover:bg-blue-500/20 text-blue-600 dark:text-blue-400 rounded-lg md:rounded-xl font-bold text-xs md:text-sm transition-colors">
-                                           <svg class="w-4 h-4 md:w-5 md:h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15"></path></svg>
-                                           <span data-i18n="ov_refresh">Refresh Statistics</span>
-                                      </button>
-                                  </div>
-                              </div>
-                          </div>
-                      </div>
-
-                      <!-- INFO VIEW -->
-                      <div id="view-info" class="hidden space-y-6">
-                          <div id="dyn-profiles-container" class="columns-1 md:columns-2 gap-4"></div>
-                      </div>
-
-                      <!-- NETWORK/METRICS VIEW -->
-                      <div id="view-network" class="hidden space-y-6">
-                            <div class="bg-white dark:bg-darkcard rounded-3xl p-6 shadow-sm border border-slate-200 dark:border-darkborder mb-6">
-                              <h3 class="text-sm uppercase font-bold text-slate-500 tracking-wider mb-4" data-i18n="metrics_live">Live Profile Usage</h3>
-                              <div id="usage-metrics-container" class="flex flex-col">
-                                  <p class="text-xs text-slate-400 text-center py-4" data-i18n="no_metrics">No active connection data yet.</p>
-                              </div>
-                          </div>
-                          <div class="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-4 md:gap-6">
-                              <div class="bg-white dark:bg-darkcard p-6 rounded-3xl shadow-sm border border-slate-200 dark:border-darkborder relative overflow-hidden group">
-                                  <svg class="w-8 h-8 text-blue-500 mb-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="1.5" d="M21 12a9 9 0 01-9 9m9-9a9 9 0 00-9-9m9 9H3m9 9a9 9 0 01-9-9m9 9c1.657 0 3-4.03 3-9s-1.343-9-3-9m0 18c-1.657 0-3-4.03-3-9s1.343-9 3-9m-9 9a9 9 0 019-9"></path></svg>
-                                  <p class="text-xs uppercase font-bold text-slate-400 mb-1" data-i18n="stat_ip">Origin IP</p>
-                                  <p id="net-ip" class="text-xl md:text-2xl font-black font-mono">...</p>
-                              </div>
-                              <div class="bg-white dark:bg-darkcard p-6 rounded-3xl shadow-sm border border-slate-200 dark:border-darkborder relative overflow-hidden group">
-                                  <svg class="w-8 h-8 text-emerald-500 mb-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="1.5" d="M5 12h14M5 12a2 2 0 01-2-2V6a2 2 0 012-2h14a2 2 0 012 2v4a2 2 0 01-2 2M5 12a2 2 0 00-2 2v4a2 2 0 002 2h14a2 2 0 002-2v-4a2 2 0 00-2-2m-2-4h.01M17 16h.01"></path></svg>
-                                  <p class="text-xs uppercase font-bold text-slate-400 mb-1" data-i18n="stat_dc">Edge Node</p>
-                                  <p id="net-colo" class="text-xl md:text-2xl font-black font-mono">...</p>
-                              </div>
-                              <div class="bg-white dark:bg-darkcard p-6 rounded-3xl shadow-sm border border-slate-200 dark:border-darkborder relative overflow-hidden group sm:col-span-2 lg:col-span-1">
-                                  <svg class="w-8 h-8 text-purple-500 mb-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="1.5" d="M17.657 16.657L13.414 20.9a1.998 1.998 0 01-2.827 0l-4.244-4.243a8 8 0 1111.314 0z"></path><path stroke-linecap="round" stroke-linejoin="round" stroke-width="1.5" d="M15 11a3 3 0 11-6 0 3 3 0 016 0z"></path></svg>
-                                  <p class="text-xs uppercase font-bold text-slate-400 mb-1" data-i18n="stat_loc">Data Region</p>
-                                  <p id="net-loc" class="text-lg font-bold truncate">...</p>
-                              </div>
-                              <div class="bg-white dark:bg-darkcard p-6 rounded-3xl shadow-sm border border-slate-200 dark:border-darkborder relative overflow-hidden group sm:col-span-2 lg:col-span-1">
-                                  <svg class="w-8 h-8 text-blue-500 mb-4"  width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" class="lucide lucide-clock10-icon lucide-clock-10"><circle cx="12" cy="12" r="10"/><path d="M12 6v6l-4-2"/></svg>
-                                  <p class="text-xs uppercase font-bold text-slate-400 mb-1" data-i18n="stat_datetime">Date Time</p>
-                                  <p id="net-datetime" class="text-lg font-bold truncate text-center"  dir="rtl">...</p>
-                              </div>
-                              <!-- Diagnostics Segment -->
-                              <div class="bg-white dark:bg-darkcard p-6 rounded-3xl shadow-sm border border-slate-200 dark:border-darkborder relative overflow-hidden group sm:col-span-2 lg:col-span-3">
-                                  <div class="flex flex-col sm:flex-row sm:items-center justify-between gap-4">
-                                      <div>
-                                          <h3 class="text-sm uppercase font-bold text-slate-400 mb-1" data-i18n="ping_test_title">Latency Diagnostics</h3>
-                                          <p class="text-xs text-slate-500" data-i18n="ping_test_desc">Test response time to your active node target.</p>
-                                      </div>
-                                      <button onclick="runPingTest()" class="px-6 py-2.5 bg-primary/10 hover:bg-primary/20 text-primary font-bold rounded-xl transition-colors text-sm" data-i18n="run_diagnostics">
-                                          ⚡ Run Diagnostics
-                                      </button>
-                                  </div>
-                                  <div id="ping-results" class="mt-4 grid grid-cols-2 sm:grid-cols-4 gap-4 hidden">
-                                      <div class="bg-slate-50 dark:bg-darkbg p-3 rounded-xl border border-slate-100 dark:border-darkborder/50">
-                                          <p class="text-[10px] uppercase font-bold text-slate-400" data-i18n="target_node">Target Node</p>
-                                          <p id="ping-target" class="text-sm font-bold font-mono truncate">...</p>
-                                      </div>
-                                      <div class="bg-slate-50 dark:bg-darkbg p-3 rounded-xl border border-slate-100 dark:border-darkborder/50">
-                                          <p class="text-[10px] uppercase font-bold text-slate-400" data-i18n="response">Response</p>
-                                          <p id="ping-time" class="text-sm font-bold font-mono text-emerald-500">...</p>
-                                      </div>
-                                      <div class="bg-slate-50 dark:bg-darkbg p-3 rounded-xl border border-slate-100 dark:border-darkborder/50">
-                                          <p class="text-[10px] uppercase font-bold text-slate-400" data-i18n="status">Status</p>
-                                          <p id="ping-status" class="text-sm font-bold">...</p>
-                                      </div>
-                                      <div class="bg-slate-50 dark:bg-darkbg p-3 rounded-xl border border-slate-100 dark:border-darkborder/50">
-                                          <p class="text-[10px] uppercase font-bold text-slate-400" data-i18n="local_port">Local Port</p>
-                                          <p id="ping-port" class="text-sm font-bold font-mono">...</p>
-                                      </div>
-                                  </div>
-                              </div>
-                          </div>
-                      </div>
-  
-                      <!-- SETTINGS VIEW -->
-                      <div id="view-settings" class="hidden">
-                          <div class="bg-white dark:bg-darkcard rounded-3xl p-6 shadow-sm border border-slate-200 dark:border-darkborder grid grid-cols-1 md:grid-cols-2 gap-5">
-                              <div class="space-y-1">
-                                  <label class="block text-sm font-bold text-slate-600 dark:text-slate-300 ms-1" data-i18n="lbl_proto">Primary Display Mode</label>
-                                  <select id="cfg-proto" class="w-full px-4 py-3 rounded-xl border border-slate-200 dark:border-darkborder bg-slate-50 dark:bg-slate-800 focus:border-primary focus:ring-1 outline-none appearance-none">
-                                      <option value="alpha">Alpha Mode (V-Core)</option>
-                                      <option value="beta">Beta Mode (T-Core)</option>
-                                      <option value="both">Both (V-Core & T-Core)</option>
-                                  </select>
-                              </div>
-                               <div class="space-y-1">
-                                  <label class="block text-sm font-bold text-slate-600 dark:text-slate-300 ms-1" data-i18n="lbl_port">Data Port (Checkbox Selection)</label>
-                                  <select id="cfg-port" multiple class="hidden">
-                                      <option value="443">443</option>
-                                      <option value="2053">2053</option>
-                                      <option value="2083">2083</option>
-                                      <option value="2087">2087</option>
-                                      <option value="2096">2096</option>
-                                      <option value="8443">8443</option>
-                                      <option value="80">80</option>
-                                      <option value="8080">8080</option>
-                                      <option value="8880">8880</option>
-                                      <option value="2052">2052</option>
-                                      <option value="2082">2082</option>
-                                      <option value="2086">2086</option>
-                                      <option value="2095">2095</option>
-                                  </select>
-                                  <div id="port-checkboxes-container" class="bg-slate-50 dark:bg-slate-800 border border-slate-200 dark:border-darkborder p-4 rounded-xl space-y-3 font-mono text-xs max-h-48 overflow-y-auto">
-                                      <!-- TLS ports -->
-                                      <div class="space-y-1.5">
-                                          <div class="text-[10px] uppercase tracking-wider font-bold text-slate-400 dark:text-slate-500">🔒 Secure (TLS)</div>
-                                          <div class="grid grid-cols-2 gap-2">
-                                              <label class="flex items-center gap-2 p-1.5 rounded bg-white dark:bg-slate-900 border border-slate-100 dark:border-slate-800 cursor-pointer hover:border-primary transition">
-                                                  <input type="checkbox" value="443" onchange="togglePortCheckbox('443', this.checked)" class="accent-primary">
-                                                  <span>443</span>
-                                              </label>
-                                              <label class="flex items-center gap-2 p-1.5 rounded bg-white dark:bg-slate-900 border border-slate-100 dark:border-slate-800 cursor-pointer hover:border-primary transition">
-                                                  <input type="checkbox" value="2053" onchange="togglePortCheckbox('2053', this.checked)" class="accent-primary">
-                                                  <span>2053</span>
-                                              </label>
-                                              <label class="flex items-center gap-2 p-1.5 rounded bg-white dark:bg-slate-900 border border-slate-100 dark:border-slate-800 cursor-pointer hover:border-primary transition">
-                                                  <input type="checkbox" value="2083" onchange="togglePortCheckbox('2083', this.checked)" class="accent-primary">
-                                                  <span>2083</span>
-                                              </label>
-                                              <label class="flex items-center gap-2 p-1.5 rounded bg-white dark:bg-slate-900 border border-slate-100 dark:border-slate-800 cursor-pointer hover:border-primary transition">
-                                                  <input type="checkbox" value="2087" onchange="togglePortCheckbox('2087', this.checked)" class="accent-primary">
-                                                  <span>2087</span>
-                                              </label>
-                                              <label class="flex items-center gap-2 p-1.5 rounded bg-white dark:bg-slate-900 border border-slate-100 dark:border-slate-800 cursor-pointer hover:border-primary transition">
-                                                  <input type="checkbox" value="2096" onchange="togglePortCheckbox('2096', this.checked)" class="accent-primary">
-                                                  <span>2096</span>
-                                              </label>
-                                              <label class="flex items-center gap-2 p-1.5 rounded bg-white dark:bg-slate-900 border border-slate-100 dark:border-slate-800 cursor-pointer hover:border-primary transition">
-                                                  <input type="checkbox" value="8443" onchange="togglePortCheckbox('8443', this.checked)" class="accent-primary">
-                                                  <span>8443</span>
-                                              </label>
-                                          </div>
-                                      </div>
-                                      <!-- Non-TLS ports -->
-                                      <div class="space-y-1.5 pt-1 border-t border-slate-200 dark:border-slate-700">
-                                          <div class="text-[10px] uppercase tracking-wider font-bold text-slate-400 dark:text-slate-500">🔓 Standard</div>
-                                          <div class="grid grid-cols-2 gap-2">
-                                              <label class="flex items-center gap-2 p-1.5 rounded bg-white dark:bg-slate-900 border border-slate-100 dark:border-slate-800 cursor-pointer hover:border-primary transition">
-                                                  <input type="checkbox" value="80" onchange="togglePortCheckbox('80', this.checked)" class="accent-primary">
-                                                  <span>80</span>
-                                              </label>
-                                              <label class="flex items-center gap-2 p-1.5 rounded bg-white dark:bg-slate-900 border border-slate-100 dark:border-slate-800 cursor-pointer hover:border-primary transition">
-                                                  <input type="checkbox" value="8080" onchange="togglePortCheckbox('8080', this.checked)" class="accent-primary">
-                                                  <span>8080</span>
-                                              </label>
-                                              <label class="flex items-center gap-2 p-1.5 rounded bg-white dark:bg-slate-900 border border-slate-100 dark:border-slate-800 cursor-pointer hover:border-primary transition">
-                                                  <input type="checkbox" value="8880" onchange="togglePortCheckbox('8880', this.checked)" class="accent-primary">
-                                                  <span>8880</span>
-                                              </label>
-                                              <label class="flex items-center gap-2 p-1.5 rounded bg-white dark:bg-slate-900 border border-slate-100 dark:border-slate-800 cursor-pointer hover:border-primary transition">
-                                                  <input type="checkbox" value="2052" onchange="togglePortCheckbox('2052', this.checked)" class="accent-primary">
-                                                  <span>2052</span>
-                                              </label>
-                                              <label class="flex items-center gap-2 p-1.5 rounded bg-white dark:bg-slate-900 border border-slate-100 dark:border-slate-800 cursor-pointer hover:border-primary transition">
-                                                  <input type="checkbox" value="2082" onchange="togglePortCheckbox('2082', this.checked)" class="accent-primary">
-                                                  <span>2082</span>
-                                              </label>
-                                              <label class="flex items-center gap-2 p-1.5 rounded bg-white dark:bg-slate-900 border border-slate-100 dark:border-slate-800 cursor-pointer hover:border-primary transition">
-                                                  <input type="checkbox" value="2086" onchange="togglePortCheckbox('2086', this.checked)" class="accent-primary">
-                                                  <span>2086</span>
-                                              </label>
-                                              <label class="flex items-center gap-2 p-1.5 rounded bg-white dark:bg-slate-900 border border-slate-100 dark:border-slate-800 cursor-pointer hover:border-primary transition col-span-2">
-                                                  <input type="checkbox" value="2095" onchange="togglePortCheckbox('2095', this.checked)" class="accent-primary">
-                                                  <span>2095</span>
-                                              </label>
-                                          </div>
-                                      </div>
-                                  </div>
-                              </div>
-                              <div class="space-y-1 md:col-span-2">
-                                  <div class="flex justify-between items-center">
-                                      <label class="block text-sm font-bold text-slate-600 dark:text-slate-300 ms-1" data-i18n="lbl_id">Device UUID (Empty=Auto)</label>
-                                      <button type="button" onclick="document.getElementById('cfg-uuid').value = crypto.randomUUID()" class="text-xs text-primary bg-primary/10 hover:bg-primary/20 px-2 py-1 rounded transition-colors duration-200" data-i18n="btn_generate_uuid">Generate UUID</button>
-                                  </div>
-                                  <input type="text" id="cfg-uuid" class="w-full px-4 py-3 rounded-xl border border-slate-200 dark:border-darkborder bg-slate-50 dark:bg-slate-800 focus:border-primary outline-none font-mono text-sm">
-                              </div>
-                              <div class="space-y-1">
-                                  <label class="block text-sm font-bold text-slate-600 dark:text-slate-300 ms-1" data-i18n="lbl_path">API Route (Hidden Path)</label>
-                                  <input type="text" id="cfg-path" class="w-full px-4 py-3 rounded-xl border border-slate-200 dark:border-darkborder bg-slate-50 dark:bg-slate-800 focus:border-primary outline-none">
-                              </div>
-                              <div class="space-y-1">
-                                  <label class="block text-sm font-bold text-slate-600 dark:text-slate-300 ms-1" data-i18n="lbl_pass">Master Key</label>
-                                  <div class="relative">
-                                      <input type="password" id="cfg-pass" class="w-full px-4 py-3 rounded-xl border border-slate-200 dark:border-darkborder bg-slate-50 dark:bg-slate-800 focus:border-primary outline-none pe-12">
-                                      <button type="button" onclick="const n=document.getElementById('cfg-pass');n.type=n.type==='password'?'text':'password'" class="absolute inset-y-0 end-0 flex items-center px-4 text-slate-400 hover:text-slate-600 dark:hover:text-slate-200">👁️</button>
-                                  </div>
-                              </div>
-                              <div class="space-y-1 md:col-span-2">
-                                  <label class="block text-sm font-bold text-slate-600 dark:text-slate-300 ms-1" data-i18n="lbl_sub_ua">Custom Subscription User-Agent</label>
-                                  <input type="text" id="cfg-sub-ua" placeholder="e.g. MySpecialUABypass" class="w-full px-4 py-3 rounded-xl border border-slate-200 dark:border-darkborder bg-slate-50 dark:bg-slate-800 focus:border-primary outline-none text-sm">
-                                  <p class="text-xs text-slate-500 mt-1 ms-1" data-i18n="desc_sub_ua">Allow specific browser User-Agent containing this text to bypass camouflage and retrieve profile data directly in web browser.</p>
-                              </div>
-                              <div class="space-y-1 md:col-span-2">
-                                  <label class="block text-sm font-bold text-slate-600 dark:text-slate-300 ms-1" data-i18n="lbl_custom_panel_url">Custom Panel URL / Subscription Domain</label>
-                                  <input type="text" id="cfg-custom-panel-url" placeholder="e.g. custom.domain.com or https://custom.domain.com" class="w-full px-4 py-3 rounded-xl border border-slate-200 dark:border-darkborder bg-slate-50 dark:bg-slate-800 focus:border-primary outline-none text-sm">
-                                  <p class="text-xs text-slate-500 mt-1 ms-1" data-i18n="desc_custom_panel_url">Optionally specify a custom domain/URL to be used for subscription/sync links. If empty, the default Worker address will be used.</p>
-                              </div>
-                              <!-- System Toggles -->
-                              <div class="flex flex-col sm:flex-row gap-3 md:col-span-2">
-                                  <label class="flex-1 flex items-center justify-between cursor-pointer bg-slate-50 dark:bg-slate-800/50 p-4 rounded-2xl">
-                                      <span class="text-sm font-bold text-slate-700 dark:text-slate-300" data-i18n="lbl_silent">Silent UI Alerts</span>
-                                      <div class="relative inline-flex items-center cursor-pointer">
-                                          <input type="checkbox" id="cfg-silent" class="sr-only peer">
-                                          <div class="w-11 h-6 bg-slate-300 dark:bg-slate-600 rounded-full peer peer-checked:after:translate-x-5 rtl:peer-checked:after:-translate-x-5 peer-checked:after:border-white after:content-[''] after:absolute after:top-[2px] after:start-[2px] after:bg-white after:border-slate-300 after:border after:rounded-full after:h-5 after:w-5 after:transition-all dark:border-slate-500 peer-checked:bg-primary"></div>
-                                      </div>
-                                  </label>
-                                  <label class="flex-1 flex items-center justify-between cursor-pointer bg-red-50 dark:bg-red-900/10 p-4 rounded-2xl border border-red-200 dark:border-red-900/30">
-                                      <span class="text-sm font-bold text-red-600 dark:text-red-400" data-i18n="lbl_pause">Kill Switch</span>
-                                      <div class="relative inline-flex items-center cursor-pointer">
-                                          <input type="checkbox" id="cfg-pause" class="sr-only peer">
-                                          <div class="w-11 h-6 bg-red-200 dark:bg-red-900/50 rounded-full peer peer-checked:after:translate-x-5 rtl:peer-checked:after:-translate-x-5 peer-checked:after:border-white after:content-[''] after:absolute after:top-[2px] after:start-[2px] after:bg-white after:border-slate-300 after:border after:rounded-full after:h-5 after:w-5 after:transition-all dark:border-slate-500 peer-checked:bg-red-500"></div>
-                                      </div>
-                                  </label>
-                               </div>
-
-                                <!-- API Keys Management -->
-                                <div class="bg-white dark:bg-darkcard rounded-3xl p-6 shadow-sm border border-slate-200 dark:border-darkborder md:col-span-2 space-y-4">
-                                    <div class="flex items-center justify-between">
-                                        <div>
-                                            <h3 class="text-sm font-bold text-slate-700 dark:text-slate-200 flex items-center gap-2">
-                                                🔑 <span data-i18n="lbl_api_keys">Panel API Keys</span>
-                                            </h3>
-                                            <p class="text-[10px] text-slate-500 dark:text-slate-400 mt-1" data-i18n="desc_api_keys">Generate API keys to securely connect remote panels. Remote panels use these keys instead of sharing your master key.</p>
-                                        </div>
-                                        <button onclick="generateApiKey()" class="px-4 py-2 bg-primary text-white text-xs font-bold rounded-xl hover:opacity-90 transition-opacity" data-i18n="btn_generate_key">Generate Key</button>
-                                    </div>
-                                    <div id="api-keys-list" class="space-y-2"></div>
-                                    <div id="api-key-new" class="hidden bg-emerald-50 dark:bg-emerald-900/20 border border-emerald-200 dark:border-emerald-800 rounded-xl p-4 space-y-2">
-                                        <p class="text-xs font-bold text-emerald-700 dark:text-emerald-400" data-i18n="api_key_created">API Key Created! Copy it now — it won't be shown again.</p>
-                                        <div class="flex items-center gap-2">
-                                            <input type="text" id="api-key-value" readonly class="flex-1 px-3 py-2 bg-white dark:bg-slate-800 rounded-lg text-xs font-mono border border-emerald-300 dark:border-emerald-700 text-slate-700 dark:text-slate-300">
-                                            <button onclick="copyApiKey()" class="px-3 py-2 bg-emerald-600 text-white text-xs font-bold rounded-lg hover:bg-emerald-700">Copy</button>
-                                        </div>
-                                    </div>
-                                </div>
-
-                                <!-- Import/Export Config Area -->
-                               <div class="bg-white dark:bg-darkcard rounded-3xl p-6 shadow-sm border border-slate-200 dark:border-darkborder md:col-span-2 space-y-4">
-                                  <h3 class="text-sm uppercase font-bold text-slate-400 tracking-wider" data-i18n="backup_restore_title">Backup & Restore</h3>
-                                  <div class="flex flex-col sm:flex-row gap-4">
-                                      <button onclick="exportConfig()" class="flex-1 py-3 px-4 bg-slate-100 hover:bg-slate-200 dark:bg-slate-800 dark:hover:bg-slate-700 text-slate-700 dark:text-slate-300 font-bold rounded-xl transition-colors text-sm" data-i18n="export_btn">
-                                          📥 Export Configuration (JSON)
-                                      </button>
-                                      <label class="flex-1 py-3 px-4 bg-slate-100 hover:bg-slate-200 dark:bg-slate-800 dark:hover:bg-slate-700 text-slate-700 dark:text-slate-300 font-bold rounded-xl transition-colors text-sm text-center cursor-pointer">
-                                          <span data-i18n="import_btn">📤 Import Configuration (JSON)</span>
-                                          <input type="file" id="import-file" class="hidden" accept=".json" onchange="importConfig(event)">
-                                      </label>
-                                  </div>
-                              </div>
-                          </div>
-                      </div>
-  
-                      <!-- ADVANCED VIEW -->
-                      <div id="view-advanced" class="hidden space-y-4">
-
-                          <!-- Section: Network & DNS -->
-                          <div class="bg-white dark:bg-darkcard rounded-2xl border border-slate-200 dark:border-darkborder overflow-hidden" data-accordion>
-                              <button onclick="toggleAccordion(this)" class="w-full flex items-center justify-between px-5 py-4 hover:bg-slate-50 dark:hover:bg-slate-800/50 transition-colors">
-                                  <div class="flex items-center gap-3">
-                                      <span class="text-lg">🌐</span>
-                                      <span class="text-sm font-bold text-slate-700 dark:text-slate-200" data-i18n="adv_network_dns">Network & DNS</span>
-                                  </div>
-                                  <svg class="w-4 h-4 text-slate-400 transform transition-transform duration-200 accordion-icon" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M19 9l-7 7-7-7"></path></svg>
-                              </button>
-                              <div data-accordion-content class="transition-all duration-300" style="max-height:0;overflow:hidden;visibility:hidden">
-                                  <div class="space-y-4 px-5 pb-5 pt-1">
-                                      <div>
-                                          <div class="flex items-center justify-between mb-2">
-                                              <label class="text-sm font-bold text-slate-600 dark:text-slate-300" data-i18n="lbl_clean_ips">Clean IPs (Multi-Generator)</label>
-                                              <span class="text-xs bg-indigo-100 dark:bg-indigo-900/50 text-indigo-700 dark:text-indigo-300 px-2 py-1 rounded-md font-bold" id="ip-count-badge">1 Config Set</span>
-                                          </div>
-                                          <textarea id="cfg-ips" rows="3" data-i18n="ph_clean_ips" placeholder="1.2.3.4#Germany&#10;5.6.7.8#US&#10;9.10.11.12#France" class="w-full px-4 py-3 rounded-xl border border-slate-200 dark:border-darkborder bg-slate-50 dark:bg-slate-800 focus:border-primary focus:ring-1 outline-none font-mono text-sm resize-none"></textarea>
-                                          <p class="text-xs text-slate-400 mt-2" data-i18n="desc_clean_ips">One IP per line. Use <code class="bg-slate-100 dark:bg-slate-800/80 px-1 py-0.5 rounded text-rose-500 font-mono">IP#Name</code> format to tag IPs (e.g. <code class="bg-slate-100 dark:bg-slate-800/80 px-1 py-0.5 rounded text-rose-500 font-mono">1.2.3.4#Germany</code>). Use <code class="bg-slate-100 dark:bg-slate-800/80 px-1 py-0.5 rounded text-rose-500 font-mono">{IP_NAME}</code> in name strategy.</p>
-                                          <button id="btn-resolve-smart-ips" onclick="resolveSmartCleanIps()" class="mt-3 w-full sm:w-auto px-4 py-2.5 bg-primary/10 hover:bg-primary/20 text-primary border border-primary/20 rounded-xl text-xs font-bold transition-all flex items-center justify-center gap-2">
-                                              <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M13 10V3L4 14h7v7l9-11h-7z"></path></svg>
-                                              Auto-Resolve CDN & Clean IPs
-                                          </button>
-                                      </div>
-                                      <div class="grid grid-cols-1 md:grid-cols-2 gap-4">
-                                          <div class="space-y-1">
-                                              <label class="block text-sm font-bold text-slate-600 dark:text-slate-300" data-i18n="lbl_fp">TLS Signature</label>
-                                              <select id="cfg-fp" class="w-full px-4 py-3 rounded-xl border border-slate-200 dark:border-darkborder bg-slate-50 dark:bg-slate-800 focus:border-primary outline-none appearance-none">
-                                                  <option value="chrome">Chrome</option><option value="firefox">Firefox</option><option value="safari">Safari</option>
-                                              </select>
-                                          </div>
-                                          <div class="space-y-1">
-                                              <label class="block text-sm font-bold text-slate-600 dark:text-slate-300" data-i18n="lbl_dns">Resolver IP</label>
-                                              <input type="text" id="cfg-dns" placeholder="1.1.1.1" class="w-full px-4 py-3 rounded-xl border border-slate-200 dark:border-darkborder bg-slate-50 dark:bg-slate-800 focus:border-primary outline-none text-sm">
-                                          </div>
-                                          <div class="space-y-1 md:col-span-2">
-                                              <label class="block text-sm font-bold text-slate-600 dark:text-slate-300" data-i18n="lbl_doh">Custom DNS (DoH Provider)</label>
-                                              <input type="text" id="cfg-custom-dns" placeholder="https://cloudflare-dns.com/dns-query" class="w-full px-4 py-3 rounded-xl border border-slate-200 dark:border-darkborder bg-slate-50 dark:bg-slate-800 focus:border-primary outline-none text-sm">
-                                          </div>
-                                      </div>
-                                  </div>
-                              </div>
-                          </div>
-
-                          <!-- Section: Proxy & Relay -->
-                          <div class="bg-white dark:bg-darkcard rounded-2xl border border-slate-200 dark:border-darkborder overflow-hidden" data-accordion>
-                              <button onclick="toggleAccordion(this)" class="w-full flex items-center justify-between px-5 py-4 hover:bg-slate-50 dark:hover:bg-slate-800/50 transition-colors">
-                                  <div class="flex items-center gap-3">
-                                      <span class="text-lg">🔗</span>
-                                      <span class="text-sm font-bold text-slate-700 dark:text-slate-200" data-i18n="adv_proxy_relay">Proxy & Relay</span>
-                                  </div>
-                                  <svg class="w-4 h-4 text-slate-400 transform transition-transform duration-200 accordion-icon" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M19 9l-7 7-7-7"></path></svg>
-                              </button>
-                              <div data-accordion-content class="transition-all duration-300" style="max-height:0;overflow:hidden;visibility:hidden">
-                                  <div class="space-y-4 px-5 pb-5 pt-1">
-                                      <div class="space-y-1">
-                                          <label class="block text-sm font-bold text-slate-600 dark:text-slate-300" data-i18n="lbl_relay">Proxy IPs (Comma/Newline separated)</label>
-                                          <textarea id="cfg-relay" rows="3" placeholder="104.20.0.1&#10;proxyip.cmliussss.net" class="w-full px-4 py-3 rounded-xl border border-slate-200 dark:border-darkborder bg-slate-50 dark:bg-slate-800 focus:border-primary focus:ring-1 outline-none font-mono text-sm resize-none"></textarea>
-                                      </div>
-                                      <div class="space-y-1">
-                                          <label class="block text-sm font-bold text-slate-600 dark:text-slate-300" data-i18n="lbl_nat64">NAT64 Prefix</label>
-                                          <textarea id="cfg-nat64" rows="2" placeholder="64:ff9b::/96&#10;2001:db8:64::/96" class="w-full px-4 py-3 rounded-xl border border-slate-200 dark:border-darkborder bg-slate-50 dark:bg-slate-800 focus:border-primary focus:ring-1 outline-none font-mono text-sm resize-none"></textarea>
-                                          <p class="text-xs text-slate-400 mt-1" data-i18n="desc_nat64">Optional. Converts IPv4 Proxy IPs to NAT64 IPv6 addresses. Supports multiple prefixes (one per line).</p>
-                                      </div>
-                                      <label class="flex items-center justify-between cursor-pointer bg-slate-50 dark:bg-slate-800/50 p-4 rounded-2xl">
-                                          <div>
-                                              <span class="text-sm font-bold text-slate-700 dark:text-slate-300" data-i18n="lbl_direct_configs">Include Direct Configs</span>
-                                              <p class="text-[10px] text-slate-400 mt-0.5">Generate configs without Proxy IP alongside relay configs</p>
-                                          </div>
-                                          <div class="relative inline-flex items-center cursor-pointer">
-                                              <input type="checkbox" id="cfg-direct-configs" class="sr-only peer">
-                                              <div class="w-11 h-6 bg-slate-300 dark:bg-slate-600 rounded-full peer peer-checked:after:translate-x-5 rtl:peer-checked:after:-translate-x-5 peer-checked:after:border-white after:content-[''] after:absolute after:top-[2px] after:start-[2px] after:bg-white after:border-slate-300 after:border after:rounded-full after:h-5 after:w-5 after:transition-all dark:border-slate-500 peer-checked:bg-primary"></div>
-                                          </div>
-                                      </label>
-                                  </div>
-                              </div>
-                          </div>
-
-                          <!-- Section: Subscription -->
-                          <div class="bg-white dark:bg-darkcard rounded-2xl border border-slate-200 dark:border-darkborder overflow-hidden" data-accordion>
-                              <button onclick="toggleAccordion(this)" class="w-full flex items-center justify-between px-5 py-4 hover:bg-slate-50 dark:hover:bg-slate-800/50 transition-colors">
-                                  <div class="flex items-center gap-3">
-                                      <span class="text-lg">📝</span>
-                                      <span class="text-sm font-bold text-slate-700 dark:text-slate-200" data-i18n="adv_subscription">Subscription</span>
-                                  </div>
-                                  <svg class="w-4 h-4 text-slate-400 transform transition-transform duration-200 accordion-icon" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M19 9l-7 7-7-7"></path></svg>
-                              </button>
-                              <div data-accordion-content class="transition-all duration-300" style="max-height:0;overflow:hidden;visibility:hidden">
-                                  <div class="space-y-4 px-5 pb-5 pt-1">
-                                      <div class="grid grid-cols-1 md:grid-cols-2 gap-4">
-                                          <div class="space-y-1">
-                                              <label class="block text-sm font-bold text-slate-600 dark:text-slate-300" data-i18n="lbl_strategy">Configuration Name Strategy</label>
-                                              <input type="text" id="cfg-name-strategy" placeholder="{FLAG} {PROTOCOL}-{USER}-{PORT}" class="w-full px-4 py-3 rounded-xl border border-slate-200 dark:border-darkborder bg-slate-50 dark:bg-slate-800 focus:border-primary outline-none">
-                                              <p data-i18n="html_desc_strategy" class="text-[11px] text-slate-400 dark:text-slate-500 mt-1 leading-relaxed">
-                                                  Supported templates: <code class="bg-slate-100 dark:bg-slate-800/80 px-1 py-0.5 rounded text-rose-500 font-mono">default</code>, <code class="bg-slate-100 dark:bg-slate-800/80 px-1 py-0.5 rounded text-rose-500 font-mono">type-user-port</code>, <code class="bg-slate-100 dark:bg-slate-800/80 px-1 py-0.5 rounded text-rose-500 font-mono">user-port</code>, <code class="bg-slate-100 dark:bg-slate-800/80 px-1 py-0.5 rounded text-rose-500 font-mono">host-port-user</code>, <code class="bg-slate-100 dark:bg-slate-800/80 px-1 py-0.5 rounded text-rose-500 font-mono">prefix-user-port</code>, <code class="bg-slate-100 dark:bg-slate-800/80 px-1 py-0.5 rounded text-rose-500 font-mono">ip</code>. Tags: <code class="bg-slate-100 dark:bg-slate-800/80 px-1 py-0.5 rounded text-rose-500 font-mono">{FLAG}</code> <code class="bg-slate-100 dark:bg-slate-800/80 px-1 py-0.5 rounded text-rose-500 font-mono">{IP_NAME}</code> <code class="bg-slate-100 dark:bg-slate-800/80 px-1 py-0.5 rounded text-rose-500 font-mono">{USER}</code> <code class="bg-slate-100 dark:bg-slate-800/80 px-1 py-0.5 rounded text-rose-500 font-mono">{PORT}</code>
-                                              </p>
-                                          </div>
-                                          <div class="space-y-1">
-                                              <label class="block text-sm font-bold text-slate-600 dark:text-slate-300" data-i18n="lbl_prefix">Custom Name Prefix</label>
-                                              <input type="text" id="cfg-name-prefix" placeholder="lowkey" class="w-full px-4 py-3 rounded-xl border border-slate-200 dark:border-darkborder bg-slate-50 dark:bg-slate-800 focus:border-primary outline-none text-sm">
-                                          </div>
-                                       </div>
-                                       <div class="border-t border-slate-100 dark:border-darkborder pt-4">
-                                          <div class="flex items-center justify-between mb-3">
-                                              <div>
-                                                  <h4 class="text-sm font-bold text-slate-600 dark:text-slate-300" data-i18n="lbl_fake_configs">Subscription Fake Entries</h4>
-                                                  <p class="text-[11px] text-slate-400 dark:text-slate-500 mt-0.5" data-i18n="desc_fake_configs">Customize info entries shown in subscription profiles. Use <code class="bg-slate-100 dark:bg-slate-800/80 px-1 py-0.5 rounded text-rose-500 font-mono">{usage}</code> and <code class="bg-slate-100 dark:bg-slate-800/80 px-1 py-0.5 rounded text-rose-500 font-mono">{expiry}</code> for dynamic values.</p>
-                                              </div>
-                                              <button onclick="addFakeConfig()" class="px-3 py-1.5 bg-primary/10 hover:bg-primary/20 text-primary border border-primary/20 rounded-xl text-xs font-bold transition-all flex items-center gap-1.5 shrink-0">
-                                                  <svg class="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 6v6m0 0v6m0-6h6m-6 0H6"></path></svg>
-                                                  <span data-i18n="btn_add_entry">Add Entry</span>
-                                              </button>
-                                          </div>
-                                          <div id="fake-configs-list" class="space-y-2"></div>
-                                      </div>
-                                  </div>
-                              </div>
-                          </div>
-
-                          <!-- Section: Protocol -->
-                          <div class="bg-white dark:bg-darkcard rounded-2xl border border-slate-200 dark:border-darkborder overflow-hidden" data-accordion>
-                              <button onclick="toggleAccordion(this)" class="w-full flex items-center justify-between px-5 py-4 hover:bg-slate-50 dark:hover:bg-slate-800/50 transition-colors">
-                                  <div class="flex items-center gap-3">
-                                      <span class="text-lg">⚡</span>
-                                      <span class="text-sm font-bold text-slate-700 dark:text-slate-200" data-i18n="adv_protocol">Protocol</span>
-                                  </div>
-                                  <svg class="w-4 h-4 text-slate-400 transform transition-transform duration-200 accordion-icon" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M19 9l-7 7-7-7"></path></svg>
-                              </button>
-                              <div data-accordion-content class="transition-all duration-300" style="max-height:0;overflow:hidden;visibility:hidden">
-                                  <div class="flex flex-col sm:flex-row gap-3">
-                                      <label class="flex-1 flex items-center justify-between cursor-pointer bg-slate-50 dark:bg-slate-800/50 p-4 rounded-2xl">
-                                          <span class="text-sm font-bold text-slate-700 dark:text-slate-300" data-i18n="lbl_tfo">TCP Fast Open</span>
-                                          <div class="relative inline-flex items-center cursor-pointer">
-                                              <input type="checkbox" id="cfg-tfo" class="sr-only peer">
-                                              <div class="w-11 h-6 bg-slate-300 dark:bg-slate-600 rounded-full peer peer-checked:after:translate-x-5 rtl:peer-checked:after:-translate-x-5 peer-checked:after:border-white after:content-[''] after:absolute after:top-[2px] after:start-[2px] after:bg-white after:border-slate-300 after:border after:rounded-full after:h-5 after:w-5 after:transition-all dark:border-slate-500 peer-checked:bg-primary"></div>
-                                          </div>
-                                      </label>
-                                      <label class="flex-1 flex items-center justify-between cursor-pointer bg-slate-50 dark:bg-slate-800/50 p-4 rounded-2xl">
-                                          <span class="text-sm font-bold text-slate-700 dark:text-slate-300" data-i18n="lbl_ech">Secure Hello (ECH)</span>
-                                          <div class="relative inline-flex items-center cursor-pointer">
-                                              <input type="checkbox" id="cfg-ech" class="sr-only peer">
-                                              <div class="w-11 h-6 bg-slate-300 dark:bg-slate-600 rounded-full peer peer-checked:after:translate-x-5 rtl:peer-checked:after:-translate-x-5 peer-checked:after:border-white after:content-[''] after:absolute after:top-[2px] after:start-[2px] after:bg-white after:border-slate-300 after:border after:rounded-full after:h-5 after:w-5 after:transition-all dark:border-slate-500 peer-checked:bg-primary"></div>
-                                          </div>
-                                      </label>
-                                  </div>
-                              </div>
-                          </div>
-
-                          <!-- Section: Cluster -->
-                          <div class="bg-indigo-50 dark:bg-indigo-950/20 rounded-2xl border border-indigo-100 dark:border-indigo-900/50 overflow-hidden" data-accordion>
-                               <button onclick="toggleAccordion(this)" class="w-full flex items-center justify-between px-5 py-4 hover:bg-indigo-100/50 dark:hover:bg-indigo-900/30 transition-colors">
-                                   <div class="flex items-center gap-3">
-                                       <span class="text-lg">🔬</span>
-                                       <span class="text-sm font-bold text-indigo-700 dark:text-indigo-300" data-i18n="other_nodes_title">Other Nodes</span>
-                                   </div>
-                                   <svg class="w-4 h-4 text-indigo-400 transform transition-transform duration-200 accordion-icon" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M19 9l-7 7-7-7"></path></svg>
-                               </button>
-                               <div data-accordion-content class="transition-all duration-300" style="max-height:0;overflow:hidden;visibility:hidden">
-                                   <div class="space-y-3 px-5 pb-5 pt-1">
-                                       <p class="text-xs text-indigo-600/80 dark:text-indigo-300/70 leading-relaxed" data-i18n="other_nodes_desc">External nodes (URL + API Key) for cross-panel management.</p>
-                                       <div class="flex items-center justify-between">
-                                           <div id="linked-nodes-list" class="space-y-2 flex-1"></div>
-                                       </div>
-                                       <button onclick="showAddNodeModal()" type="button" class="w-full py-3 border-2 border-dashed border-indigo-300 dark:border-indigo-700 hover:border-indigo-500 dark:hover:border-indigo-500 text-indigo-500 dark:text-indigo-400 text-sm font-bold rounded-xl transition-colors flex items-center justify-center gap-2">
-                                           <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 6v6m0 0v6m0-6h6m-6 0H6"></path></svg>
-                                           <span data-i18n="add_node_confirm">Add Node</span>
-                                       </button>
-                                   </div>
-                               </div>
-                           </div>
-
-                          <!-- Modal: Add Other Node -->
-                           <div id="modal-add-node" class="hidden fixed inset-0 z-50 flex items-end sm:items-center justify-center p-0 pb-4 sm:p-4 bg-slate-900/50 backdrop-blur-sm">
-                               <div class="bg-white dark:bg-darkcard rounded-t-3xl sm:rounded-3xl w-full sm:max-w-md max-h-[calc(100vh-2rem)] sm:max-h-[85vh] flex flex-col shadow-2xl border border-slate-200 dark:border-darkborder">
-                                  <div class="px-6 pt-6 pb-4">
-                                      <h3 class="text-lg font-bold" data-i18n="add_node_title">Add External Node</h3>
-                                      <p class="text-xs text-slate-400 mt-1" data-i18n="add_node_desc">Enter the URL and API Key of the external panel.</p>
-                                  </div>
-                                   <div class="px-6 pb-4 space-y-4 overflow-y-auto flex-1 min-h-0">
-                                      <div>
-                                          <label class="block text-xs font-bold text-slate-500 mb-1" data-i18n="add_node_url">Node URL</label>
-                                          <input type="text" id="add-node-url" placeholder="node.example.com" class="w-full px-4 py-3 rounded-xl border border-slate-200 dark:border-darkborder bg-slate-50 dark:bg-slate-800 focus:border-primary outline-none text-sm font-mono">
-                                      </div>
-                                      <div>
-                                          <label class="block text-xs font-bold text-slate-500 mb-1" data-i18n="add_node_apikey">API Key</label>
-                                          <input type="password" id="add-node-apikey" placeholder="lowkey_..." class="w-full px-4 py-3 rounded-xl border border-slate-200 dark:border-darkborder bg-slate-50 dark:bg-slate-800 focus:border-primary outline-none text-sm font-mono pe-12">
-                                          <button type="button" onclick="const n=document.getElementById('add-node-apikey');n.type=n.type==='password'?'text':'password'" class="absolute end-14 mt-[-36px] px-2 text-slate-400 hover:text-slate-600 dark:hover:text-slate-200">👁️</button>
-                                      </div>
-                                  </div>
-                                  <div class="px-6 py-4 border-t border-slate-200 dark:border-darkborder flex justify-end gap-2">
-                                      <button onclick="document.getElementById('modal-add-node').classList.add('hidden')" class="px-4 py-2 rounded-xl bg-slate-100 dark:bg-slate-800 text-slate-600 dark:text-slate-300 font-bold text-sm" data-i18n="btn_cancel">Cancel</button>
-                                      <button onclick="commitAddNode()" class="px-4 py-2 rounded-xl bg-indigo-500 hover:bg-indigo-600 text-white font-bold text-sm" data-i18n="add_node_confirm">Add Node</button>
-                                  </div>
-                              </div>
-                          </div>
-
-                          <!-- Section: Telegram -->
-                          <div class="bg-white dark:bg-darkcard rounded-2xl border border-slate-200 dark:border-darkborder overflow-hidden" data-accordion>
-                              <button onclick="toggleAccordion(this)" class="w-full flex items-center justify-between px-5 py-4 hover:bg-slate-50 dark:hover:bg-slate-800/50 transition-colors">
-                                  <div class="flex items-center gap-3">
-                                      <span class="text-lg">🤖</span>
-                                      <span class="text-sm font-bold text-slate-700 dark:text-slate-200" data-i18n="adv_telegram">Telegram Bot</span>
-                                  </div>
-                                  <svg class="w-4 h-4 text-slate-400 transform transition-transform duration-200 accordion-icon" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M19 9l-7 7-7-7"></path></svg>
-                              </button>
-                              <div data-accordion-content class="transition-all duration-300" style="max-height:0;overflow:hidden;visibility:hidden">
-                                  <div class="space-y-3 px-5 pb-5 pt-1">
-                                      <div class="space-y-1">
-                                          <label class="block text-sm font-bold text-slate-600 dark:text-slate-300" data-i18n="lbl_tg_token">Bot Token</label>
-                                          <div class="relative">
-                                              <input type="password" id="cfg-tg-token" placeholder="123456:ABC-DEF1234ghIkl-zyx5c" class="w-full px-4 py-3 rounded-xl border border-slate-200 dark:border-darkborder bg-slate-50 dark:bg-slate-800 focus:border-primary outline-none text-sm pe-12">
-                                              <button type="button" onclick="const n=document.getElementById('cfg-tg-token');n.type=n.type==='password'?'text':'password'" class="absolute inset-y-0 end-0 flex items-center px-4 text-slate-400 hover:text-slate-600 dark:hover:text-slate-200">👁️</button>
-                                          </div>
-                                      </div>
-                                      <div class="grid grid-cols-1 md:grid-cols-2 gap-3">
-                                          <div class="space-y-1">
-                                              <label class="block text-sm font-bold text-slate-600 dark:text-slate-300" data-i18n="lbl_tg_chat">Chat ID</label>
-                                              <input type="text" id="cfg-tg-chat" placeholder="123456789" class="w-full px-4 py-3 rounded-xl border border-slate-200 dark:border-darkborder bg-slate-50 dark:bg-slate-800 focus:border-primary outline-none text-sm">
-                                          </div>
-                                          <div class="space-y-1">
-                                              <label class="block text-sm font-bold text-slate-600 dark:text-slate-300" data-i18n="lbl_tg_admin">Authorized Admin ID</label>
-                                              <input type="text" id="cfg-tg-admin" placeholder="123456789" class="w-full px-4 py-3 rounded-xl border border-slate-200 dark:border-darkborder bg-slate-50 dark:bg-slate-800 focus:border-primary outline-none text-sm">
-                                              <p class="text-xs text-slate-400" data-i18n="desc_tg_admin">Only this Telegram User ID can manage the panel via bot. Leave empty to use Chat ID.</p>
-                                          </div>
-                                      </div>
-                                      <p class="text-xs text-slate-400" data-i18n="desc_tg_bot">Set these values to receive login alerts via Telegram.</p>
-                                  </div>
-                              </div>
-                          </div>
-
-                          <!-- Section: Cloudflare -->
-                          <div class="bg-white dark:bg-darkcard rounded-2xl border border-slate-200 dark:border-darkborder overflow-hidden" data-accordion>
-                              <button onclick="toggleAccordion(this)" class="w-full flex items-center justify-between px-5 py-4 hover:bg-slate-50 dark:hover:bg-slate-800/50 transition-colors">
-                                  <div class="flex items-center gap-3">
-                                      <span class="text-lg">☁️</span>
-                                      <span class="text-sm font-bold text-slate-700 dark:text-slate-200" data-i18n="adv_cloudflare">Cloudflare</span>
-                                  </div>
-                                  <svg class="w-4 h-4 text-slate-400 transform transition-transform duration-200 accordion-icon" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M19 9l-7 7-7-7"></path></svg>
-                              </button>
-                              <div data-accordion-content class="transition-all duration-300" style="max-height:0;overflow:hidden;visibility:hidden">
-                                  <div class="space-y-3 px-5 pb-5 pt-1">
-                                      <div class="grid grid-cols-1 md:grid-cols-2 gap-3">
-                                          <div class="space-y-1">
-                                              <label class="block text-sm font-bold text-slate-600 dark:text-slate-300" data-i18n="lbl_cf_acc">CF Account ID</label>
-                                              <input type="text" id="cfg-cf-acc" placeholder="a1b2c3d4e5f6..." class="w-full px-4 py-3 rounded-xl border border-slate-200 dark:border-darkborder bg-slate-50 dark:bg-slate-800 focus:border-primary outline-none text-sm font-mono">
-                                          </div>
-                                          <div class="space-y-1">
-                                              <label class="block text-sm font-bold text-slate-600 dark:text-slate-300" data-i18n="lbl_cf_token">CF API Token</label>
-                                              <div class="relative">
-                                                  <input type="password" id="cfg-cf-token" placeholder="Bearer Token (Read Analytics)" class="w-full px-4 py-3 rounded-xl border border-slate-200 dark:border-darkborder bg-slate-50 dark:bg-slate-800 focus:border-primary outline-none text-sm font-mono pe-12">
-                                                  <button type="button" onclick="const n=document.getElementById('cfg-cf-token');n.type=n.type==='password'?'text':'password'" class="absolute inset-y-0 end-0 flex items-center px-4 text-slate-400 hover:text-slate-600 dark:hover:text-slate-200">👁️</button>
-                                              </div>
-                                          </div>
-                                      </div>
-                                      <div class="space-y-1">
-                                          <label class="block text-sm font-bold text-slate-600 dark:text-slate-300" data-i18n="lbl_cf_worker">CF Worker Script Name</label>
-                                          <input type="text" id="cfg-cf-worker" placeholder="e.g. lowkey" class="w-full px-4 py-3 rounded-xl border border-slate-200 dark:border-darkborder bg-slate-50 dark:bg-slate-800 focus:border-primary outline-none text-sm font-mono">
-                                          <p class="text-xs text-slate-400" data-i18n="desc_cf_worker">The script name shown in your Cloudflare Workers dashboard.</p>
-                                      </div>
-                                      <p class="text-xs text-slate-400" data-i18n="desc_cf_api">Optional: Monitor Worker free usage limits (100k/day). Needs Account Analytics Read permission.</p>
-                                      <div class="border-t border-slate-100 dark:border-darkborder pt-3">
-                                          <button type="button" onclick="document.getElementById('cf-helper-guide').classList.toggle('hidden')" class="w-full text-start px-4 py-3 bg-primary/10 hover:bg-primary/15 text-primary text-xs font-bold rounded-xl flex items-center justify-between transition-colors">
-                                              <span class="flex items-center gap-1.5">
-                                                  💡 <span data-i18n="cf_help_title">Need help getting these? Beginner's Guide</span>
-                                              </span>
-                                              <span class="text-[10px] transform transition-transform duration-200">▼</span>
-                                          </button>
-                                          <div id="cf-helper-guide" class="hidden mt-3 p-4 bg-slate-50/50 dark:bg-slate-900/30 border border-slate-200 dark:border-darkborder rounded-2xl text-[11px] space-y-4 text-start leading-relaxed">
-                                              <div class="space-y-1 pb-3 border-b border-dashed border-slate-200 dark:border-darkborder">
-                                                  <h5 class="font-extrabold text-slate-800 dark:text-slate-200 flex items-center gap-1">🇬🇧 Beginner's Walkthrough:</h5>
-                                                  <ol class="list-decimal list-inside space-y-1 text-slate-500 dark:text-slate-400">
-                                                      <li><strong>CF API Token:</strong> Click <a href="https://dash.cloudflare.com/profile/api-tokens?template=edit-workers" target="_blank" class="text-primary hover:underline font-bold">Api Token Template ↗</a>. Click <strong>Use Template</strong>, then <strong>Continue to summary</strong> &gt; <strong>Create Token</strong>. Copy and paste above!</li>
-                                                      <li><strong>CF Account ID:</strong> Open any Cloudflare Workers page. Copy the 32-char string after <code>dash.cloudflare.com/</code> in the URL.</li>
-                                                      <li><strong>Worker Script Name:</strong> Go to <strong>Compute &gt; Workers & Pages</strong> in Cloudflare. Copy your worker's name.</li>
-                                                  </ol>
-                                              </div>
-                                          </div>
-                                      </div>
-                                  </div>
-                              </div>
-                          </div>
-
-                      </div>
-                      
-                          <!-- USERS VIEW -->
-                      <div id="view-users" class="hidden space-y-4">
-                          <!-- Compact Stats Bar -->
-                          <div class="bg-white dark:bg-darkcard rounded-2xl border border-slate-200 dark:border-darkborder p-4 flex flex-wrap items-center gap-4 md:gap-6">
-                              <div class="flex items-center gap-2">
-                                  <div class="p-1.5 bg-primary/10 text-primary rounded-lg"><svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M17 20h5v-2a3 3 0 00-5.356-1.857M17 20H7m10 0v-2c0-.656-.126-1.283-.356-1.857M7 20H2v-2a3 3 0 015.356-1.857M7 20v-2c0-.656.126-1.283.356-1.857m0 0a5.002 5.002 0 019.288 0M15 7a4 4 0 11-8 0 4 4 0 018 0z"></path></svg></div>
-                                  <div><span class="text-[10px] font-bold text-slate-400 uppercase" data-i18n="stat_total_subscribers">Total</span><span id="stat-total-users" class="ms-1.5 text-sm font-black text-slate-800 dark:text-white">0</span></div>
-                              </div>
-                              <div class="flex items-center gap-2">
-                                  <div class="p-1.5 bg-emerald-500/10 text-emerald-500 rounded-lg"><svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 12l2 2 4-4m6 2a9 9 0 11-18 0 9 9 0 0118 0z"></path></svg></div>
-                                  <div><span class="text-[10px] font-bold text-slate-400 uppercase" data-i18n="stat_active_paused">Active/Paused</span><span id="stat-active-users" class="ms-1.5 text-sm font-black text-slate-800 dark:text-white">0 / 0</span></div>
-                              </div>
-                              <div class="flex items-center gap-2">
-                                  <div class="p-1.5 bg-violet-500/10 text-violet-500 rounded-lg"><svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M19 11H5m14 0a2 2 0 012 2v6a2 2 0 01-2 2H5a2 2 0 01-2-2v-6a2 2 0 012-2m14 0V9a2 2 0 00-2-2M5 11V9a2 2 0 012-2m0 0V5a2 2 0 012-2h6a2 2 0 012 2v2M7 7h10"></path></svg></div>
-                                  <div><span class="text-[10px] font-bold text-slate-400 uppercase" data-i18n="stat_cumulative_traffic">Traffic</span><span id="stat-total-traffic" class="ms-1.5 text-sm font-black text-slate-800 dark:text-white">0 GB</span></div>
-                              </div>
-                              <div class="flex items-center gap-2">
-                                  <div class="p-1.5 bg-red-500/10 text-red-500 rounded-lg"><svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 9v2m0 4h.01m-6.938 4h13.856c1.54 0 2.502-1.667 1.732-2.5L13.732 4c-.77-.833-1.964-.833-2.732 0L4.082 16.5c-.77.833.192 2.5 1.732 2.5z"></path></svg></div>
-                                  <div><span class="text-[10px] font-bold text-slate-400 uppercase" data-i18n="stat_auto_disabled">Disabled</span><span id="stat-auto-disabled" class="ms-1.5 text-sm font-black text-slate-800 dark:text-white">0</span></div>
-                              </div>
-                          </div>
-
-                          <!-- Recently Disabled Users Panel -->
-                          <div id="disabled-users-panel" class="hidden">
-                              <div class="bg-gradient-to-br from-red-50 to-orange-50 dark:from-red-950/30 dark:to-orange-950/30 rounded-3xl p-6 shadow-sm border border-red-200 dark:border-red-800/40 relative overflow-hidden">
-                                  <div class="flex items-center justify-between mb-4">
-                                      <div class="flex items-center gap-3">
-                                          <div class="p-2.5 bg-red-100 dark:bg-red-900/40 rounded-xl">
-                                              <svg class="w-5 h-5 text-red-600 dark:text-red-400" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 9v2m0 4h.01m-6.938 4h13.856c1.54 0 2.502-1.667 1.732-2.5L13.732 4c-.77-.833-1.964-.833-2.732 0L4.082 16.5c-.77.833.192 2.5 1.732 2.5z"></path></svg>
-                                          </div>
-                                          <div>
-                                              <h3 class="text-sm font-bold text-red-700 dark:text-red-300" data-i18n="disabled_panel_title">Recently Disabled Users</h3>
-                                              <p class="text-[11px] text-red-500/70 dark:text-red-400/60" data-i18n="disabled_panel_desc">Users automatically disabled due to quota or expiration limits</p>
-                                          </div>
-                                      </div>
-                                      <span id="disabled-panel-badge" class="px-3 py-1 bg-red-500 text-white text-xs font-bold rounded-full shadow-sm">0</span>
-                                  </div>
-                                  <div id="disabled-users-list" class="space-y-2.5 max-h-64 overflow-y-auto pr-1">
-                                  </div>
-                              </div>
-                          </div>
-
-                          <div class="bg-white dark:bg-darkcard rounded-3xl p-4 md:p-6 shadow-sm border border-slate-200 dark:border-darkborder relative overflow-hidden">
-                              <div class="flex flex-col sm:flex-row items-stretch sm:items-center justify-between mb-4 md:mb-6 gap-3">
-                                   <h3 class="text-sm uppercase font-bold text-slate-500 tracking-wider" data-i18n="sub_directory_title">Subscriber Directory</h3>
-                                   <div class="flex flex-col sm:flex-row items-stretch sm:items-center gap-2">
-                                       <select id="user-status-filter" onchange="renderUsersTable()" class="bg-slate-50 dark:bg-darkbg border border-slate-200 dark:border-darkborder px-3 py-2.5 rounded-xl text-xs outline-none font-sans text-slate-600 dark:text-slate-400 focus:border-primary">
-                                           <option value="all" data-i18n="filter_all">All Users</option>
-                                           <option value="active" data-i18n="filter_active">Active</option>
-                                           <option value="paused" data-i18n="filter_paused">Paused</option>
-                                           <option value="auto-disabled" data-i18n="filter_auto_disabled">Auto-Disabled</option>
-                                       </select>
-                                       <input type="text" id="user-search-input" onkeyup="renderUsersTable()" placeholder="🔍 Find by Name or UUID..." data-i18n="user_search_placeholder" class="bg-slate-50 dark:bg-darkbg border border-slate-200 dark:border-darkborder px-3 py-2.5 rounded-xl text-xs outline-none font-sans text-slate-600 dark:text-slate-400 focus:border-primary">
-                                       <button onclick="openAddUserPage()" class="native-press px-4 py-2.5 bg-primary hover:bg-primary/90 text-white rounded-xl text-xs font-bold transition-colors shadow-sm whitespace-nowrap" data-i18n="btn_add_user">+ Add New User</button>
-                                   </div>
-                               </div>
-                              <div class="overflow-x-auto">
-                                  <div id="tbl-users" class="grid grid-cols-1 md:grid-cols-2 xl:grid-cols-3 gap-3">
-                                  </div>
-                              </div>
-                          </div>
-                       </div>
-
-                       <!-- PAGE: Add User -->
-                       <div id="view-add-user" class="hidden h-full flex flex-col">
-                           <div class="bg-white dark:bg-darkcard rounded-2xl md:rounded-3xl shadow-sm border border-slate-200 dark:border-darkborder overflow-hidden flex flex-col flex-1 min-h-0">
-                               <div class="flex items-center gap-3 px-5 py-4 border-b border-slate-200 dark:border-darkborder shrink-0">
-                                   <button onclick="closeAddUserPage()" class="native-press p-2 -ms-2 rounded-xl hover:bg-slate-100 dark:hover:bg-slate-800 transition-colors">
-                                       <svg class="w-5 h-5 text-slate-500" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M15 19l-7-7 7-7"></path></svg>
-                                   </button>
-                                   <h3 class="text-lg font-bold text-slate-800 dark:text-white" data-i18n="modal_add_title">Add User</h3>
-                               </div>
-                               <div class="overflow-y-auto flex-1 min-h-0 p-5 space-y-5">
-                                   <div class="space-y-4">
-                                       <h4 class="text-xs font-bold text-slate-400 uppercase tracking-wider" data-i18n="section_basic_info">Basic Info</h4>
-                                       <div class="space-y-3">
-                                           <div>
-                                               <label class="block text-xs font-bold text-slate-500 mb-1.5" data-i18n="lbl_u_name">Name / Identifier</label>
-                                               <input type="text" id="add-user-name" class="w-full px-4 py-3 rounded-xl border border-slate-200 dark:border-darkborder bg-slate-50 dark:bg-slate-800 focus:border-primary outline-none text-sm">
-                                           </div>
-                                           <div>
-                                               <label class="block text-xs font-bold text-slate-500 mb-1.5" data-i18n="lbl_custom_config_name">Custom Config Name / Prefix</label>
-                                               <input type="text" id="add-user-custom-name" placeholder="Leave empty to use user name" class="w-full px-4 py-3 rounded-xl border border-slate-200 dark:border-darkborder bg-slate-50 dark:bg-slate-800 focus:border-primary outline-none text-sm">
-                                           </div>
-                                       </div>
-                                   </div>
-                                   <div class="space-y-4">
-                                       <h4 class="text-xs font-bold text-slate-400 uppercase tracking-wider" data-i18n="section_limits">Limits</h4>
-                                       <div class="space-y-3">
-                                           <div class="grid grid-cols-2 gap-3">
-                                               <div>
-                                                   <label class="block text-xs font-bold text-slate-500 mb-1.5" data-i18n="lbl_traffic_limit_gb">Traffic (GB) Limit</label>
-                                                   <input type="number" id="add-user-total-reqs" placeholder="Unlimited" class="w-full px-4 py-3 rounded-xl border border-slate-200 dark:border-darkborder bg-slate-50 dark:bg-slate-800 focus:border-primary outline-none text-sm">
-                                               </div>
-                                               <div>
-                                                   <label class="block text-xs font-bold text-slate-500 mb-1.5" data-i18n="lbl_daily_limit_gb">Daily Limit (GB)</label>
-                                                   <input type="number" id="add-user-daily-reqs" placeholder="Unlimited" class="w-full px-4 py-3 rounded-xl border border-slate-200 dark:border-darkborder bg-slate-50 dark:bg-slate-800 focus:border-primary outline-none text-sm">
-                                               </div>
-                                           </div>
-                                           <div>
-                                               <label class="block text-xs font-bold text-slate-500 mb-1.5" data-i18n="lbl_expiration_days">Expiration (Days)</label>
-                                               <input type="number" id="add-user-days" placeholder="Unlimited" class="w-full px-4 py-3 rounded-xl border border-slate-200 dark:border-darkborder bg-slate-50 dark:bg-slate-800 focus:border-primary outline-none text-sm">
-                                           </div>
-                                           <div>
-                                               <label class="block text-xs font-bold text-slate-500 mb-1.5" data-i18n="lbl_conn_limit">IP Connection Limit</label>
-                                               <input type="number" id="add-user-conn-limit" placeholder="Unlimited" min="1" class="w-full px-4 py-3 rounded-xl border border-slate-200 dark:border-darkborder bg-slate-50 dark:bg-slate-800 focus:border-primary outline-none text-sm" data-i18n-placeholder="unlimited">
-                                               <p class="text-[10px] text-slate-400 mt-1" data-i18n="desc_conn_limit">Max simultaneous connections per IP. Leave empty for unlimited.</p>
-                                           </div>
-                                       </div>
-                                   </div>
-                                   <div class="space-y-4">
-                                       <h4 class="text-xs font-bold text-slate-400 uppercase tracking-wider" data-i18n="section_network">Network</h4>
-                                       <div class="space-y-3">
-                                           <div>
-                                               <label class="block text-xs font-bold text-slate-500 mb-1.5" data-i18n="lbl_clean_ips">Clean IPs</label>
-                                               <div id="add-user-clean-ips-wrap" class="flex flex-wrap gap-2 mt-1 text-slate-500"></div>
-                                               <label class="block text-[10px] font-bold text-slate-400 mt-2" data-i18n="desc_clean_ips_modal">Custom Clean IPs (comma/newline)</label>
-                                               <textarea id="add-user-custom-clean" rows="2" placeholder="e.g. 1.2.3.4, 5.6.7.8" class="w-full mt-1 px-4 py-3 rounded-xl border border-slate-200 dark:border-darkborder bg-slate-50 dark:bg-slate-800 focus:border-primary outline-none text-sm"></textarea>
-                                           </div>
-                                           <div>
-                                               <label class="block text-xs font-bold text-slate-500 mb-1.5" data-i18n="lbl_proxy_ips">Proxy IPs</label>
-                                               <div id="add-user-proxy-ips-wrap" class="flex flex-wrap gap-2 mt-1 text-slate-500"></div>
-                                               <label class="block text-[10px] font-bold text-slate-400 mt-2" data-i18n="desc_proxy_ips">Custom Proxy IPs (comma/newline)</label>
-                                               <textarea id="add-user-custom-proxy" rows="2" placeholder="e.g. proxy1.com:443" class="w-full mt-1 px-4 py-3 rounded-xl border border-slate-200 dark:border-darkborder bg-slate-50 dark:bg-slate-800 focus:border-primary outline-none text-sm"></textarea>
-                                           </div>
-                                           <div>
-                                               <label class="block text-xs font-bold text-slate-500 mb-1.5" data-i18n="lbl_assigned_nodes">Assigned Nodes</label>
-                                               <div id="add-user-nodes-wrap" class="flex flex-wrap gap-2 mt-1 text-slate-500"></div>
-                                               <label class="block text-[10px] font-bold text-slate-400 mt-2" data-i18n="desc_assigned_nodes">Custom Nodes (comma/newline, empty = all nodes)</label>
-                                               <textarea id="add-user-custom-nodes" rows="2" placeholder="node1.example.com" class="w-full mt-1 px-4 py-3 rounded-xl border border-slate-200 dark:border-darkborder bg-slate-50 dark:bg-slate-800 focus:border-primary outline-none text-sm"></textarea>
-                                           </div>
-                                           <div>
-                                               <label class="block text-xs font-bold text-slate-500 mb-1.5" data-i18n="lbl_user_panel_url">Main Panel URL (Custom Nodes)</label>
-                                               <input type="text" id="add-user-panel-url" placeholder="e.g. panel.example.com" class="w-full px-4 py-3 rounded-xl border border-slate-200 dark:border-darkborder bg-slate-50 dark:bg-slate-800 focus:border-primary outline-none text-sm">
-                                               <p class="text-[10px] text-slate-400 mt-1" data-i18n="desc_user_panel_url">Main panel domain for custom nodes. If empty, default panel URL is used.</p>
-                                           </div>
-                                           <div>
-                                               <label class="block text-xs font-bold text-slate-500 mb-1.5" data-i18n="lbl_nat64">NAT64 Prefix</label>
-                                               <input type="text" id="add-user-nat64" placeholder="e.g. 64:ff9b::/96" class="w-full px-4 py-3 rounded-xl border border-slate-200 dark:border-darkborder bg-slate-50 dark:bg-slate-800 focus:border-primary outline-none text-sm font-mono">
-                                               <p class="text-[10px] text-slate-400 mt-1" data-i18n="desc_nat64_user">Optional. Converts IPv4 Proxy IPs to NAT64 IPv6 addresses.</p>
-                                           </div>
-                                       </div>
-                                   </div>
-                                   <div class="space-y-4">
-                                       <h4 class="text-xs font-bold text-slate-400 uppercase tracking-wider" data-i18n="section_advanced">Advanced</h4>
-                                       <div class="space-y-3">
-                                           <div>
-                                               <label class="block text-xs font-bold text-slate-500 mb-1.5" data-i18n="lbl_protocol_mode">Protocol Mode</label>
-                                               <div id="add-user-mode-wrap" class="flex gap-4 mt-1">
-                                                   <label class="flex items-center gap-2 text-sm cursor-pointer"><input type="checkbox" value="alpha" class="add-mode-cb accent-primary"> <span>Alpha (VLESS)</span></label>
-                                                   <label class="flex items-center gap-2 text-sm cursor-pointer"><input type="checkbox" value="beta" class="add-mode-cb accent-primary"> <span>Beta (Trojan)</span></label>
-                                               </div>
-                                           </div>
-                                           <div>
-                                               <label class="block text-xs font-bold text-slate-500 mb-1.5">Ports</label>
-                                               <div id="add-user-ports-wrap" class="flex flex-wrap gap-2 mt-1"></div>
-                                           </div>
-                                           <div>
-                                               <label class="block text-xs font-bold text-slate-500 mb-1.5" data-i18n="lbl_max_configs">Max Configs</label>
-                                               <input type="number" id="add-user-max-configs" placeholder="Unlimited" class="w-full px-4 py-3 rounded-xl border border-slate-200 dark:border-darkborder bg-slate-50 dark:bg-slate-800 focus:border-primary outline-none text-sm" data-i18n-placeholder="unlimited">
-                                           </div>
-                                       </div>
-                                   </div>
-                               </div>
-                               <div class="px-5 py-4 border-t border-slate-200 dark:border-darkborder bg-white dark:bg-darkcard flex justify-between items-center shrink-0">
-                                   <button onclick="closeAddUserPage()" class="px-5 py-2.5 rounded-xl bg-slate-100 dark:bg-slate-800 text-slate-600 dark:text-slate-300 font-bold text-sm" data-i18n="btn_cancel">Cancel</button>
-                                   <button onclick="commitAddUser()" class="native-press px-6 py-2.5 rounded-xl bg-primary text-white font-bold text-sm shadow-sm" data-i18n="save_btn_user">Save User</button>
-                               </div>
-                           </div>
-                       </div>
-
-                       <!-- PAGE: Edit User -->
-                       <div id="view-edit-user" class="hidden h-full flex flex-col">
-                           <div class="bg-white dark:bg-darkcard rounded-2xl md:rounded-3xl shadow-sm border border-slate-200 dark:border-darkborder overflow-hidden flex flex-col flex-1 min-h-0">
-                               <div class="flex items-center gap-3 px-5 py-4 border-b border-slate-200 dark:border-darkborder shrink-0">
-                                   <button onclick="closeEditUserPage()" class="native-press p-2 -ms-2 rounded-xl hover:bg-slate-100 dark:hover:bg-slate-800 transition-colors">
-                                       <svg class="w-5 h-5 text-slate-500" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M15 19l-7-7 7-7"></path></svg>
-                                   </button>
-                                   <h3 class="text-lg font-bold text-slate-800 dark:text-white" data-i18n="edit_sub">Edit Subscriber</h3>
-                                   <input type="hidden" id="edit-user-id">
-                               </div>
-                               <div class="overflow-y-auto flex-1 min-h-0 p-5 space-y-5">
-                                   <div class="space-y-4">
-                                       <h4 class="text-xs font-bold text-slate-400 uppercase tracking-wider" data-i18n="section_basic_info">Basic Info</h4>
-                                       <div class="space-y-3">
-                                           <div>
-                                               <label class="block text-xs font-bold text-slate-500 mb-1.5" data-i18n="lbl_name_ph">Name / Identifier</label>
-                                               <input type="text" id="edit-user-name" class="w-full px-4 py-3 rounded-xl border border-slate-200 dark:border-darkborder bg-slate-50 dark:bg-slate-800 focus:border-primary outline-none text-sm">
-                                           </div>
-                                           <div>
-                                               <label class="block text-xs font-bold text-slate-500 mb-1.5" data-i18n="lbl_custom_config_name">Custom Config Name / Prefix</label>
-                                               <input type="text" id="edit-user-custom-name" placeholder="Leave empty to use user name" class="w-full px-4 py-3 rounded-xl border border-slate-200 dark:border-darkborder bg-slate-50 dark:bg-slate-800 focus:border-primary outline-none text-sm">
-                                           </div>
-                                       </div>
-                                   </div>
-                                   <div class="space-y-4">
-                                       <h4 class="text-xs font-bold text-slate-400 uppercase tracking-wider" data-i18n="section_limits">Limits</h4>
-                                       <div class="space-y-3">
-                                           <div class="grid grid-cols-2 gap-3">
-                                               <div>
-                                                   <label class="block text-xs font-bold text-slate-500 mb-1.5" data-i18n="lbl_traffic_limit_gb">Traffic Limit (GB)</label>
-                                                   <input type="number" id="edit-user-total-reqs" placeholder="Unlimited" class="w-full px-4 py-3 rounded-xl border border-slate-200 dark:border-darkborder bg-slate-50 dark:bg-slate-800 focus:border-primary outline-none text-sm">
-                                               </div>
-                                               <div>
-                                                   <label class="block text-xs font-bold text-slate-500 mb-1.5" data-i18n="lbl_daily_limit_gb">Daily Limit (GB)</label>
-                                                   <input type="number" id="edit-user-daily-reqs" placeholder="Unlimited" class="w-full px-4 py-3 rounded-xl border border-slate-200 dark:border-darkborder bg-slate-50 dark:bg-slate-800 focus:border-primary outline-none text-sm">
-                                               </div>
-                                           </div>
-                                           <div>
-                                               <label class="block text-xs font-bold text-slate-500 mb-1.5" data-i18n="lbl_expiration_days">Expiration (Days)</label>
-                                               <input type="number" id="edit-user-days" placeholder="Unlimited" class="w-full px-4 py-3 rounded-xl border border-slate-200 dark:border-darkborder bg-slate-50 dark:bg-slate-800 focus:border-primary outline-none text-sm">
-                                           </div>
-                                           <div>
-                                               <label class="block text-xs font-bold text-slate-500 mb-1.5" data-i18n="lbl_conn_limit">IP Connection Limit</label>
-                                               <input type="number" id="edit-user-conn-limit" placeholder="Unlimited" min="1" class="w-full px-4 py-3 rounded-xl border border-slate-200 dark:border-darkborder bg-slate-50 dark:bg-slate-800 focus:border-primary outline-none text-sm" data-i18n-placeholder="unlimited">
-                                               <p class="text-[10px] text-slate-400 mt-1" data-i18n="desc_conn_limit">Max simultaneous connections per user. Leave empty for unlimited.</p>
-                                           </div>
-                                       </div>
-                                   </div>
-                                   <div class="space-y-4">
-                                       <h4 class="text-xs font-bold text-slate-400 uppercase tracking-wider" data-i18n="section_network">Network</h4>
-                                       <div class="space-y-3">
-                                           <div>
-                                               <label class="block text-xs font-bold text-slate-500 mb-1.5" data-i18n="lbl_clean_ips">Clean IPs</label>
-                                               <div id="edit-user-clean-ips-wrap" class="flex flex-wrap gap-2 mt-1 text-slate-500"></div>
-                                               <label class="block text-[10px] font-bold text-slate-400 mt-2" data-i18n="desc_clean_ips_modal">Custom Clean IPs (comma/newline)</label>
-                                               <textarea id="edit-user-custom-clean" rows="2" placeholder="e.g. 1.2.3.4, 5.6.7.8" class="w-full mt-1 px-4 py-3 rounded-xl border border-slate-200 dark:border-darkborder bg-slate-50 dark:bg-slate-800 focus:border-primary outline-none text-sm"></textarea>
-                                           </div>
-                                           <div>
-                                               <label class="block text-xs font-bold text-slate-500 mb-1.5" data-i18n="lbl_proxy_ips">Proxy IPs</label>
-                                               <div id="edit-user-proxy-ips-wrap" class="flex flex-wrap gap-2 mt-1 text-slate-500"></div>
-                                               <label class="block text-[10px] font-bold text-slate-400 mt-2" data-i18n="desc_proxy_ips">Custom Proxy IPs (comma/newline)</label>
-                                               <textarea id="edit-user-custom-proxy" rows="2" placeholder="e.g. proxy1.com:443" class="w-full mt-1 px-4 py-3 rounded-xl border border-slate-200 dark:border-darkborder bg-slate-50 dark:bg-slate-800 focus:border-primary outline-none text-sm"></textarea>
-                                           </div>
-                                           <div>
-                                               <label class="block text-xs font-bold text-slate-500 mb-1.5" data-i18n="lbl_assigned_nodes">Assigned Nodes</label>
-                                               <div id="edit-user-nodes-wrap" class="flex flex-wrap gap-2 mt-1 text-slate-500"></div>
-                                               <label class="block text-[10px] font-bold text-slate-400 mt-2" data-i18n="desc_assigned_nodes">Custom Nodes (comma/newline, empty = all nodes)</label>
-                                               <textarea id="edit-user-custom-nodes" rows="2" placeholder="node1.example.com" class="w-full mt-1 px-4 py-3 rounded-xl border border-slate-200 dark:border-darkborder bg-slate-50 dark:bg-slate-800 focus:border-primary outline-none text-sm"></textarea>
-                                           </div>
-                                           <div>
-                                               <label class="block text-xs font-bold text-slate-500 mb-1.5" data-i18n="lbl_user_panel_url">Main Panel URL (Custom Nodes)</label>
-                                               <input type="text" id="edit-user-panel-url" placeholder="e.g. panel.example.com" class="w-full px-4 py-3 rounded-xl border border-slate-200 dark:border-darkborder bg-slate-50 dark:bg-slate-800 focus:border-primary outline-none text-sm">
-                                               <p class="text-[10px] text-slate-400 mt-1" data-i18n="desc_user_panel_url">Main panel domain for custom nodes. If empty, default panel URL is used.</p>
-                                           </div>
-                                           <div>
-                                               <label class="block text-xs font-bold text-slate-500 mb-1.5" data-i18n="lbl_nat64">NAT64 Prefix</label>
-                                               <input type="text" id="edit-user-nat64" placeholder="e.g. 64:ff9b::/96" class="w-full px-4 py-3 rounded-xl border border-slate-200 dark:border-darkborder bg-slate-50 dark:bg-slate-800 focus:border-primary outline-none text-sm font-mono">
-                                               <p class="text-[10px] text-slate-400 mt-1" data-i18n="desc_nat64_user">Optional. Converts IPv4 Proxy IPs to NAT64 IPv6 addresses.</p>
-                                           </div>
-                                       </div>
-                                   </div>
-                                   <div class="space-y-4">
-                                       <h4 class="text-xs font-bold text-slate-400 uppercase tracking-wider" data-i18n="section_advanced">Advanced</h4>
-                                       <div class="space-y-3">
-                                           <div>
-                                               <label class="block text-xs font-bold text-slate-500 mb-1.5" data-i18n="lbl_protocol_mode">Protocol Mode</label>
-                                               <div id="edit-user-mode-wrap" class="flex gap-4 mt-1">
-                                                   <label class="flex items-center gap-2 text-sm cursor-pointer"><input type="checkbox" value="alpha" class="edit-mode-cb accent-primary"> <span>Alpha (VLESS)</span></label>
-                                                   <label class="flex items-center gap-2 text-sm cursor-pointer"><input type="checkbox" value="beta" class="edit-mode-cb accent-primary"> <span>Beta (Trojan)</span></label>
-                                               </div>
-                                           </div>
-                                           <div>
-                                               <label class="block text-xs font-bold text-slate-500 mb-1.5">Ports</label>
-                                               <div id="edit-user-ports-wrap" class="flex flex-wrap gap-2 mt-1"></div>
-                                           </div>
-                                           <div>
-                                               <label class="block text-xs font-bold text-slate-500 mb-1.5" data-i18n="lbl_max_configs">Max Configs</label>
-                                               <input type="number" id="edit-user-max-configs" placeholder="Unlimited" class="w-full px-4 py-3 rounded-xl border border-slate-200 dark:border-darkborder bg-slate-50 dark:bg-slate-800 focus:border-primary outline-none text-sm" data-i18n-placeholder="unlimited">
-                                           </div>
-                                       </div>
-                                   </div>
-                               </div>
-                               <div class="px-5 py-4 border-t border-slate-200 dark:border-darkborder bg-white dark:bg-darkcard flex justify-between items-center shrink-0">
-                                   <button onclick="closeEditUserPage()" class="px-5 py-2.5 rounded-xl bg-slate-100 dark:bg-slate-800 text-slate-600 dark:text-slate-300 font-bold text-sm" data-i18n="btn_cancel">Cancel</button>
-                                   <button onclick="commitEditUser()" class="native-press px-6 py-2.5 rounded-xl bg-primary text-white font-bold text-sm shadow-sm" data-i18n="btn_save_changes">Save Changes</button>
-                               </div>
-                           </div>
-                       </div>
-
-                      <!-- LOGS VIEW -->
-                      <div id="view-logs" class="hidden space-y-6">
-                          <div class="bg-white dark:bg-darkcard rounded-3xl p-6 shadow-sm border border-slate-200 dark:border-darkborder relative overflow-hidden">
-                              <div class="flex items-center justify-between mb-6">
-                                  <h3 class="text-sm uppercase font-bold text-slate-500 tracking-wider" data-i18n="tab_logs">System Activity Logs</h3>
-                                  <button onclick="loadLogs()" class="px-3 py-1.5 bg-slate-100 hover:bg-slate-200 dark:bg-slate-800 dark:hover:bg-slate-700 text-slate-700 dark:text-slate-300 rounded-lg text-xs font-bold transition-colors">
-                                      🔄 Refresh
-                                  </button>
-                              </div>
-                              <div class="space-y-3" id="logs-container">
-                                  <p class="text-sm text-slate-400 text-center py-8" data-i18n="loading_logs">Loading activity logs...</p>
-                              </div>
-                          </div>
-                      </div>
-                  </div>
-              </div>
-  
-              <!-- Save Bar (Docked to bottom of main content) -->
-              <div class="shrink-0 bg-white dark:bg-darkcard border-t border-slate-200 dark:border-darkborder p-4 flex justify-between md:justify-end items-center z-20 mobile-save-bar">
-                  <span id="save-status" class="text-sm font-bold text-slate-500 md:me-4"></span>
-                  <button onclick="doSave()" class="native-press px-8 py-3 bg-primary text-white font-bold rounded-xl shadow-lg hover:opacity-90 transition-opacity" data-i18n="save_btn">Save Config</button>
-              </div>
-          </main>
-  
-          <!-- BOTTOM NAV (Mobile) -->
-          <nav class="md:hidden w-full mobile-bottom-nav flex justify-around items-center z-30 shrink-0" style="height:calc(4rem + env(safe-area-inset-bottom, 0px));padding-bottom:env(safe-area-inset-bottom, 0px);">
-              <button onclick="switchTab('overview')" id="mob-tab-overview" class="mobile-tab-item mobile-nav-item active flex flex-col items-center justify-center w-full h-full text-slate-400">
-                  <svg class="w-6 h-6 mb-1" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 5a1 1 0 011-1h4a1 1 0 011 1v4a1 1 0 01-1 1H5a1 1 0 01-1-1V5zm10 0a1 1 0 011-1h4a1 1 0 011 1v4a1 1 0 01-1 1h-4a1 1 0 01-1-1V5zM4 15a1 1 0 011-1h4a1 1 0 011 1v4a1 1 0 01-1 1H5a1 1 0 01-1-1v-4zm10 0a1 1 0 011-1h4a1 1 0 011 1v4a1 1 0 01-1 1h-4a1 1 0 01-1-1v-4z"></path></svg>
-                  <span class="text-[10px] font-bold" data-i18n="tab_overview">Home</span>
-              </button>
-              <button onclick="switchTab('info')" id="mob-tab-info" class="mobile-tab-item mobile-nav-item flex flex-col items-center justify-center w-full h-full text-slate-400">
-                  <svg class="w-6 h-6 mb-1" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M13.828 10.172a4 4 0 00-5.656 0l-4 4a4 4 0 105.656 5.656l1.102-1.101m-.758-4.899a4 4 0 005.656 0l4-4a4 4 0 00-5.656-5.656l-1.1 1.1"></path></svg>
-                  <span class="text-[10px] font-bold" data-i18n="tab_info">Endpoints</span>
-              </button>
-              <button onclick="switchTab('network')" id="mob-tab-network" class="mobile-tab-item mobile-nav-item flex flex-col items-center justify-center w-full h-full text-slate-400">
-                  <svg class="w-6 h-6 mb-1" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 19v-6a2 2 0 00-2-2H5a2 2 0 00-2 2v6a2 2 0 002 2h2a2 2 0 002-2zm0 0V9a2 2 0 012-2h2a2 2 0 012 2v10m-6 0a2 2 0 002 2h2a2 2 0 002-2m0 0V5a2 2 0 012-2h2a2 2 0 012 2v14a2 2 0 01-2 2h-2a2 2 0 01-2-2z"></path></svg>
-                  <span class="text-[10px] font-bold" data-i18n="tab_status">Metrics</span>
-              </button>
-              <button onclick="switchTab('settings')" id="mob-tab-settings" class="mobile-tab-item mobile-nav-item flex flex-col items-center justify-center w-full h-full text-slate-400">
-                  <svg class="w-6 h-6 mb-1" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M10.325 4.317c.426-1.756 2.924-1.756 3.35 0a1.724 1.724 0 002.573 1.066c1.543-.94 3.31.826 2.37 2.37a1.724 1.724 0 001.065 2.572c1.756.426 1.756 2.924 0 3.35a1.724 1.724 0 00-1.066 2.573c.94 1.543-.826 3.31-2.37 2.37a1.724 1.724 0 00-2.572 1.065c-.426 1.756-2.924 1.756-3.35 0a1.724 1.724 0 00-2.573-1.066c-1.543.94-3.31-.826-2.37-2.37a1.724 1.724 0 00-1.065-2.572c-1.756-.426-1.756-2.924 0-3.35a1.724 1.724 0 001.066-2.573c-.94-1.543.826-3.31 2.37-2.37.996.608 2.296.07 2.572-1.065z"></path></svg>
-                  <span class="text-[10px] font-bold" data-i18n="tab_settings">System</span>
-              </button>
-              <button onclick="switchTab('advanced')" id="mob-tab-advanced" class="mobile-tab-item mobile-nav-item flex flex-col items-center justify-center w-full h-full text-slate-400">
-                  <svg class="w-6 h-6 mb-1" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M8 9l3 3-3 3m5 0h3M5 20h14a2 2 0 002-2V6a2 2 0 00-2-2H5a2 2 0 00-2 2v12a2 2 0 002 2z"></path></svg>
-                  <span class="text-[10px] font-bold" data-i18n="tab_adv">Network</span>
-              </button>
-              <button onclick="switchTab('logs')" id="mob-tab-logs" class="mobile-tab-item mobile-nav-item flex flex-col items-center justify-center w-full h-full text-slate-400">
-                  <svg class="w-6 h-6 mb-1" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 6h16M4 10h16M4 14h16M4 18h16"></path></svg>
-                  <span class="text-[10px] font-bold" data-i18n="tab_logs">Logs</span>
-              </button>
-              <button onclick="switchTab('users')" id="mob-tab-users" class="mobile-tab-item mobile-nav-item flex flex-col items-center justify-center w-full h-full text-slate-400">
-                  <svg class="w-6 h-6 mb-1" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 4.354a4 4 0 110 5.292M15 21H3v-1a6 6 0 0112 0v1zm0 0h6v-1a6 6 0 00-9-5.197M13 7a4 4 0 11-8 0 4 4 0 018 0z"></path></svg>
-                  <span class="text-[10px] font-bold" data-i18n="tab_users">Users</span>
-              </button>
-          </nav>
-      </div>
-  
-      <!-- Toast Notification -->
-      <div id="copy-toast" class="fixed top-20 md:top-10 left-1/2 -translate-x-1/2 bg-slate-800 dark:bg-white text-white dark:text-slate-900 px-6 py-3 rounded-full shadow-2xl font-bold text-sm z-50 transition-all transform -translate-y-20 opacity-0 pointer-events-none">
-          <span data-i18n="copied">Copied!</span>
-      </div>
-      
-      <!-- QR Code Modal (Enhanced) -->
-      <div id="qr-modal" class="fixed inset-0 bg-black/60 backdrop-blur-sm z-[100] hidden items-center justify-center p-4">
-          <div class="bg-white dark:bg-darkcard rounded-3xl p-8 max-w-sm w-full shadow-2xl border border-slate-200 dark:border-darkborder relative">
-              <button onclick="closeQRModal()" class="absolute top-4 end-4 text-slate-400 hover:text-slate-800 dark:hover:text-white">
-                  <svg class="w-6 h-6" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M6 18L18 6M6 6l12 12"></path></svg>
-              </button>
-              <div class="text-center mb-6">
-                  <h3 id="qr-modal-title" class="text-xl font-bold text-slate-800 dark:text-white" data-i18n="qr_title">Scan to Connect</h3>
-                  <p class="text-xs text-slate-500 mt-1" data-i18n="qr_subtitle">Scan with your V-Core or T-Core client</p>
-              </div>
-              <div class="bg-white p-4 rounded-2xl shadow-inner border border-slate-100 mb-4">
-                  <img id="qr-modal-img" src="" alt="QR Code" class="w-full aspect-square object-contain">
-              </div>
-              <div class="bg-slate-50 dark:bg-slate-800 p-3 rounded-xl break-all text-xs font-mono text-slate-600 dark:text-slate-400 max-h-24 overflow-auto border border-slate-200 dark:border-darkborder" id="qr-modal-link"></div>
-          </div>
-      </div>
-
-      <!-- Modal: Version Update Highlights -->
-      <div id="modal-version-update" class="fixed inset-0 bg-slate-900/60 backdrop-blur-md z-[101] hidden items-center justify-center p-4">
-          <div class="bg-white dark:bg-darkcard rounded-3xl p-8 max-w-lg w-full shadow-2xl border border-slate-200 dark:border-darkborder relative overflow-hidden transform transition-all duration-300">
-              <div class="absolute top-0 right-0 left-0 h-2 bg-gradient-to-r from-indigo-500 via-primary to-emerald-500"></div>
-              <div class="flex items-center justify-between mb-6">
-                  <div class="flex items-center gap-2.5">
-                      <div class="bg-primary/10 text-primary p-2.5 rounded-2xl">
-                          <svg class="w-6 h-6" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                              <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M13 10V3L4 14h7v7l9-11h-7z"></path>
-                          </svg>
-                      </div>
-                      <div>
-                          <h3 class="text-lg font-black text-slate-800 dark:text-white" data-i18n="v_pop_title">Version Update</h3>
-                          <span id="modal-version-badge" class="text-[10px] font-bold px-2 py-0.5 bg-indigo-500 text-white rounded-full tracking-wide"></span>
-                      </div>
-                  </div>
-                  <button onclick="closeVersionModal()" class="text-slate-400 hover:text-slate-700 dark:hover:text-white bg-slate-50 dark:bg-slate-800 p-2 rounded-xl border border-slate-100 dark:border-darkborder transition-colors">
-                      <svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                          <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M6 18L18 6M6 6l12 12"></path>
-                      </svg>
-                  </button>
-              </div>
-
-              <div class="space-y-4">
-                  <div class="p-4 bg-slate-50 dark:bg-slate-800/30 rounded-2xl border border-slate-100 dark:border-darkborder/50">
-                      <p class="text-xs font-bold text-slate-400 uppercase tracking-widest" data-i18n="v_pop_whatsnew">What's New in This Version</p>
-                      <h4 id="modal-version-headline" class="text-sm font-black text-slate-700 dark:text-white mt-1"></h4>
-                  </div>
-                  
-                  <div id="modal-changelog-container" class="space-y-4 max-h-[50vh] overflow-y-auto pe-2 text-start">
-                  </div>
-              </div>
-
-              <div class="mt-6 pt-5 border-t border-slate-100 dark:border-darkborder/50 flex justify-end">
-                  <button onclick="closeVersionModal()" class="px-5 py-2.5 bg-primary hover:bg-primary/95 text-white rounded-xl text-xs font-bold shadow-md transition-all transform hover:scale-105 active:scale-95" data-i18n="v_pop_btn">Got it!</button>
-              </div>
-          </div>
-      </div>
-  
-      <script>
-          function parseImportBindings(importStr) {
-              const cleanStr = importStr.replace(/\\/\\/.*$/gm, '').replace(/\\/\\*[\\s\\S]*?\\*\\//g, '').trim();
-              const content = cleanStr
-                  .replace(/^import\\s+/, '')
-                  .replace(/\\s+from\\s+["'].*?["'];?$/, '')
-                  .trim();
-              
-              const bindings = [];
-              
-              if (content.startsWith('*')) {
-                  const match = content.match(/\\*\\s+as\\s+(\\w+)/);
-                  if (match) bindings.push({ name: match[1], isNamespace: true });
-                  return bindings;
-              }
-              
-              const braceStart = content.indexOf('{');
-              if (braceStart !== -1) {
-                  const defaultPart = content.slice(0, braceStart).replace(/,/, '').trim();
-                  if (defaultPart) {
-                      bindings.push({ name: defaultPart, isDefault: true });
-                  }
-                  const bracePart = content.slice(braceStart + 1, content.lastIndexOf('}')).trim();
-                  const namedImports = bracePart.split(',').map(s => s.trim()).filter(Boolean);
-                  namedImports.forEach(item => {
-                      if (item.includes(' as ')) {
-                          const parts = item.split(/\\s+as\\s+/);
-                           bindings.push({ name: parts[1], original: parts[0] });
-                      } else {
-                          bindings.push({ name: item });
-                      }
-                  });
-              } else {
-                  bindings.push({ name: content, isDefault: true });
-              }
-              
-              return bindings;
-          }
-
-          function obfuscateCode(srcText) {
-              const importRegex = /import\\s+[\\s\\S]*?from\\s+["'].*?["'];?/g;
-              const imports = [];
-              let match;
-              
-              while ((match = importRegex.exec(srcText)) !== null) {
-                  imports.push(match[0]);
-              }
-              
-              let cleanCode = srcText.replace(importRegex, '');
-              
-              const bindings = [];
-              imports.forEach(imp => {
-                  const parsed = parseImportBindings(imp);
-                  bindings.push(...parsed);
-              });
-              
-              const uniqueBindings = [];
-              const seenNames = new Set();
-              bindings.forEach(b => {
-                  if (!seenNames.has(b.name)) {
-                      seenNames.add(b.name);
-                      uniqueBindings.push(b);
-                  }
-              });
-              
-              cleanCode = cleanCode.replace(/export\\s+default\\s+/g, 'const _0xLowkeyModule = ');
-              cleanCode += '\\nreturn _0xLowkeyModule;';
-              
-              const randKey = Math.floor(Math.random() * 80) + 64; 
-              
-              const encoder = new TextEncoder();
-              const bytes = encoder.encode(cleanCode);
-              
-              let hexOutput = '';
-              for (let i = 0; i < bytes.length; i++) {
-                  const xorByte = bytes[i] ^ randKey;
-                  hexOutput += xorByte.toString(16).padStart(2, '0');
-               }
-              
-              const rawImportsStr = imports.join('\\n');
-              const bindingNames = uniqueBindings.map(b => b.name);
-              
-              const finalLoaderCode = rawImportsStr + '\\n\\n' +
-                  '// lowkey - Obfuscated Loader Context (v2.5.4.2 Optimized)\\n' +
-                  'const _0xLowkeyPayload = "' + hexOutput + '";\\n' +
-                  'const _0xLowkeyKey = ' + randKey + ';\\n\\n' +
-                  'const _0xLowkeyBytes = new Uint8Array((_0xLowkeyPayload.match(/.{1,2}/g) || []).map(x => parseInt(x, 16) ^ _0xLowkeyKey));\\n' +
-                  'const _0xLowkeyCode = new TextDecoder().decode(_0xLowkeyBytes);\\n' +
-                  'const _0xLowkeyRuntime = new Function(' + bindingNames.map(name => '"' + name + '"').join(', ') + ', _0xLowkeyCode)(' + bindingNames.join(', ') + ');\\n\\n' +
-                  'export default _0xLowkeyRuntime;';
-
-              return finalLoaderCode;
-          }
-
-          const CURRENT_VERSION = "${CURRENT_VERSION}";
-          const i18n = {
-              en: {
-                  title: "lowkey", pass_ph: "Master Key", login_btn: "Authenticate", err_pass: "Access Denied", missing_db: "⚠️ IOT_DB namespace missing! Settings won't save.",
-                  logout: "Disconnect", tab_overview: "Overview", tab_info: "Endpoints", tab_status: "Metrics", tab_settings: "System", tab_adv: "Advanced", tab_logs: "Activity Logs",
-                  qr_title: "Direct Stream Link", badge_multi: "Dual-Core Multiplexed", copy: "Copy", copied: "Copied to clipboard!", sync_link: "Cloud Sync URL", active_id: "Hardware ID",
-                  stat_ip: "Origin IP", stat_dc: "Edge Node", stat_loc: "Data Region",
-                  lbl_proto: "Primary Display Mode", lbl_port: "Data Port", lbl_id: "Device UUID (Empty=Auto)",
-                  lbl_path: "API Route (Hidden Path)", lbl_pass: "Master Key", lbl_fp: "TLS Signature", lbl_dns: "Resolver IP",
-                  lbl_clean_ips: "Clean IPs (Multi-Generator)", ph_clean_ips: "1.1.1.1, 2.2.2.2", desc_clean_ips: "Separate IPs by comma or new line. The Sync URL will multiply configs for all IPs.",
-                  lbl_fake: "Maintenance Hosts (Camouflage)", lbl_relay: "Backup Relay IP", lbl_tfo: "TCP Fast Open", lbl_ech: "Secure Hello (ECH)",
-                  lbl_fake_configs: "Subscription Fake Entries", desc_fake_configs: "Customize info entries shown in subscription profiles. Use {usage} and {expiry} for dynamic values.", btn_add_entry: "Add Entry",                   lbl_tg_token: "Telegram Bot Token", lbl_tg_chat: "Telegram Chat ID", lbl_tg_admin: "Authorized Telegram Admin ID", desc_tg_admin: "Only this Telegram User ID can manage the panel via bot. Leave empty to use Chat ID.", desc_tg_bot: "Set these values to receive login alerts via Telegram.",
-                  lbl_cf_acc: "Cloudflare Account ID", lbl_cf_token: "Cloudflare API Token", desc_cf_api: "Optional: Monitor Worker daily usage limit (100k/day). Requires Account Analytics read permission.",
-                  lbl_silent: "Silent UI Alerts", lbl_pause: "Kill Switch (Pause System)",
-                  lbl_sub_ua: "Custom Subscription User-Agent", desc_sub_ua: "Allow specific browser User-Agent containing this text to bypass camouflage and retrieve profile data directly in web browser.",
-                  tab_users: "Users",
-                  user_mgt_title: "User Management", user_mgt_desc: "Manage multiple users, set traffic limits, and expiration dates.", btn_add_user: "+ Add New User",
-                  tbl_name: "Name", tbl_uuid: "UUID", tbl_traffic: "Traffic (Used / Limit)", tbl_exp: "Expiration", tbl_action: "Action", no_users: "No users found. Create one above.",
-                  modal_add_title: "Add New User", lbl_u_name: "Name (Required)", lbl_u_gb: "Traffic Limit (GB) - Optional", lbl_u_days: "Duration (Days) - Optional", btn_cancel: "Cancel", btn_confirm: "Add User",
-                  limit_total: "Traffic (GB) Limit (Leave empty for unlimited)", limit_daily: "Daily Requests Limit (Leave empty for unlimited)",
-                  limit_days: "Expiration limit (Days) - Leave empty for unlimited", edit_sub: "Edit Subscriber", lbl_name_ph: "Name or UUID",
-                  btn_save_changes: "Save Changes", save_btn_user: "Save User", save_btn: "Save Config", status_active: "Active", status_paused: "Paused", status_expired: "Expired",
-                  stat_total_subscribers: "Total Subscribers", stat_active_paused: "Active / Paused", stat_cumulative_traffic: "Cumulative Traffic", stat_auto_disabled: "Auto-Disabled",
-                  sub_directory_title: "Subscriber Directory", sub_directory_desc: "Search, modify bounds, toggle traffic limits or clear billing sessions.", user_search_placeholder: "🔍 Find by Name or UUID...",
-                  filter_all: "All Users", filter_active: "Active", filter_paused: "Paused", filter_auto_disabled: "Auto-Disabled",
-                  disabled_panel_title: "Recently Disabled Users", disabled_panel_desc: "Users automatically disabled due to quota or expiration limits",
-                  lbl_u_Protocol:"Protocol Mode (Leave empty to use global setting)",
-                  lbl_u_ports:"Custom Ports (Optional - overrides global ports, comma separated e.g. 443,80",
-                  lbl_u_max_config:"Max Configs",
-                  login_password:"Password",
-                  lbl_u_ipproxy:"User Proxy IP(s) (Optional - overrides global Clean IP, comma/newline separated)",
-                   lbl_custom_panel_url:"Custom Panel URL / Subscription Domain",
-                   lbl_api_keys: "Panel API Keys", desc_api_keys: "Generate API keys to securely connect remote panels. Remote panels use these keys instead of sharing your master key.",
-                   btn_generate_key: "Generate Key", api_key_created: "API Key Created! Copy it now — it won't be shown again.",
-                   api_keys_empty: "No API keys generated yet.", enter_key_name: "Enter a name for this API key:",
-                   confirm_revoke: "Revoke this API key? The remote panel will lose access.", revoke: "Revoke",
-                   created: "Created", last_used: "Last used", never: "Never",
-                   v_pop_title: "Release Notice", v_pop_whatsnew: "What's New", v_pop_headline: "New Features & Improvements",
-                  v_pop_btn: "Got it!",
-                  changelog_title: "Release Notes & Changelog:",
-                  changelog_added: "Added", changelog_fixed: "Fixed", changelog_improved: "Improved", changelog_changed: "Changed", changelog_note: "Important Notes",
-                  ov_total_users: "Total Users", ov_active_users: "Active", ov_paused_users: "Paused", ov_auto_disabled: "Auto-Disabled", ov_expired_users: "Expired",
-                  ov_total_traffic: "Total Traffic", ov_today_traffic: "Today's Traffic", ov_requests: "requests", ov_active_conns: "Active Connections",
-                  ov_system: "System", ov_recent_activity: "Recent Activity", ov_view_all: "View All →", ov_loading: "Loading...",
-                   ov_quick_actions: "Quick Actions", ov_add_user: "Add User", ov_backup_config: "Backup Config", ov_refresh: "Refresh Statistics", ov_manage_users: "Manage Users",
-                   ov_gb_unit: "GB",
-                    lbl_allow_sync:"Allow Sync",
-                    other_nodes_title: "Other Nodes", other_nodes_desc: "External nodes (URL + API Key) for cross-panel management.",
-                    add_node_title: "Add External Node", add_node_desc: "Enter the URL and API Key of the external panel.",
-                    add_node_url: "Node URL", add_node_apikey: "API Key", add_node_confirm: "Add Node", add_node_invalid: "Please enter both URL and API Key.",
-                    node_added: "Node added successfully!", node_removed: "Node removed.",
-                   lbl_cf_worker: "CF Worker Script Name", desc_cf_worker: "The script name shown in your Cloudflare Workers dashboard.",
-                    cf_help_title: "Need help getting these? Beginner's Step-by-Step Guide",
-                    adv_network_dns: "Network & DNS", adv_proxy_relay: "Proxy & Relay", adv_subscription: "Subscription",
-                    adv_protocol: "Protocol", adv_telegram: "Telegram Bot", adv_cloudflare: "Cloudflare",
-                    stat_datetime: "Date Time",
-                    desc_custom_panel_url: "Optionally specify a custom domain/URL to be used for subscription/sync links. If empty, the default Worker address will be used.",
-                    lbl_custom_config_name: "Custom Config Name / Prefix",
-                    lbl_traffic_limit_gb: "Traffic (GB) Limit",
-                    lbl_daily_limit_gb: "Daily Limit (GB)",
-                    lbl_expiration_days: "Expiration (Days)",
-                    loading_logs: "Loading activity logs...", show_qr: "Show QR Code",
-                    no_matching_users: "No matching subscribers found", no_active_conn: "No active connection data yet.",
-                    qr_subtitle: "Scan with your V-Core or T-Core client",
-                    no_activity_logs: "No activity logs found.", no_recent_activity: "No recent activity.",
-                    no_ips_advanced: "No IPs added in Advanced Tab", no_nodes_advanced: "No slave nodes in Advanced Tab",
-                    no_changelog: "No changelog available for this version.", no_changes: "No changes documented.",
-                    section_basic_info: "Basic Info", section_limits: "Limits", section_network: "Network", section_advanced: "Advanced",
-                    lbl_nat64: "NAT64 Prefix", desc_nat64: "Optional. Converts IPv4 Proxy IPs to NAT64 IPv6 addresses. Supports multiple prefixes.",
-                    lbl_direct_configs: "Include Direct Configs", desc_direct_configs: "Generate configs without Proxy IP alongside relay configs",
-                    lbl_sync_api_key: "Sync API Key (Slave Push)", desc_sync_api_key: "API key from a slave panel. Main uses this to push config. Same key must exist on each slave's Panel API Keys.",
-                    lbl_clean_ips: "Clean IPs", lbl_proxy_ips: "Proxy IPs", lbl_assigned_nodes: "Assigned Nodes",
-                    lbl_protocol_mode: "Protocol Mode", lbl_max_configs: "Max Configs",
-                    desc_assigned_nodes: "Custom Nodes (comma/newline, empty = all nodes)",
-                    desc_nat64_user: "Optional. Converts IPv4 Proxy IPs to NAT64 IPv6 addresses.",
-                    desc_proxy_ips: "Custom Proxy IPs (comma/newline)",
-                    desc_clean_ips_modal: "Custom Clean IPs (comma/newline)",
-                    btn_generate_uuid: "Generate UUID",
-                    lbl_conn_limit: "IP Connection Limit", desc_conn_limit: "Max simultaneous connections per user. Leave empty for unlimited.",
-                    lbl_user_panel_url: "Main Panel URL (Custom Nodes)", desc_user_panel_url: "Main panel domain for custom nodes. If empty, default panel URL is used.",
-                    html_desc_strategy: "Supported placeholders: <code class='bg-slate-100 dark:bg-slate-800/80 px-1 py-0.5 rounded text-rose-500 font-mono'>{FLAG}</code>, <code class='bg-slate-100 dark:bg-slate-800/80 px-1 py-0.5 rounded text-rose-500 font-mono'>{COUNTRY}</code>, <code class='bg-slate-100 dark:bg-slate-800/80 px-1 py-0.5 rounded text-rose-500 font-mono'>{CITY}</code>, <code class='bg-slate-100 dark:bg-slate-800/80 px-1 py-0.5 rounded text-rose-500 font-mono'>{ISP}</code>, <code class='bg-slate-100 dark:bg-slate-800/80 px-1 py-0.5 rounded text-rose-500 font-mono'>{PROTOCOL}</code>, <code class='bg-slate-100 dark:bg-slate-800/80 px-1 py-0.5 rounded text-rose-500 font-mono'>{USER}</code>, <code class='bg-slate-100 dark:bg-slate-800/80 px-1 py-0.5 rounded text-rose-500 font-mono'>{PORT}</code>, <code class='bg-slate-100 dark:bg-slate-800/80 px-1 py-0.5 rounded text-rose-500 font-mono'>{PREFIX}</code>, <code class='bg-slate-100 dark:bg-slate-800/80 px-1 py-0.5 rounded text-rose-500 font-mono'>{IP}</code>, <code class='bg-slate-100 dark:bg-slate-800/80 px-1 py-0.5 rounded text-rose-500 font-mono'>{HOST}</code>, <code class='bg-slate-100 dark:bg-slate-800/80 px-1 py-0.5 rounded text-rose-500 font-mono'>{DATE}</code>, <code class='bg-slate-100 dark:bg-slate-800/80 px-1 py-0.5 rounded text-rose-500 font-mono'>{INDEX}</code>, <code class='bg-slate-100 dark:bg-slate-800/80 px-1 py-0.5 rounded text-rose-500 font-mono'>{WORKER}</code>.<br><span class='text-[10px] text-slate-400 dark:text-slate-500 leading-snug'>• <b>{FLAG}</b>: Country flag emoji (e.g. 🇺🇸).<br>• <b>{COUNTRY}</b>: Country name (e.g. United States).<br>• <b>{CITY}</b>: City name (e.g. San Francisco).<br>• <b>{ISP}</b>: ISP / ASN org (e.g. Cloudflare, Inc.).<br>• <b>{PROTOCOL}</b>: Core mode (VLESS / Trojan).<br>• <b>{USER}</b>: Subscriber name.<br>• <b>{PORT}</b>: Active port.<br>• <b>{PREFIX}</b>: Custom prefix.<br>• <b>{IP}</b>: Clean IP address.<br>• <b>{HOST}</b>: Hostname.<br>• <b>{DATE}</b>: Current date (YYYY-MM-DD).<br>• <b>{INDEX}</b>: Config index (0, 1, 2...).<br>• <b>{WORKER}</b>: Worker name from config.</span><br>Pre-defined strategies: <code>default</code>, <code>type-user-port</code>, <code>user-port</code>, <code>host-port-user</code>, <code>prefix-user-port</code>, <code>ip</code>.",
-               },
-              fa: {
-                  title: "دروازه lowkey", pass_ph: "کلید اصلی", login_btn: "ورود به سیستم", err_pass: "دسترسی مسدود شد", missing_db: "⚠️ فضای پایگاه داده یافت نشد! تنظیمات ذخیره نمی‌شوند.",
-                  logout: "خروج", tab_overview: "نمای کلی", tab_info: "نقاط اتصال", tab_status: "وضعیت شبکه", tab_settings: "تنظیمات پایه", tab_adv: "پیشرفته", tab_logs: "گزارش فعالیت",
-                  qr_title: "لینک اتصال مستقیم", badge_multi: "ترکیب ترانزیت پیشرفته دوگانه", copy: "کپی", copied: "در حافظه کپی شد!", sync_link: "لینک ساب (همگام سازی ابری)", active_id: "شناسه سخت‌افزار",
-                  stat_ip: "آی‌پی مبدا", stat_dc: "گره لبه", stat_loc: "منطقه داده",
-                  lbl_proto: "پروتکل نمایش مستقیم", lbl_port: "پورت داده", lbl_id: "شناسه یکتا (خالی=خودکار)",
-                  lbl_path: "مسیر مخفی آی‌پی‌آی", lbl_pass: "کلید اصلی", lbl_fp: "امضای امنیتی", lbl_dns: "آی‌پی تحلیلگر",
-                  lbl_clean_ips: "آی‌پی‌های تمیز (مولد چندگانه)", ph_clean_ips: "1.1.1.1, 2.2.2.2", desc_clean_ips: "آی‌پی ها را با کاما یا خط جدید جدا کنید. لینک ساب برای همه ترکیب می‌سازد.",
-                  lbl_fake: "سایت‌های استتار (حالت مخفی)", lbl_relay: "آی‌پی جایگزین (کمکی)", lbl_tfo: "اتصال سریع", lbl_ech: "سلام امن",
-                  lbl_fake_configs: "ورودی‌های اطلاعاتی اشتراک", desc_fake_configs: "متن نمایشی ورودی‌ها در پروفایل اشتراک را سفارشی کنید. از {usage} و {expiry} برای مقادیر پویا استفاده کنید.", btn_add_entry: "افزودن ورودی", lbl_tg_token: "توکن ربات تلگرام", lbl_tg_chat: "شناسه عددی تلگرام", lbl_tg_admin: "شناسه مدیر تلگرام", desc_tg_admin: "فقط این شناسه کاربری تلگرام می‌تواند پنل را از طریق ربات مدیریت کند. خالی بگذارید برای استفاده از شناسه چت.", desc_tg_bot: "با تنظیم این مقادیر، جزئیات ورود به پنل به تلگرام ارسال می‌شود.",
-                  lbl_cf_acc: "شناسه اکانت ابری", lbl_cf_token: "توکن دسترسی کاربری", desc_cf_api: "اختیاری: برای نمایش میزان مصرف روزانه کارگر از صد هزار درخواست رایگان در پیام‌های تلگرام.",
-                  lbl_silent: "هشدار و پیغام خاموش", lbl_pause: "کلید توقف اضطراری",
-                   lbl_sub_ua: "یوزراجنت سفارشی ساب", desc_sub_ua: "درخواست‌های مرورگر که حاوی این متن باشند، استتار را خنثی کرده و مستقیم به ساب دسترسی پیدا می‌کنند.",
-                   lbl_api_keys: "کلیدهای API پنل", desc_api_keys: "کلیدهای API برای اتصال امن پنل‌های راهدور ایجاد کنید. پنل‌های راهدور به جای اشتراک‌گذاری کلید اصلی، از این کلیدها استفاده می‌کنند.",
-                   btn_generate_key: "ایجاد کلید", api_key_created: "کلید API ایجاد شد! آن را کپی کنید — دوباره نمایش داده نخواهد شد.",
-                   api_keys_empty: "هنوز کلید API ایجاد نشده.", enter_key_name: "نامی برای این کلید API وارد کنید:",
-                   confirm_revoke: "این کلید API لغو شود؟ پنل راهدور دسترسی خود را از دست خواهد داد.", revoke: "لغو",
-                   created: "ایجاد شده", last_used: "آخرین استفاده", never: "هرگز",
-                   tab_users: "کاربران",
-                  user_mgt_title: "مدیریت کاربران", user_mgt_desc: "مدیریت کاربران متعدد، تنظیم محدودیت ترافیک، و تاریخ انقضا.", btn_add_user: "+ افزودن کاربر جدید",
-                  tbl_name: "نام", tbl_uuid: "شناسه یکتا", tbl_traffic: "ترافیک (مصرفی/محدودیت)", tbl_exp: "انقضا", tbl_action: "عملیات", no_users: "کاربری یافت نشد. از دکمه بالا یک کاربر ایجاد کنید.",
-                  modal_add_title: "افزودن کاربر جدید", lbl_u_name: "نام (الزامی)", lbl_u_gb: "محدودیت ترافیک (گیگابایت) - اختیاری", lbl_u_days: "مدت زمان اعتبار (روز) - اختیاری", btn_cancel: "انصراف", btn_confirm: "افزودن کاربر",
-                  save_btn: "ذخیره تنظیمات", msg_saving: "در حال ثبت...", msg_saved: "موفق! در حال بارگذاری...", msg_err: "خطای ارتباط",
-                  backup_restore_title: "پشتیبان‌گیری و بازیابی", ping_test_title: "عیب‌یابی تاخیر شبکه", ping_test_desc: "تاخیر پاسخ‌دهی را به آی‌پی تمیز فعال اندازه بگیرید.",
-                    cf_help_title: "آموزش بدست آوردن این اطلاعات برای کاربران مبتدی",
-                    adv_network_dns: "شبکه و DNS", adv_proxy_relay: "پروکسی و رله", adv_subscription: "اشتراک",
-                    adv_protocol: "پروتکل", adv_telegram: "ربات تلگرام", adv_cloudflare: "کلودفلر",
-                    stat_datetime: "تاریخ و زمان",
-                    desc_custom_panel_url: "اختیاری. یک دامنه/آدرس سفارشی برای لینک‌های ساب/همگام‌سازی وارد کنید. اگر خالی باشد، آدرس پیش‌فرض ورکر استفاده می‌شود.",
-                    lbl_custom_config_name: "نام/پیشوند سفارشی کانفیگ",
-                    lbl_traffic_limit_gb: "محدودیت ترافیک (GB)",
-                    lbl_daily_limit_gb: "محدودیت روزانه (GB)",
-                    lbl_expiration_days: "تاریخ انقضا (روز)",
-                    loading_logs: "در حال بارگذاری گزارش‌ها...", show_qr: "نمایش کد QR",
-                    no_matching_users: "کاربری مطابقت نداشت", no_active_conn: "هنوز داده اتصال فعالی ثبت نشده.",
-                    qr_subtitle: "با کلاینت V-Core یا T-Core اسکن کنید",
-                    no_activity_logs: "گزارش فعالیتی یافت نشد.", no_recent_activity: "فعالیت اخیری ثبت نشده.",
-                    no_ips_advanced: "آی‌پی‌ای در بخش پیشرفته اضافه نشده", no_nodes_advanced: "نود فرعی‌ای در بخش پیشرفته اضافه نشده",
-                    no_changelog: "گزارش تغییراتی برای این نسخه موجود نیست.", no_changes: "تغییراتی ثبت نشده.",
-                    section_basic_info: "اطلاعات پایه", section_limits: "محدودیت‌ها", section_network: "شبکه", section_advanced: "پیشرفته",
-                    lbl_nat64: "پیشوند NAT64", desc_nat64: "اختیاری. آی‌پی‌های پروکسی IPv4 را به آدرس‌های NAT64 IPv6 تبدیل می‌کند. چند پیشوند پشتیبانی می‌شود.",
-                    lbl_direct_configs: "شامل کانفیگ‌های مستقیم", desc_direct_configs: "تولید کانفیگ‌ها بدون آی‌پی پروکسی در کنار کانفیگ‌های رله",
-                    lbl_sync_api_key: "کلید API همگام‌سازی (ارسال به اسلیو)", desc_sync_api_key: "کلید API از پنل اسلیو. پنل اصلی با این کلید کانفیگ را ارسال می‌کند. این کلید باید در کلیدهای API پنل اسلیو وجود داشته باشد.",
-                    lbl_clean_ips: "آی‌پی‌های تمیز", lbl_proxy_ips: "آی‌پی‌های پروکسی", lbl_assigned_nodes: "نودهای اختصاصی",
-                    lbl_protocol_mode: "پروتکل", lbl_max_configs: "حداکثر کانفیگ",
-                    desc_assigned_nodes: "نودهای سفارشی (کاما/خط جدید، خالی = همه نودها)",
-                    desc_nat64_user: "اختیاری. آی‌پی‌های پروکسی IPv4 را به آدرس‌های NAT64 IPv6 تبدیل می‌کند.",
-                    desc_proxy_ips: "آی‌پی‌های پروکسی سفارشی (کاما/خط جدید)",
-                    desc_clean_ips_modal: "آی‌پی‌های تمیز سفارشی (کاما/خط جدید)",
-                    btn_generate_uuid: "تولید UUID",
-                    lbl_conn_limit: "محدودیت اتصال همزمان", desc_conn_limit: "حداکثر اتصالات همزمان برای هر کاربر. برای نامحدود خالی بگذارید.",
-                    lbl_user_panel_url: "آدرس پنل اصلی (نودهای سفارشی)", desc_user_panel_url: "دامنه پنل اصلی برای نودهای سفارشی. اگر خالی باشد، آدرس پنل پیش‌فرض استفاده می‌شود.",
-                  metrics_live: "وضعیت زنده مصرف اتصالات و پردازش", no_metrics: "هنوز داده‌ای از تراکنش و اتصالات فعال ثبت نشده است.", run_diagnostics: "⚡ اجرای عیب‌یابی شبکه",
-                  target_node: "هدف گره شبکه", response: "مدت زمان تاخیر پاسخگویی", status: "وضعیت گره", local_port: "درگاه محلی",
-                  lbl_doh: "تحلیل‌گر تخصصی آدرس‌یابی عددی", lbl_strategy: "روش نام‌گذاری کانفیگ‌ها", lbl_prefix: "پیشوند نام کانفیگ‌ها",
-                  slave_title: "سایر نودهای موازی", slave_desc: "آدرس دامنه سایر ورکرها را وارد نمایید (هر خط یک آدرس). نود اصلی تنظیمات و مشترکین را به صورت خودکار با آن‌ها هماهنگ می‌کند!",
-                  force_sync: "همگام‌سازی اجباری نودها", limit_total: "محدودیت تعداد کل درخواست‌ها (GB)  (برای نامحدود خالی بگذارید)", limit_daily: "محدودیت درخواست‌های روزانه (GB)  (برای نامحدود خالی بگذارید)",
-                  limit_days: "مدت زمان اعتبار قانونی (روز) - برای نامحدود خالی بگذارید", edit_sub: "ویرایش مشترک", lbl_name_ph: "نام یا شناسه یکتا",
-                  btn_save_changes: "ذخیره تغییرات", save_btn_user: "ثبت کاربر جدید", status_active: "فعال", status_paused: "متوقف شده", status_expired: "منقضی شده",
-                  export_btn: "📥 برون‌بری فایل پیکربندی (نسخه پشتیبان)", import_btn: "📤 درون‌ریزی فایل پیکربندی (نسخه پشتیبان)",
-                  stat_total_subscribers: "کل مشترکین", stat_active_paused: "فعال / متوقف شده", stat_cumulative_traffic: "ترافیک کل انباشته", stat_auto_disabled: "غیرفعال خودکار",
-                  sub_directory_title: "فهرست مشترکین", sub_directory_desc: "جستجو، اصلاح محدودیت‌ها، تغییر محدودیت‌های ترافیک یا پاک کردن جلسات حسابداری.", user_search_placeholder: "🔍 جستجو بر اساس نام یا شناسه...",
-                  filter_all: "همه کاربران", filter_active: "فعال", filter_paused: "متوقف شده", filter_auto_disabled: "غیرفعال خودکار",
-                  disabled_panel_title: "کاربران اخیراً غیرفعال شده", disabled_panel_desc: "کاربرانی که به دلیل اتمام سهمیه یا تاریخ انقضا غیرفعال شده‌اند",
-                  lbl_u_Protocol:"نوع پروتکل(خالی بر اساس تنظیمات کلی)",
-                  lbl_u_ports:"نوع پورت",
-                  lbl_u_max_config:"حداکثر تعداد کانفیگ",
-                  login_password:"رمز ورود",
-                  lbl_u_ipproxy:"آی‌پی(های) پروکسی کاربر (اختیاری - آی‌پی پاک سراسری را نادیده می‌گیرد، با کاما/خط جدید از هم جدا می‌شوند)",
-                  v_pop_title: "اطلاعیه تعمیرات", v_pop_whatsnew: "ویژگی‌های جدید", v_pop_headline: "امکانات جدید و بهبودها",
-                  v_pop_btn: "متوجه شدم!",
-                  changelog_title: "گزارش تغییرات و توضیحات نسخه جدید:",
-                   changelog_added: "اضافه شده", changelog_fixed: "رفع شده", changelog_improved: "بهبود یافته", changelog_changed: "تغییر یافته", changelog_note: "نکات مهم",
-                   ov_total_users: "کل کاربران", ov_active_users: "فعال", ov_paused_users: "متوقف", ov_auto_disabled: "غیرفعال خودکار", ov_expired_users: "منقضی",
-                   ov_total_traffic: "ترافیک کل", ov_today_traffic: "ترافیک امروز", ov_requests: "درخواست", ov_active_conns: "اتصالات فعال",
-                   ov_system: "سیستم", ov_recent_activity: "فعالیت‌های اخیر", ov_view_all: "مشاهده همه ←", ov_loading: "در حال بارگذاری...",
-                   ov_quick_actions: "عملیات سریع", ov_add_user: "افزودن کاربر", ov_backup_config: "پشتیبان‌گیری", ov_refresh: "بروزرسانی آمار", ov_manage_users: "مدیریت کاربران",
-                   ov_gb_unit: "گیگابایت",
-                     lbl_allow_sync:"اجازه همگام سازی",
-                     other_nodes_title: "سایر نودها", other_nodes_desc: "نودهای خارجی (URL + کلید API) برای مدیریت بین پنل‌ها.",
-                     add_node_title: "افزودن نود خارجی", add_node_desc: "آدرس URL و کلید API پنل خارجی را وارد کنید.",
-                     add_node_url: "آدرس نود", add_node_apikey: "کلید API", add_node_confirm: "افزودن نود", add_node_invalid: "لطفاً URL و کلید API را وارد کنید.",
-                     node_added: "نود با موفقیت اضافه شد!", node_removed: "نود حذف شد.",
-                      lbl_cf_worker: "نام اسکریپت کارگر ابری", desc_cf_worker: "نام اسکریپت در داشبورد کارگرهای ابری.",
-                     html_desc_strategy: "متغیرهای پشتیبانی شده: <code class='bg-slate-100 dark:bg-slate-800/80 px-1 py-0.5 rounded text-rose-500 font-mono'>{FLAG}</code>، <code class='bg-slate-100 dark:bg-slate-800/80 px-1 py-0.5 rounded text-rose-500 font-mono'>{COUNTRY}</code>، <code class='bg-slate-100 dark:bg-slate-800/80 px-1 py-0.5 rounded text-rose-500 font-mono'>{CITY}</code>، <code class='bg-slate-100 dark:bg-slate-800/80 px-1 py-0.5 rounded text-rose-500 font-mono'>{ISP}</code>، <code class='bg-slate-100 dark:bg-slate-800/80 px-1 py-0.5 rounded text-rose-500 font-mono'>{PROTOCOL}</code>، <code class='bg-slate-100 dark:bg-slate-800/80 px-1 py-0.5 rounded text-rose-500 font-mono'>{USER}</code>، <code class='bg-slate-100 dark:bg-slate-800/80 px-1 py-0.5 rounded text-rose-500 font-mono'>{PORT}</code>، <code class='bg-slate-100 dark:bg-slate-800/80 px-1 py-0.5 rounded text-rose-500 font-mono'>{PREFIX}</code>، <code class='bg-slate-100 dark:bg-slate-800/80 px-1 py-0.5 rounded text-rose-500 font-mono'>{IP}</code>، <code class='bg-slate-100 dark:bg-slate-800/80 px-1 py-0.5 rounded text-rose-500 font-mono'>{HOST}</code>، <code class='bg-slate-100 dark:bg-slate-800/80 px-1 py-0.5 rounded text-rose-500 font-mono'>{DATE}</code>، <code class='bg-slate-100 dark:bg-slate-800/80 px-1 py-0.5 rounded text-rose-500 font-mono'>{INDEX}</code>، <code class='bg-slate-100 dark:bg-slate-800/80 px-1 py-0.5 rounded text-rose-500 font-mono'>{WORKER}</code>.<br><span class='text-[10px] text-slate-400 dark:text-slate-500 leading-snug'>• <b>{FLAG}</b>: ایموجی پرچم کشور (مثلاً 🇺🇸).<br>• <b>{COUNTRY}</b>: نام کشور (مثلاً United States).<br>• <b>{CITY}</b>: نام شهر (مثلاً San Francisco).<br>• <b>{ISP}</b>: نام ارائه‌دهنده اینترنت (مثلاً Cloudflare, Inc.).<br>• <b>{PROTOCOL}</b>: پروتکل اصلی هسته (VLESS / Trojan).<br>• <b>{USER}</b>: نام یا شناسه مشترک.<br>• <b>{PORT}</b>: پورت فعال اتصال.<br>• <b>{PREFIX}</b>: پیشوند نام دلخواه.<br>• <b>{IP}</b>: آدرس آی‌پی تمیز.<br>• <b>{HOST}</b>: نام دامنه هاست.<br>• <b>{DATE}</b>: تاریخ جاری (YYYY-MM-DD).<br>• <b>{INDEX}</b>: شماره ردیف کانفیگ (0, 1, 2...).<br>• <b>{WORKER}</b>: نام اسکریپت کارگر ابری.</span><br>طرح‌های از پیش تعریف شده: <code>default</code>، <code>type-user-port</code>، <code>user-port</code>، <code>host-port-user</code>، <code>prefix-user-port</code>، <code>ip</code>.",
-                }
-          };
-
-          const CHANGELOG_DATA = {
-              "2.9.0": {
-                  headline: { en: "Protocol Fix & Per-Config Node Routing", fa: "رفع پروتکل و مسیریابی نود به‌ازای هر کانفیگ" },
-                  added: [
-                      { en: "Per-config node routing for beta protocol via WebSocket path payload — beta nodes now route through their designated gateway IP just like alpha", fa: "مسیریابی نود به‌ازای هر کانفیگ پروتکل بتا از طریق مسیر وب‌ساکت — نودهای بتا اکنون مانند آلفا از طریق آدرس دروازه تعیین‌شده مسیریابی می‌کنند" },
-                      { en: "Server-side node index extraction with triple fallback: query parameter → numeric path segment → base64 JSON payload", fa: "استخراج شاخص نود سمت سرور با زنجیره سه‌گانه بازگشت: پارامتر کوئری → بخش عددی مسیر → بار پیلود JSON باینری" },
-                      { en: "Device connection limit per user (connLimit) — cap simultaneous connections per subscriber", fa: "محدودیت اتصال دستگاه به‌ازای هر کاربر (connLimit) — محدود کردن اتصالات همزمان هر مشترک" },
-                      { en: "Panel API key system for secure node-to-panel authentication", fa: "سیستم کلید API پنل برای احراز هویت امن اتصال نود به پنل" },
-                      { en: "Mobile-friendly add/edit user modals with improved responsive layout", fa: "فرم‌های افزودن/ویرایش کاربر سازگار با موبایل با طرح‌بندی واکنش‌گرا بهبودیافته" }
-                  ],
-                  fixed: [
-                      { en: "Fixed beta protocol header offset parsing — beta connections were silently dropping payload data after the port field", fa: "رفع خطای اندازه‌گیری افست هدر پروتکل بتا — اتصالات بتا به‌طور خاموش داده پس از فیلد پورت را حذف می‌کردند" },
-                      { en: "Fixed beta protocol authentication — password was set to generated internal ID instead of raw user identifier, causing permanent auth failure", fa: "رفع احراز هویت پروتکل بتا — رمز عبور به‌جای شناسه داخلی تولیدشده از شناسه خام کاربر استفاده می‌کند" },
-                      { en: "Added SHA224 hash registration in configRegistry so beta lookup works when isolate is warm", fa: "افزودن ثبت هش SHA224 در configRegistry تا جستجوی بتا در isolate گرم کار کند" },
-                      { en: "Removed Maintenance Hosts and Sync API Key fields from Advanced tab network section as requested", fa: "حذف فیلدهای میزبان‌های نگهداری و کلید API همگام‌سازی از بخش شبکه پیشرفته" }
-                  ],
-                  improved: [
-                      { en: "Beta node routing now uses the same base64 JSON WebSocket path payload format as alpha for maximum client compatibility", fa: "مسیریابی نود بتا اکنون از همان قالب پیلود مسیر وب‌ساکت JSON باینری آلفا برای حداکثر سازگاری استفاده می‌کند" },
-                      { en: "Node resolution uses getEffectivePips with NAT64 awareness for both alpha and beta protocols", fa: "解析 نود از getEffectivePips با آگاهی NAT64 برای هر دو پروتکل آلفا و بتا استفاده می‌کند" },
-                      { en: "Added reqPath variable to buildYamlProfile for consistent path generation", fa: "افزودن متغیر reqPath به buildYamlProfile برای تولید مسیر یکپارچه" }
-                  ],
-                  notes: []
-              },
-              "2.6.0": {
-                  headline: { en: "Bilingual Subscription Page & NAT64 Support", fa: "صفحه اشتراک چندزبانه و پشتیبانی NAT64" },
-                  added: [
-                      { en: "Full Persian and English language support on the subscription info page with RTL layout", fa: "پشتیبانی کامل از فارسی و انگلیسی در صفحه اطلاعات اشتراک با چیدمان RTL" },
-                      { en: "Dark and light mode toggle on the subscription page with saved preference", fa: "قابلیت تغییر حالت تاریک/روشن در صفحه اشتراک با ذخیره ترجیح کاربر" },
-                      { en: "NAT64 support for automatic IPv4 to IPv6 address conversion", fa: "پشتیبانی NAT64 برای تبدیل خودکار آدرس IPv4 به IPv6" },
-                      { en: "Per-user custom hostnames for multi-region deployments", fa: "هاست‌های اختصاصی برای هر کاربر جهت استقرار چند منطقه‌ای" },
-                      { en: "Direct connection configs that work without gateway IPs", fa: "کانفیگ‌های اتصال مستقیم بدون نیاز به آدرس دروازه" },
-                      { en: "Auto update from GitHub directly inside the dashboard", fa: "بروزرسانی خودکار از GitHub مستقیماً از داشبورد" },
-                      { en: "Customizable fake subscription entries with usage and expiry display", fa: "ورودی‌های اشتراک جعلی سفارشی با نمایش مصرف و انقضا" },
-                      { en: "Full gateway management via Telegram inline buttons", fa: "مدیریت کامل دروازه از طریق دکمه‌های اینلاین تلگرام" }
-                  ],
-                  fixed: [
-                      { en: "Fixed garbled Persian text in the user interface", fa: "اصلاح متن‌های فارسی نادرست در رابط کاربری" },
-                      { en: "Fixed subscription page not loading properly", fa: "رفع مشکل بارگذاری صفحه اشتراک" }
-                  ],
-                  improved: [
-                      { en: "Significantly faster dashboard scrolling and page loading", fa: "سرعت اسکرول و بارگذاری صفحات داشبورد بهبود چشمگیر یافت" },
-                      { en: "Rewritten config generators for better compatibility", fa: "بازنویسی مولدهای کانفیگ برای سازگاری بهتر" },
-                      { en: "Faster and more accurate country flag detection", fa: "سرعت و دقت نمایش پرچم کشورها بهبود یافت" },
-                      { en: "New config naming tags: country, city, ISP, date, and worker name", fa: "تگ‌های جدید نامگذاری: کشور، شهر، ارائه‌دهنده، تاریخ و نام ورکر" }
-                  ],
-                  notes: []
-              },
-              "2.5.8": {
-                  headline: { en: "Advanced Naming Tags & GeoIP Tag Engine", fa: "موتور نامگذاری پیشرفته با تگ‌های جغرافیایی" },
-                  added: [
-                      { en: "Added 7 new config naming placeholders: {COUNTRY}, {CITY}, {ISP}, {HOST}, {DATE}, {INDEX}, {WORKER}", fa: "اضافه شدن ۷ متغیر جدید نامگذاری: {COUNTRY}، {CITY}، {ISP}، {HOST}، {DATE}، {INDEX}، {WORKER}" },
-                      { en: "Replaced single-purpose flag API with batch ip-api.com GeoIP enrichment for country, city, and ISP data", fa: "جایگزینی API پرچم با غنی‌سازی GeoIP دسته‌ای ip-api.com برای داده‌های کشور، شهر و ارائه‌دهنده اینترنت" },
-                      { en: "Added tag validation engine that detects and reports unknown/invalid tags in naming strategies", fa: "افزودن موتور اعتبارسنجی تگ که تگ‌های ناشناخته یا نامعتبر در استراتژی نامگذاری را شناسایی و گزارش می‌کند" }
-                  ],
-                  fixed: [
-                      { en: "GeoIP cache now stores full geo metadata (country, city, ISP) instead of only flag emoji", fa: "کش GeoIP اکنون فراداده‌های کامل جغرافیایی (کشور، شهر، ارائه‌دهنده) را به جای فقط ایموجی پرچم ذخیره می‌کند" }
-                  ],
-                  improved: [
-                      { en: "Config name generation now receives config index for sequential naming patterns via {INDEX}", fa: "تولید نام کانفیگ اکنون شماره ردیف را برای الگوهای نامگذاری متوالی از طریق {INDEX} دریافت می‌کند" },
-                      { en: "Updated dashboard documentation with full list of all 13 supported naming tags in English and Persian", fa: "به‌روزرسانی مستندات داشبورد با لیست کامل ۱۳ تگ نامگذاری پشتیبانی شده در فارسی و انگلیسی" }
-                  ],
-                  notes: []
-              },
-              "2.5.7": {
-                  headline: { en: "Dynamic Multi-IP Failover & Keyless Country Flagging", fa: "لینک هوشمند آی‌پی‌ها، بهبود کلودفلر و نگاشت پرچم بدون تحریم" },
-                  added: [
-                      { en: "Support entering custom clean IPs, gateway IPs, and custom config names for each subscriber dynamically in Add/Edit user modals, with automatic extraction and seamless database merging", fa: "امکان ثبت آی‌پی تمیز دلخواه، آی‌پی دروازه دلخواه و نام کانفیگ دلخواه برای هر کاربر به صورت مجزا با قابلیت استخراج خودکار و ادغام هوشمند" },
-                      { en: "Integrated free, open-source and keyless api.country.is for country flag mapping of IP addresses", fa: "یکپارچه‌سازی وب‌سرویس رایگان و متن‌باز api.country.is جهت نگاشت پرچم کشورهای مربوط به آدرس‌های آی‌پی" }
-                  ],
-                  fixed: [
-                      { en: "Resolved Cloudflare API compatibility flag error ('No such compatibility flag: unsafe-eval' and startup 'Uncaught EvalError') by updating to 'allow_eval_during_startup'", fa: "رفع خطای ناسازگاری فلگ کلودفلر (خطای عدم وجود فلگ unsafe-eval و خطای زمان شروع کار EvalError) در بخش استقرار خودکار با بازنویسی به فلگ مدرن allow_eval_during_startup" },
-                      { en: "Fixed a critical issue where selecting multiple gateway IPs for a user caused session disruptions (IP splitting) on sites behind Cloudflare, resolved via user-consistent hashing and smart gateway failover", fa: "رفع مشکل عدم باز شدن وب‌سایت‌های پشت کلودفلر هنگام انتخاب چندین آی‌پی دروازه با پیاده‌سازی مکانیزم Hashing پایدار کاربر و سوییچ خودکار (Failover) بر روی دروازه‌های جایگزین" },
-                      { en: "Fixed client-side regular expression parsing to correctly split global IPs separated by backslashes, tabs, commas, or semicolons in the browser", fa: "اصلاح عبارات منظم فرانت‌اند در مروگر جهت تفکیک صحیح لیست آی‌پی‌های تفکیک شده با اینتر، ویرگول، نقطه ویرگول یا بک‌اسلش" }
-                  ],
-                  improved: [
-                      { en: "Enhanced reliability of user management dashboard modals and subscription validation logic", fa: "بهبود پایداری پنجره‌های مدیریتی داشبورد و منطق بررسی اعتبار اشتراک‌ها" }
-                  ],
-                  notes: []
-              },
-              "2.5.6.1": {
-                  headline: { en: "Multi-IP Management & Crucial Bug Fixes", fa: "مدیریت آی‌پی‌های چندگانه و رفع خطاهای بحرانی" },
-                  added: [
-                       { en: "Support setting custom config name, custom gateway IP, and custom clean IP for each user dynamically in the Add User modal", fa: "اضافه شدن امکان ثبت نام کانفیگ دلخواه، آی‌پی دروازه اختصاصی و آی‌پی تمیز اختصاصی به صورت مجزا برای هر کاربر در پنجره افزودن کاربر" }
-                  ],
-                  fixed: [
-                      { en: "Fixed a critical JavaScript rollback error ('ReferenceError: proxyIp is not defined') when adding a new user", fa: "رفع خطای بحرانی جاوااسکریپت ('ReferenceError: proxyIp is not defined') هنگام تلاش برای افزودن یک کاربر جدید" }
-                  ],
-                  improved: [
-                      { en: "Streamlined alignment of custom user values with subscription generation", fa: "بهبود همگام‌سازی مقادیر اختصاصی کاربران با فرایند ساخت کانفیگ‌ها در اشتراک" }
-                  ],
-                  notes: []
-              },
-              "2.5.6": {
-                  headline:                { en: "Multiple Gateway IPs & Flag Matching", fa: "آی‌پی‌های دروازه متعدد و انطباق پرچم" },
-                  added: [
-                      { en: "Support multi-gateway IP lists (rotated/distributed across generated configs to bypass Cloudflare limits)", fa: "پشتیبانی از لیست‌های آی‌پی دروازه چندگانه (چرخش و توزیع خودکار میان کانفیگ‌ها برای عبور از محدودیت‌های کلودفلر)" },
-                      { en: "Proper country flag matching for configs based on the actual gateway IP used", fa: "انطباق صحیح پرچم کشور برای کانفیگ‌ها بر اساس آی‌پی دروازه واقعی استفاده‌شده" }
-                  ],
-                  fixed: [
-                      { en: "Fixed outbound transport and websocket configurations formatting errors", fa: "رفع خطاهای فرمت‌دهی در کانفیگ‌های حمل و نقل خروجی و وب‌ساکت" }
-                  ],
-                  improved: [
-                      { en: "Distributed multiple gateway IPs evenly across subscription sub-configs", fa: "توزیع یکنواخت چندین آی‌پی دروازه میان زیرکانفیگ‌های اشتراک" },
-                      { en: "Enhanced IP API resolving and flag caching logic", fa: "بهبود منطق حل‌وفصل و کش پرچم برای آی‌پی‌ها" }
-                  ],
-                  notes: []
-              },
-              "2.5.5": {
-                  headline: { en: "One-Click Panel Update", fa: "بروزرسانی پنل با یک کلیک" },
-                  added: [
-                      { en: "Update the panel directly from the admin panel — no need to use Cloudflare dashboard", fa: "بروزرسانی پنل مستقیماً از پنل مدیریت — بدون نیاز به داشبورد کلودفلر" },
-                      { en: "One-click deployment inside the panel for quick and easy updates", fa: "نصب با یک کلیک داخل پنل برای بروزرسانی سریع و آسان" },
-                  ],
-                  fixed: [],
-                  improved: [
-                      { en: "Improved stability and reliability of the update system", fa: "بهبود پایداری و اطمینان سیستم بروزرسانی" },
-                  ],
-                  notes: []
-              },
-              "2.5.4.2": {
-                  headline: { en: "Performance Optimization & Background Processing", fa: "بهینه‌سازی عملکرد و پردازش پس‌زمینه" },
-                  added: [],
-                  fixed: [],
-                  improved: [
-                      { en: "Improved system performance using smart caching (faster responses and less database load)", fa: "بهبود عملکرد سیستم با استفاده از کش هوشمند (پاسخ‌ سریع‌تر و بار کمتر روی پایگاه داده)" },
-                      { en: "Added smart caching system (TTL) for configuration and usage data", fa: "افزودن سیستم کش هوشمند (TTL) برای داده‌های تنظیمات و مصرف" },
-                      { en: "Reduced database calls to make the panel faster and more efficient", fa: "کاهش درخواست‌ها به پایگاه داده برای سریع‌تر و کاراتر شدن پنل" },
-                      { en: "Background processing added for non-critical tasks to improve speed", fa: "افزودن پردازش پس‌زمینه برای کارهای غیربحرانی جهت بهبود سرعت" },
-                  ],
-                  notes: []
-              },
-              "2.5.4.1": {
-                  headline: { en: "Security Hotfix — Bot Authorization", fa: "اصلاح امنیتی — احراز هویت ربات" },
-                  added: [],
-                  fixed: [
-                      { en: "Fixed critical issue where unauthorized users could access bot and panel data via Worker", fa: "رفع مشکل بحرانی دسترسی کاربران غیرمجاز به اطلاعات ربات و پنل از طریق Worker" },
-                      { en: "Added proper Telegram user ID validation for all Worker-related requests", fa: "افزودن بررسی صحیح آیدی عددی تلگرام برای تمام درخواست‌های مربوط به Worker" },
-                  ],
-                  improved: [
-                      { en: "Only users with approved admin IDs can interact with the bot and access panel data", fa: "فقط کاربرانی که آیدی آن‌ها در لیست ادمین‌ها ثبت شده باشد اجازه دسترسی به ربات و اطلاعات پنل را دارند" },
-                      { en: "Unauthorized users now receive a clear access denied message", fa: "کاربران غیرمجاز اکنون پیام خطای دسترسی مناسب دریافت می‌کنند" },
-                  ],
-                  notes: [
-                      { en: "Security update — recommended for all users", fa: "به‌روزرسانی امنیتی — توصیه‌شده برای تمام کاربران" },
-                  ]
-              },
-              "2.5.4": {
-                  headline: { en: "Overview Dashboard & Mobile Improvements", fa: "داشبورد نمای کلی و بهبود نمایش در موبایل" },
-                  added: [
-                      { en: "Added Overview Dashboard as the default home page", fa: "اضافه شدن داشبورد نمای کلی به عنوان صفحه اصلی پنل" },
-                      { en: "Added quick statistics and recent activity section", fa: "اضافه شدن بخش آمار سریع و فعالیت‌های اخیر" },
-                  ],
-                  fixed: [],
-                  improved: [
-                      { en: "Improved mobile responsiveness of the Overview page", fa: "بهبود نمایش صفحه نمای کلی در موبایل" },
-                      { en: "Localized traffic units for Persian language", fa: "نمایش واحد ترافیک به فارسی در صفحه نمای کلی" },
-                  ],
-                  notes: []
-              },
-              "2.5.3": {
-                  headline: { en: "Telegram Bot Fixes & Formatting Cleanup", fa: "رفع مشکلات ربات تلگرام و اصلاح فرمت‌بندی" },
-                  added: [],
-                  fixed: [
-                      { en: "Fixed admin buttons not showing immediately after /start in some cases", fa: "رفع مشکل نمایش ندادن دکمه‌های مدیر بلافاصله پس از /start در بعضی موارد" },
-                      { en: "Fixed subscription link button returning per-user links instead of master link", fa: "رفع مشکل بازگشت لینک‌های کاربری به جای لینک اصلی هنگام فشردن دکمه لینک اشتراک" },
-                      { en: "Fixed duplicate messages when clicking Update Usage with unchanged stats", fa: "رفع مشکل ارسال پیام تکراری هنگام فشردن بروزرسانی مصرف بدون تغییر آمار" },
-                      { en: "Fixed <code> tags showing as raw text in Telegram messages", fa: "رفع مشکل نمایش تگ‌های <code> به صورت متن خام در پیام‌های تلگرام" },
-                      { en: "Fixed subscription links not being clickable in Telegram", fa: "رفع مشکل غیرقابل کلیک بودن لینک‌های اشتراک در تلگرام" },
-                  ],
-                  improved: [
-                      { en: "Subscription links now use tap-to-copy formatting in Telegram", fa: "لینک‌های اشتراک اکنون با فرمت کپی با یک لمس در تلگرام نمایش داده می‌شوند" },
-                      { en: "UUIDs now use tap-to-copy formatting in user lists and detail views", fa: "شناسه‌های یکتا اکنون با فرمت کپی با یک لمس در لیست و جزئیات کاربران نمایش داده می‌شوند" },
-                      { en: "Bot menu now correctly shows admin options on first interaction after login", fa: "منوی ربات اکنون گزینه‌های مدیریتی را در اولین تعامل پس از ورود به درستی نمایش می‌دهد" },
-                      { en: "Update Usage button now edits the existing message instead of sending a new one", fa: "دکمه بروزرسانی مصرف اکنون پیام موجود را ویرایش می‌کند به جای ارسال پیام جدید" },
-                  ],
-                  notes: [
-                      { en: "No breaking changes — fully backward compatible", fa: "بدون تغییرات ناسازگار — کاملاً سازگار با نسخه‌های قبلی" },
-                  ]
-              },
-              "2.5.2": {
-                  headline: { en: "Modal Responsiveness & Mobile UX", fa: "واکنش‌گرایی مودال و تجربه کاربری موبایل" },
-                  added: [],
-                  fixed: [],
-                  improved: [
-                      { en: "Improved Add/Edit User modal responsiveness on all screen sizes", fa: "بهبود واکنش‌گرایی مودال افزودن/ویرایش کاربر در تمام اندازه‌های صفحه" },
-                      { en: "Added sticky action buttons in modals for better mobile support", fa: "افزودن دکمه‌های شناور در مودال‌ها برای پشتیبانی بهتر از موبایل" },
-                      { en: "Enhanced scrolling behavior — form content scrolls independently while buttons stay visible", fa: "بهبود رفتار اسکرول — محتوای فرم به‌طور مستقل اسکرول می‌شود در حالی که دکمه‌ها قابل مشاهده باقی می‌مانند" },
-                      { en: "Improved overall user experience when managing subscribers", fa: "بهبود تجربه کاربری هنگام مدیریت مشترکین" },
-                  ],
-                  notes: [
-                      { en: "No breaking changes — fully backward compatible", fa: "بدون تغییرات ناسازگار — کاملاً سازگار با نسخه‌های قبلی" },
-                  ]
-              },
-              "2.5.1": {
-                  headline: { en: "Simplified Panel Management & Bot Stability", fa: "مدیریت ساده‌شده پنل و پایداری ربات" },
-                  added: [
-                      { en: "Web login signal system — bot auto-detects the last active web-logged panel", fa: "سیستم سیگنال ورود وب — ربات به‌طور خودکار آخرین پنل واردشده از وب را شناسایی می‌کند" },
-                      { en: "Login sync endpoint (/tg/sync_panel) for remote panels to notify the hub on admin login", fa: "نقطه پایانی همگام‌سازی ورود (/tg/sync_panel) برای اطلاع‌رسانی پنل‌های راهدور به هاب هنگام ورود مدیر" },
-                      { en: "Hub panel URL config (hubPanelUrl) for remote panels to signal login events", fa: "پیکربندی آدرس هاب پنل (hubPanelUrl) برای ارسال سیگنال ورود از پنل‌های راهدور" },
-                      { en: "Full user management via Telegram bot (create, edit, delete, search, disable, re-enable)", fa: "مدیریت کامل کاربران از طریق ربات تلگرام (ایجاد، ویرایش، حذف، جستجو، غیرفعال‌سازی، فعال‌سازی مجدد)" },
-                      { en: "HTTP REST API for all user operations at /api/users (GET, POST, PUT, DELETE)", fa: "API جدید REST برای تمام عملیات کاربران در /api/users" },
-                      { en: "Statistics API at /api/stats with user counts, traffic totals, and system status", fa: "API آمار در /api/stats با تعداد کاربران، مجموع ترافیک و وضعیت سیستم" },
-                  ],
-                  fixed: [
-                      { en: "Removed multi-panel selection system that caused session confusion and incorrect panel switching", fa: "حذف سیستم انتخاب چندپنلی که باعث سردرگمی نشست و جابجایی نادرست پنل می‌شد" },
-                      { en: "Fixed bot not responding after pressing /start due to stale step state", fa: "رفع مشکل پاسخ ندادن ربات پس از فشار دادن /start به دلیل وضعیت مرحله قدیمی" },
-                      { en: "Fixed panel context mixing when switching between panels", fa: "رفع مشکل ترکیب زمینه پنل هنگام جابجایی بین پنل‌ها" },
-                      { en: "Fixed race condition in bot state persistence from non-blocking D1 writes", fa: "رفع مشکل شرایط مسابقه در ماندگاری وضعیت ربات ناشی از نوشتن غیرهمزمان D1" },
-                  ],
-                  improved: [
-                      { en: "/start now directly opens panel management based on last web login — no panel selection menu", fa: "/start اکنون مستقیماً مدیریت پنل را بر اساس آخرین ورود وب باز می‌کند — بدون منوی انتخاب پنل" },
-                      { en: "Bot automatically links Telegram session to the last active web-logged panel", fa: "ربات به‌طور خودکار نشست تلگرام را به آخرین پنل فعال واردشده از وب متصل می‌کند" },
-                      { en: "Simplified bot logic with clean 1-to-1 mapping between web login and Telegram session", fa: "ساده‌سازی منطق ربات با نگاشت یک‌به‌یک بین ورود وب و نشست تلگرام" },
-                      { en: "Telegram bot main menu redesigned with inline keyboard layout for mobile-first management", fa: "منوی اصلی ربات تلگرام با طرح‌بندی کیبورد درون‌خطی برای مدیریت موبایل‌محور بازطراحی شد" },
-                  ],
-                  notes: [
-                      { en: "Single-panel mode works more reliably — it is recommended to use one Telegram bot per panel for best stability", fa: "حالت تک‌پنلی پایدارتر است — توصیه می‌شود برای بهترین پایداری از یک ربات تلگرام برای هر پنل استفاده کنید" },
-                      { en: "For multi-panel setups: set hubPanelUrl on each remote panel to enable automatic login sync", fa: "برای تنظیمات چندپنلی: hubPanelUrl را روی هر پنل راهدور تنظیم کنید تا همگام‌سازی خودکار ورود فعال شود" },
-                      { en: "Each panel having its own dedicated bot improves session accuracy and prevents panel mix-up issues", fa: "داشتن ربات اختصاصی برای هر پنل، دقت نشست را بهبود می‌دهد و از مشکلات ترکیب پنل جلوگیری می‌کند" },
-                      { en: "API endpoints are authenticated via Master Key (Bearer token or ?key= parameter)", fa: "نقاط پایانی API از طریق کلید اصلی احراز هویت می‌شوند (توکن Bearer یا پارامتر ?key=)" },
-                  ]
-              },
-              "2.5.0": {
-                  headline: { en: "User Auto-Disable & Management Improvements", fa: "غیرفعال‌سازی خودکار کاربر و بهبود مدیریت" },
-                  added: [
-                      { en: "Automatic user disable on traffic limit exceeded", fa: "غیرفعال‌سازی خودکار کاربر هنگام اتمام محدودیت ترافیک" },
-                      { en: "Automatic user disable on expiration date reached", fa: "غیرفعال‌سازی خودکار کاربر هنگام رسیدن به تاریخ انقضا" },
-                      { en: "Activity log and Telegram notification for auto-disabled users", fa: "ثبت در گزارش فعالیت و ارسال اعلان تلگرام برای کاربران غیرفعال شده خودکار" },
-                      { en: "Recently Disabled Users notification panel in Users tab", fa: "پنل اعلان کاربران اخیراً غیرفعال شده در بخش کاربران" },
-                      { en: "Status filter dropdown (All/Active/Paused/Auto-Disabled)", fa: "فیلتر وضعیت (همه/فعال/متوقف/غیرفعال خودکار)" },
-                      { en: "Auto-Disabled statistics card in dashboard", fa: "کارت آمار غیرفعال‌سازی خودکار در داشبورد" },
-                  ],
-                  fixed: [
-                      { en: "Expired users are now disabled instead of deleted", fa: "کاربران منقضی شده اکنون غیرفعال می‌شوند به جای حذف" },
-                      { en: "Users exceeding traffic limits are preserved in panel", fa: "کاربرانی که محدودیت ترافیک را رد می‌کنند در پنل حفظ می‌شوند" },
-                  ],
-                  improved: [
-                      { en: "User data, statistics, and history are now preserved", fa: "داده‌ها، آمار و تاریخچه کاربران اکنون حفظ می‌شود" },
-                      { en: "Account renewal workflow for administrators", fa: "فرآیند تمدید حساب برای مدیران" },
-                  ],
-                  notes: [
-                      { en: "Re-enabling a user clears the auto-disable reason", fa: "فعال‌سازی مجدد کاربر، دلیل غیرفعال‌سازی خودکار را پاک می‌کند" },
-                  ]
-              },
-              "2.4.9": {
-                  headline: { en: "Custom Protocol & Port Configuration", fa: "پیکربندی پروتکل و پورت سفارشی" },
-                  added: [
-                      { en: "Custom protocol mode per user (VLESS/Beta/Both)", fa: "حالت پروتکل سفارشی برای هر کاربر (VLESS/Beta/هر دو)" },
-                      { en: "Custom port configuration per user", fa: "پیکربندی پورت سفارشی برای هر کاربر" },
-                      { en: "Maximum configs limit per user", fa: "محدودیت حداکثر کانفیگ برای هر کاربر" },
-                  ],
-                  fixed: [],
-                  improved: [
-                      { en: "User management panel interface", fa: "رابط کاربری پنل مدیریت کاربران" },
-                  ],
-                  notes: []
-              }
-          };
-  
-          function renderChangelog(version) {
-              const container = document.getElementById('modal-changelog-container');
-              if (!container) return;
-              
-              const data = CHANGELOG_DATA[version];
-              if (!data) {
-                  container.innerHTML = '<p class="text-slate-400 text-xs">' + (i18n[lang]?.no_changelog || 'No changelog available for this version.') + '</p>';
-                  return;
-              }
-
-              const t = (key) => i18n[lang]?.[key] || i18n['en']?.[key] || key;
-              let html = '';
-
-              if (data.headline) {
-                  const headlineEl = document.getElementById('modal-version-headline');
-                  if (headlineEl) headlineEl.textContent = data.headline[lang] || data.headline['en'];
-              }
-
-              const sections = [
-                  { key: 'added', icon: '✨', color: 'emerald', items: data.added },
-                  { key: 'fixed', icon: '🔧', color: 'blue', items: data.fixed },
-                  { key: 'improved', icon: '⚡', color: 'violet', items: data.improved },
-                  { key: 'changed', icon: '🔄', color: 'amber', items: data.changed },
-                  { key: 'note', icon: '⚠️', color: 'red', items: data.notes },
-              ];
-
-              sections.forEach(section => {
-                  if (section.items && section.items.length > 0) {
-                      html += '<div class="mb-4">';
-                      html += '<div class="flex items-center gap-2 mb-2">';
-                      html += '<span class="text-sm">' + section.icon + '</span>';
-                      html += '<h5 class="text-xs font-bold text-' + section.color + '-600 dark:text-' + section.color + '-400 uppercase tracking-wider">' + t('changelog_' + section.key) + '</h5>';
-                      html += '</div>';
-                      html += '<div class="space-y-1.5 ps-6">';
-                      section.items.forEach(item => {
-                          html += '<div class="flex items-start gap-2">';
-                          html += '<span class="text-' + section.color + '-400 mt-1.5">•</span>';
-                          html += '<span class="text-xs text-slate-600 dark:text-slate-300">' + (item[lang] || item['en']) + '</span>';
-                          html += '</div>';
-                      });
-                      html += '</div></div>';
-                  }
-              });
-
-              container.innerHTML = html || '<p class="text-slate-400 text-xs">' + (i18n[lang]?.no_changes || 'No changes documented.') + '</p>';
-          }
-
-          let lang = localStorage.getItem('lang') || 'fa';
-          let sessionKey = "", baseRoute = window.location.pathname.split('/dash')[0];
-          let hostName = window.location.hostname, localUUID = "";
-
-          window.addEventListener('DOMContentLoaded', () => {
-              let savedSession = localStorage.getItem('lowkey_session');
-              if (savedSession) {
-                  try {
-                      let parsed = JSON.parse(savedSession);
-                      if (parsed && parsed.expiry && Date.now() < parsed.expiry) {
-                           sessionKey = parsed.key;
-                           doLogin(true).then(() => loadDashboard());
-                      } else {
-                          localStorage.removeItem('lowkey_session');
-                      }
-                  } catch(e){}
-              }
-              checkVersionPopup();
-          });
-  
-          function applyLang() {
-              document.documentElement.dir = lang === 'fa' ? 'rtl' : 'ltr';
-              document.getElementById('lang-toggle').innerText = lang === 'fa' ? 'EN' : 'فا';
-              document.querySelectorAll('[data-i18n]').forEach(el => {
-                  const key = el.getAttribute('data-i18n');
-                  if (i18n[lang] && i18n[lang][key] !== undefined && i18n[lang][key] !== null) {
-                      if (el.tagName === 'INPUT' || el.tagName === 'TEXTAREA') {
-                          el.placeholder = i18n[lang][key];
-                      } else {
-                          if (key.startsWith('html_')) {
-                              el.innerHTML = i18n[lang][key];
-                          } else {
-                              el.innerText = i18n[lang][key];
-                          }
-                      }
-                  }
-              });
-              document.querySelectorAll('[data-i18n-placeholder]').forEach(el => {
-                  const key = el.getAttribute('data-i18n-placeholder');
-                  if (i18n[lang] && i18n[lang][key] !== undefined && i18n[lang][key] !== null) {
-                      el.placeholder = i18n[lang][key];
-                  }
-              });
-              const gbUnit = i18n[lang]?.ov_gb_unit || 'GB';
-              ['ov-total-traffic','ov-today-traffic'].forEach(id => {
-                  const el = document.getElementById(id);
-                  if (el && el.textContent.trim() === '- GB') el.textContent = '- ' + gbUnit;
-              });
-              const statTrafficEl = document.getElementById('stat-total-traffic');
-              if (statTrafficEl && statTrafficEl.textContent.trim() === '0 GB') statTrafficEl.textContent = '0 ' + gbUnit;
-          }
-          function toggleLang() { 
-              lang = lang === 'fa' ? 'en' : 'fa'; 
-              localStorage.setItem('lang', lang); 
-              applyLang(); 
-              updateTitle(); 
-              updateUI(); 
-              try {
-                  const m = document.getElementById('modal-version-update');
-                  if (m && !m.classList.contains('hidden')) {
-                      renderChangelog(CURRENT_VERSION);
-                  }
-              } catch(e){}
-          }
-          applyLang();
-  
-          if (localStorage.getItem('theme') === 'dark' || (!('theme' in localStorage) && window.matchMedia('(prefers-color-scheme: dark)').matches)) {
-              document.documentElement.classList.add('dark');
-          } else {
-              document.documentElement.classList.remove('dark');
-          }
-  
-          function toggleTheme() {
-              document.documentElement.classList.toggle('dark');
-              localStorage.setItem('theme', document.documentElement.classList.contains('dark') ? 'dark' : 'light');
-          }
-
-          function checkVersionPopup() {
-              const popupKey = \`lowkey_shown_v\${CURRENT_VERSION}\`;
-              if (!localStorage.getItem(popupKey)) {
-                  setTimeout(() => {
-                      const badge = document.getElementById('modal-version-badge');
-                      if (badge) badge.textContent = 'v' + CURRENT_VERSION;
-                      renderChangelog(CURRENT_VERSION);
-                      const m = document.getElementById('modal-version-update');
-                      if (m) {
-                          m.classList.remove('hidden');
-                          m.classList.add('flex');
-                      }
-                  }, 800);
-              }
-          }
-
-          function closeVersionModal() {
-              const m = document.getElementById('modal-version-update');
-              if (m) {
-                  m.classList.add('hidden');
-                  m.classList.remove('flex');
-              }
-              const popupKey = \`lowkey_shown_v\${CURRENT_VERSION}\`;
-              localStorage.setItem(popupKey, 'true');
-          }
-  
-          function updateTitle() {
-              const activeTab = document.querySelector('.nav-item.active span');
-              if(activeTab) document.getElementById('view-title').innerText = activeTab.innerText;
-          }
-  
-          function switchTab(tab) {
-            ['overview','info','network','settings','advanced','logs','users'].forEach(t => {
-                  const view = document.getElementById('view-'+t);
-                  const deskBtn = document.getElementById('tab-'+t);
-                  const mobBtn = document.getElementById('mob-tab-'+t);
-                  if (tab === t) {
-                      view.classList.remove('hidden'); view.classList.add('block', 'fade-in');
-                      deskBtn.classList.add('active'); mobBtn.classList.add('active');
-                  } else {
-                      view.classList.add('hidden'); view.classList.remove('block', 'fade-in');
-                      deskBtn.classList.remove('active'); mobBtn.classList.remove('active');
-                  }
-              });
-            document.getElementById('view-add-user').classList.add('hidden');
-            document.getElementById('view-edit-user').classList.add('hidden');
-            var sc = document.querySelector('.scroll-content');
-            sc.style.overflow = '';
-            sc.classList.remove('flex', 'flex-col');
-            sc.firstElementChild.classList.remove('flex-1', 'min-h-0', 'flex', 'flex-col');
-            updateTitle();
-            var sc = document.querySelector('.scroll-content');
-            if (sc) sc.scrollTop = 0;
-            if(tab === 'overview') loadDashboard();
-            if(tab === 'logs') loadLogs();
-            if(tab === 'network') doLogin(true); // refresh metrics
-        }
-
-        async function loadLogs() {
-            const container = document.getElementById('logs-container');
-            if(!container) return;
-            container.innerHTML = '<p class="text-sm text-slate-400 text-center py-4">' + (i18n[lang]?.loading_logs || 'Loading logs...') + '</p>';
-            try {
-                const res = await fetch(baseRoute + '/api/logs', { method: 'POST', body: JSON.stringify({ key: sessionKey }) });
-                const data = await res.json();
-                if (data.success && data.logs) {
-                    if (data.logs.length === 0) {
-                        container.innerHTML = '<p class="text-sm text-slate-400 text-center py-4">' + (i18n[lang]?.no_activity_logs || 'No activity logs found.') + '</p>';
+                    const backupUsers = JSON.parse(e.target.result);
+                    if (!Array.isArray(backupUsers)) {
+                        alert('❌ فایل پشتیبان نامعتبر است! ساختار فایل باید آرایه‌ای از کاربران باشد.');
                         return;
                     }
-                    let logsHtml = '';
-                    data.logs.forEach(log => {
-                        const dateStr = new Date(log.ts).toLocaleString('en-US', {hour12: false});
-                        logsHtml += \`<div class="flex flex-col sm:flex-row sm:items-center justify-between p-3 bg-slate-50 dark:bg-slate-800 rounded-xl border border-slate-100 dark:border-darkborder/50 gap-2"><div><p class="text-sm font-bold text-slate-700 dark:text-slate-200">\${log.type}</p><p class="text-xs text-slate-500 truncate max-w-[200px] sm:max-w-xs" title="\${log.detail}">\${log.detail}</p></div><span class="text-[10px] font-mono text-slate-400 bg-white dark:bg-darkcard px-2 py-1 rounded shrink-0">\${dateStr}</span></div>\`;
-                    });
-                    container.innerHTML = logsHtml;
-                } else {
-                    container.innerHTML = '<p class="text-sm text-red-400 text-center py-4">Failed to load logs.</p>';
+                    const validBackupUsers = backupUsers.filter(u => u && typeof u === 'object' && u.username);
+                    if (validBackupUsers.length === 0) {
+                        alert('❌ هیچ کاربر معتبری در فایل پشتیبان یافت نشد!');
+                        return;
+                    }
+                    const existingUsernames = new Set((window.allUsers || []).map(u => u.username));
+                    const duplicates = validBackupUsers.filter(u => existingUsernames.has(u.username));
+                    let overwrite = false;
+                    if (duplicates.length > 0) {
+                        overwrite = confirm('⚠️ تعداد ' + duplicates.length + ' کاربر تکراری شناسایی شد. آیا می‌خواهید اطلاعات آن‌ها با فایل پشتیبان بازنویسی شود؟\\n(در صورت انتخاب لغو، کاربران تکراری نادیده گرفته می‌شوند)');
+                    }
+                    if (importBtn) importBtn.disabled = true;
+                    if (exportBtn) exportBtn.disabled = true;
+                    if (closeBtn) closeBtn.disabled = true;
+                    let successCount = 0;
+                    let currentStep = 0;
+                    for (const u of validBackupUsers) {
+                        currentStep++;
+                        if (importBtn) {
+                            importBtn.innerText = '⏳ بازیابی (' + currentStep + '/' + validBackupUsers.length + ')';
+                        }
+                        const exists = existingUsernames.has(u.username);
+                        if (exists) {
+                            if (overwrite) {
+                                try {
+                                    // Delete first
+                                    await fetch('/api/users/' + encodeURIComponent(u.username), { method: 'DELETE' });
+                                    // Post
+                                    const res = await fetch('/api/users', {
+                                        method: 'POST',
+                                        headers: { 'Content-Type': 'application/json' },
+                                        body: JSON.stringify({
+                                            username: u.username,
+                                            uuid: u.uuid,
+                                            limit_gb: u.limit_gb,
+                                            expiry_days: u.expiry_days,
+                                            limit_req: u.limit_req,
+                                            ips: u.ips,
+                                            tls: u.tls,
+                                            port: u.port,
+                                            fingerprint: u.fingerprint,
+                                            ip_limit: u.ip_limit !== undefined ? u.ip_limit : u.max_connections,
+                                            used_gb: u.used_gb,
+                                            used_req: u.used_req,
+                                            created_at: u.created_at,
+                                            is_active: u.is_active
+                                        })
+                                    });
+                                    if (res.ok) successCount++;
+                                } catch(err) {}
+                            }
+                        } else {
+                            try {
+                                const res = await fetch('/api/users', {
+                                    method: 'POST',
+                                    headers: { 'Content-Type': 'application/json' },
+                                    body: JSON.stringify({
+                                        username: u.username,
+                                        uuid: u.uuid,
+                                        limit_gb: u.limit_gb,
+                                        expiry_days: u.expiry_days,
+                                        limit_req: u.limit_req,
+                                        ips: u.ips,
+                                        tls: u.tls,
+                                        port: u.port,
+                                        fingerprint: u.fingerprint,
+                                        ip_limit: u.ip_limit !== undefined ? u.ip_limit : u.max_connections,
+                                        used_gb: u.used_gb,
+                                        used_req: u.used_req,
+                                        created_at: u.created_at,
+                                        is_active: u.is_active
+                                    })
+                                });
+                                if (res.ok) successCount++;
+                            } catch(err) {}
+                        }
+                    }
+                    alert('✅ عملیات بازیابی با موفقیت انجام شد. ' + successCount + ' کاربر بازیابی شدند.');
+                    toggleSettingsModal(false);
+                    await loadUsers(true);
+                } catch(err) {
+                    alert('❌ خطا در خواندن یا پردازش فایل پشتیبان!');
+                } finally {
+                    if (importBtn) {
+                        importBtn.disabled = false;
+                        importBtn.innerText = '📥 بارگذاری بک‌آپ';
+                    }
+                    if (exportBtn) exportBtn.disabled = false;
+                    if (closeBtn) closeBtn.disabled = false;
+                    event.target.value = '';
                 }
-            } catch (err) {
-                container.innerHTML = '<p class="text-sm text-red-400 text-center py-4">Error loading logs.</p>';
-            }
+            };
+            reader.readAsText(file);
         }
-
-        async function loadDashboard() {
+        async function changeAdminPassword() {
+            const currentPwd = document.getElementById('change-pwd-current').value;
+            const newPwd = document.getElementById('change-pwd-new').value;
+            const btn = document.getElementById('change-pwd-btn');
+            if (!currentPwd || !newPwd) {
+                alert('⚠️ وارد کردن رمز عبور فعلی و جدید الزامی است!');
+                return;
+            }
+            if (newPwd.length < 4) {
+                alert('⚠️ رمز عبور جدید باید حداقل ۴ کاراکتر باشد!');
+                return;
+            }
+            btn.disabled = true;
+            btn.innerText = 'در حال تغییر...';
             try {
-                const [statsRes, logsRes] = await Promise.all([
-                    fetch(baseRoute + '/api/stats', { method: 'GET', headers: { 'Authorization': 'Bearer ' + sessionKey } }),
-                    fetch(baseRoute + '/api/logs', { method: 'POST', body: JSON.stringify({ key: sessionKey }) })
-                ]);
-                const statsData = await statsRes.json();
-                const logsData = await logsRes.json();
-
-                if (statsData.success && statsData.stats) {
-                    const s = statsData.stats;
-                    document.getElementById('ov-total-users').textContent = s.users.total;
-                    document.getElementById('ov-active-users').textContent = s.users.active;
-                    document.getElementById('ov-paused-users').textContent = s.users.paused;
-                    document.getElementById('ov-auto-disabled').textContent = s.users.autoDisabled;
-                    document.getElementById('ov-expired-users').textContent = s.users.expired;
-                    document.getElementById('ov-total-traffic').textContent = s.traffic.totalGB + ' ' + (i18n[lang]?.ov_gb_unit || 'GB');
-                    document.getElementById('ov-total-reqs').textContent = s.traffic.totalRequests.toLocaleString();
-                    document.getElementById('ov-today-traffic').textContent = s.traffic.dailyGB + ' ' + (i18n[lang]?.ov_gb_unit || 'GB');
-                    document.getElementById('ov-today-reqs').textContent = s.traffic.dailyRequests.toLocaleString();
-                    document.getElementById('ov-active-conns').textContent = s.system.activeConnections;
-                    document.getElementById('ov-version').textContent = 'v' + s.system.version;
-                }
-
-                const actList = document.getElementById('ov-activity-list');
-                if (logsData.success && logsData.logs && logsData.logs.length > 0) {
-                    let actHtml = '';
-                    logsData.logs.slice(0, 8).forEach(log => {
-                        const dateStr = new Date(log.ts).toLocaleString('en-US', {hour12: false});
-                        const typeColors = { 'Auth Success': 'bg-emerald-500', 'Auth Failed': 'bg-red-500', 'User Created': 'bg-blue-500', 'User Deleted': 'bg-red-500', 'User Toggled': 'bg-amber-500', 'User Updated': 'bg-indigo-500', 'User Auto-Disabled': 'bg-red-500', 'Traffic Reset': 'bg-cyan-500', 'Config Changed': 'bg-violet-500' };
-                        const dotColor = typeColors[log.type] || 'bg-slate-400';
-                        actHtml += '<div class="flex items-center gap-3 p-3 bg-slate-50 dark:bg-slate-800/50 rounded-xl"><div class="w-2 h-2 rounded-full shrink-0 ' + dotColor + '"></div><div class="flex-1 min-w-0"><p class="text-sm font-semibold text-slate-700 dark:text-slate-200 truncate">' + log.type + '</p><p class="text-[11px] text-slate-400 truncate">' + log.detail + '</p></div><span class="text-[10px] font-mono text-slate-400 shrink-0">' + dateStr + '</span></div>';
-                    });
-                    actList.innerHTML = actHtml;
+                const response = await fetch('/api/change-password', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ current_password: currentPwd, new_password: newPwd })
+                });
+                const data = await response.json();
+                if (response.ok && data.success) {
+                    alert('✅ رمز عبور با موفقیت تغییر کرد.');
+                    document.getElementById('change-pwd-current').value = '';
+                    document.getElementById('change-pwd-new').value = '';
+                    toggleSettingsModal(false);
                 } else {
-                    actList.innerHTML = '<p class="text-sm text-slate-400 text-center py-6">' + (i18n[lang]?.no_recent_activity || 'No recent activity.') + '</p>';
+                    alert('❌ خطا: ' + (data.error || 'عملیات ناموفق بود'));
                 }
             } catch (err) {
-                console.error('Dashboard load error:', err);
+                alert('خطا در برقراری ارتباط با سرور');
+            } finally {
+                btn.disabled = false;
+                btn.innerText = 'تغییر رمز عبور';
             }
-            loadApiKeys();
         }
-
-          function copyData(id) {
-              const input = document.getElementById(id); input.select(); navigator.clipboard.writeText(input.value);
-              const toast = document.getElementById('copy-toast');
-              toast.style.transform = 'translate(-50%, 0)'; toast.style.opacity = '1';
-              setTimeout(() => { toast.style.transform = 'translate(-50%, -5rem)'; toast.style.opacity = '0'; }, 2000);
-          }
-          
-          function showQR(name, url) {
-              document.getElementById('qr-modal-title').innerText = name;
-              document.getElementById('qr-modal-img').src = "https://api.qrserver.com/v1/create-qr-code/?size=300x300&data=" + encodeURIComponent(url);
-              document.getElementById('qr-modal-link').innerText = url;
-              document.getElementById('qr-modal').classList.remove('hidden');
-              document.getElementById('qr-modal').classList.add('flex');
-          }
-
-          window.toggleAccordion = function(btn) {
-              const card = btn.closest('[data-accordion]');
-              if (!card) return;
-              const content = card.querySelector('[data-accordion-content]');
-              const icon = btn.querySelector('.accordion-icon');
-              const isOpen = content.style.visibility === 'visible';
-
-              content.style.transition = 'max-height 0.3s ease, visibility 0.3s ease';
-
-              if (isOpen) {
-                  content.style.maxHeight = content.scrollHeight + 'px';
-                  requestAnimationFrame(() => {
-                      content.style.maxHeight = '0';
-                      content.style.visibility = 'hidden';
-                  });
-                  icon.style.transform = 'rotate(0deg)';
-              } else {
-                  content.style.visibility = 'visible';
-                  content.style.maxHeight = content.scrollHeight + 'px';
-                  icon.style.transform = 'rotate(180deg)';
-                  setTimeout(() => { if (content.style.visibility === 'visible') content.style.maxHeight = 'none'; }, 350);
-              }
-          }
-
-          window.handleCopy = function handleCopy(btn) {
-              copyData('sync-' + btn.dataset.id);
-          }
-          window.handleQR = function handleQR(btn) {
-              showQR(btn.dataset.name, document.getElementById('sync-' + btn.dataset.id).value);
-          }
-
-          function closeQRModal() {
-              document.getElementById('qr-modal').classList.add('hidden');
-              document.getElementById('qr-modal').classList.remove('flex');
-          }
-  
-          function updateUI() {
-              try {
-                  let portsStr = Array.from(document.getElementById('cfg-port').selectedOptions).map(o=>o.value).join(',');
-                  let port = portsStr ? portsStr.split(',')[0] : '443';
-                  let proto = document.getElementById('cfg-proto').value === 'beta' ? String.fromCharCode(116, 114, 111, 106, 97, 110) : String.fromCharCode(118, 108, 101, 115, 115);
-                  let rawIps = document.getElementById('cfg-ips').value || "";
-                  
-                  let ipsList = rawIps.replace(/,/g, '\\n').replace(/;/g, '\\n').split('\\n').map(s=>s.trim()).filter(Boolean);
-                  let finalIP = ipsList.length > 0 ? ipsList[0] : (hostName.endsWith('.pages.dev') ? 'time.is' : hostName);
-                  
-                  let fp = document.getElementById('cfg-fp').value;
-                  let path = encodeURI("/" + document.getElementById('cfg-path').value);
-                  let sec = ["80","8080"].includes(port) ? "none" : "tls";
-                  
-                  let rawLink = proto + "://" + localUUID + "@" + finalIP + ":" + port + "?encryption=none&security=" + sec + "&sni=" + hostName + "&fp=" + fp + "&type=ws&host=" + hostName + "&path=" + path;
-                  if (document.getElementById('cfg-ech').checked) rawLink += "&pbk=enabled";
-                  rawLink += "#" + hostName;
-  
-                  // FIX: Check if elements exist
-                  const linkEl = document.getElementById('link-direct');
-                  if (linkEl) linkEl.value = rawLink;
-  
-                  const qrEl = document.getElementById('qr-code');
-                  if (qrEl) qrEl.src = "https://api.qrserver.com/v1/create-qr-code/?size=300x300&data=" + encodeURIComponent(rawLink);
-  
-                  let totalIps = ipsList.length === 0 ? 1 : ipsList.length;
-                  let tCfg = totalIps * 2; 
-                  document.getElementById('ip-count-badge').innerText = lang === 'fa' ? (tCfg + ' کانفیگ تولید شد') : (tCfg + ' Configs Active');
-              } catch(e) { console.error(e); }
-          }
-  
-          function logout() {
-              localStorage.removeItem('lowkey_session');
-              window.location.reload();
-          }
-
-          function showAddNodeModal() {
-              document.getElementById('modal-add-node').classList.remove('hidden');
-              document.getElementById('add-node-url').value = '';
-              document.getElementById('add-node-apikey').value = '';
-              document.getElementById('add-node-url').focus();
-          }
-
-          function commitAddNode() {
-              const url = document.getElementById('add-node-url').value.trim();
-              const apiKey = document.getElementById('add-node-apikey').value.trim();
-              if (!url || !apiKey) {
-                  const t = i18n[lang] || i18n['en'];
-                  alert(t.add_node_invalid || 'Please enter both URL and API Key.');
-                  return;
-              }
-              if (!window.lowkeyConfig) window.lowkeyConfig = {};
-              if (!Array.isArray(window.lowkeyConfig.linkedPanels)) window.lowkeyConfig.linkedPanels = [];
-              window.lowkeyConfig.linkedPanels.push({ url, apiKey });
-              document.getElementById('modal-add-node').classList.add('hidden');
-              renderLinkedNodes();
-          }
-
-          function removeLinkedNode(idx) {
-              if (!window.lowkeyConfig || !Array.isArray(window.lowkeyConfig.linkedPanels)) return;
-              window.lowkeyConfig.linkedPanels.splice(idx, 1);
-              renderLinkedNodes();
-          }
-
-          function renderLinkedNodes() {
-              const list = document.getElementById('linked-nodes-list');
-              if (!list) return;
-              const panels = (window.lowkeyConfig && Array.isArray(window.lowkeyConfig.linkedPanels)) ? window.lowkeyConfig.linkedPanels : [];
-              if (panels.length === 0) {
-                  list.innerHTML = '<p class="text-xs text-slate-400 dark:text-slate-500 italic">' + ((i18n[lang] || i18n['en']).no_nodes_advanced || 'No external nodes added yet.') + '</p>';
-                  return;
-              }
-              list.innerHTML = panels.map((p, i) => \`
-                  <div class="flex items-center justify-between gap-2 p-3 bg-slate-50 dark:bg-slate-800/50 rounded-xl border border-slate-200 dark:border-darkborder/50">
-                      <div class="min-w-0 flex-1">
-                          <p class="text-sm font-mono font-bold text-slate-700 dark:text-slate-200 truncate">\${p.url}</p>
-                          <p class="text-[11px] text-slate-400 dark:text-slate-500 font-mono truncate">\${p.apiKey.substring(0, 12)}...</p>
-                      </div>
-                      <button onclick="removeLinkedNode(\${i})" class="p-1.5 hover:bg-red-100 dark:hover:bg-red-900/30 rounded-lg transition-colors shrink-0" title="Remove">
-                          <svg class="w-3.5 h-3.5 text-red-400" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M6 18L18 6M6 6l12 12"></path></svg>
-                      </button>
-                  </div>
-              \`).join('');
-          }
-
-          function renderFakeConfigs(configs) {
-              const list = document.getElementById('fake-configs-list');
-              if (!list) return;
-              list.innerHTML = '';
-              if (!configs || configs.length === 0) {
-                  configs = [
-                      { name: "📊 {usage}", enabled: true },
-                      { name: "📅 {expiry}", enabled: true }
-                  ];
-              }
-              configs.forEach((cfg, idx) => {
-                  const item = document.createElement('div');
-                  item.className = 'flex items-center gap-2 p-3 bg-slate-50 dark:bg-slate-800/50 rounded-xl border border-slate-200 dark:border-darkborder/50';
-                  item.innerHTML = \`
-                      <div class="relative inline-flex items-center cursor-pointer shrink-0">
-                          <input type="checkbox" \${cfg.enabled ? 'checked' : ''} onchange="toggleFakeConfig(\${idx})" class="sr-only peer">
-                          <div class="w-9 h-5 bg-slate-300 dark:bg-slate-600 rounded-full peer peer-checked:after:translate-x-4 rtl:peer-checked:after:-translate-x-4 peer-checked:after:border-white after:content-[''] after:absolute after:top-[2px] after:start-[2px] after:bg-white after:border-slate-300 after:border after:rounded-full after:h-4 after:w-4 after:transition-all peer-checked:bg-primary"></div>
-                      </div>
-                      <input type="text" value="\${cfg.name.replace(/"/g, '&quot;')}" onchange="updateFakeConfigName(\${idx}, this.value)" class="flex-1 min-w-0 px-3 py-1.5 rounded-lg border border-slate-200 dark:border-darkborder bg-white dark:bg-slate-900 focus:border-primary outline-none text-sm font-mono">
-                      <button onclick="moveFakeConfig(\${idx}, -1)" class="p-1.5 hover:bg-slate-200 dark:hover:bg-slate-700 rounded-lg transition-colors shrink-0" title="Move up">
-                          <svg class="w-3.5 h-3.5 text-slate-400" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M5 15l7-7 7 7"></path></svg>
-                      </button>
-                      <button onclick="moveFakeConfig(\${idx}, 1)" class="p-1.5 hover:bg-slate-200 dark:hover:bg-slate-700 rounded-lg transition-colors shrink-0" title="Move down">
-                          <svg class="w-3.5 h-3.5 text-slate-400" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M19 9l-7 7-7-7"></path></svg>
-                      </button>
-                      <button onclick="removeFakeConfig(\${idx})" class="p-1.5 hover:bg-red-100 dark:hover:bg-red-900/30 rounded-lg transition-colors shrink-0" title="Remove">
-                          <svg class="w-3.5 h-3.5 text-red-400" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M6 18L18 6M6 6l12 12"></path></svg>
-                      </button>
-                  \`;
-                  list.appendChild(item);
-              });
-              window._fakeConfigs = configs;
-          }
-
-          function addFakeConfig() {
-              if (!window._fakeConfigs) window._fakeConfigs = [];
-              window._fakeConfigs.push({ name: "Custom Entry", enabled: true });
-              renderFakeConfigs(window._fakeConfigs);
-          }
-
-          function removeFakeConfig(idx) {
-              if (!window._fakeConfigs) return;
-              window._fakeConfigs.splice(idx, 1);
-              renderFakeConfigs(window._fakeConfigs);
-          }
-
-          function toggleFakeConfig(idx) {
-              if (!window._fakeConfigs || !window._fakeConfigs[idx]) return;
-              window._fakeConfigs[idx].enabled = !window._fakeConfigs[idx].enabled;
-          }
-
-          function updateFakeConfigName(idx, value) {
-              if (!window._fakeConfigs || !window._fakeConfigs[idx]) return;
-              window._fakeConfigs[idx].name = value;
-          }
-
-          function moveFakeConfig(idx, direction) {
-              if (!window._fakeConfigs) return;
-              const newIdx = idx + direction;
-              if (newIdx < 0 || newIdx >= window._fakeConfigs.length) return;
-              const temp = window._fakeConfigs[idx];
-              window._fakeConfigs[idx] = window._fakeConfigs[newIdx];
-              window._fakeConfigs[newIdx] = temp;
-              renderFakeConfigs(window._fakeConfigs);
-          }
-
-          function getFakeConfigsFromUI() {
-              return window._fakeConfigs || [
-                  { name: "📊 {usage}", enabled: true },
-                  { name: "📅 {expiry}", enabled: true }
-              ];
-          }
-  
-          // Export active page inputs configuration
-          function exportConfig() {
-              const el = id => document.getElementById(id);
-              const payload = {
-                  mode: el('cfg-proto').value, socketPorts: Array.from(el('cfg-port').selectedOptions).map(o=>o.value).join(','), deviceId: el('cfg-uuid').value,
-                  apiRoute: el('cfg-path').value, masterKey: el('cfg-pass').value, agent: el('cfg-fp').value,
-                   resolveIp: el('cfg-dns').value, customDns: el('cfg-custom-dns').value ? el('cfg-custom-dns').value : 'https://cloudflare-dns.com/dns-query', cleanIps: el('cfg-ips').value, maintenanceHost: el('cfg-fake') ? el('cfg-fake').value : '', backupRelay: el('cfg-relay').value, nat64Prefix: el('cfg-nat64') ? el('cfg-nat64').value : '', enableDirectConfigs: el('cfg-direct-configs') ? el('cfg-direct-configs').checked : false, syncApiKey: el('cfg-sync-api-key') ? el('cfg-sync-api-key').value.trim() : '', autoUpdate: el('cfg-auto-update') ? el('cfg-auto-update').checked : false, autoUpdateFormat: document.querySelector('input[name="auto-update-format"]:checked')?.value || 'normal',
-                   enableOpt1: el('cfg-tfo').checked, enableOpt2: el('cfg-ech').checked,
-                   tgToken: el('cfg-tg-token').value, tgChatId: el('cfg-tg-chat').value, tgAdminId: el('cfg-tg-admin').value,
-                  cfAccountId: el('cfg-cf-acc').value, cfApiToken: el('cfg-cf-token').value,
-                  cfWorkerName: el('cfg-cf-worker').value,
-                  isPaused: el('cfg-pause').checked, silentAlerts: el('cfg-silent').checked,
-                  subUserAgent: el('cfg-sub-ua').value,
-                  customPanelUrl: el('cfg-custom-panel-url').value,
-                  fakeConfigs: getFakeConfigsFromUI(),
-                  linkedPanels: (window.lowkeyConfig && Array.isArray(window.lowkeyConfig.linkedPanels)) ? window.lowkeyConfig.linkedPanels : []
-              };
-              const dataStr = "data:text/json;charset=utf-8," + encodeURIComponent(JSON.stringify(payload, null, 2));
-              const dlAnchor = document.createElement('a');
-              dlAnchor.setAttribute("href", dataStr);
-              dlAnchor.setAttribute("download", "lowkey-config.json");
-              document.body.appendChild(dlAnchor);
-              dlAnchor.click();
-              dlAnchor.remove();
-          }
-  
-          // Import backup json to overwrite config inputs 
-          function importConfig(event) {
-              const file = event.target.files[0];
-              if (!file) return;
-              const reader = new FileReader();
-              reader.onload = function(e) {
-                  try {
-                      const conf = JSON.parse(e.target.result);
-                      const mapId = (id, val) => { const el = document.getElementById(id); if (el && val !== undefined) el.value = val; };
-                      mapId('cfg-proto', conf.mode);
-                      let pList = (conf.socketPorts || conf.socketPort || '443').split(',');
-                      Array.from(document.getElementById('cfg-port').options).forEach(o => o.selected = pList.includes(o.value));
-                      mapId('cfg-uuid', conf.deviceId);
-                      mapId('cfg-path', conf.apiRoute);
-                      mapId('cfg-pass', conf.masterKey);
-                      mapId('cfg-fp', conf.agent);
-                      mapId('cfg-dns', conf.resolveIp);
-                      mapId('cfg-custom-dns', conf.customDns);
-                      mapId('cfg-ips', conf.cleanIps);
-                      mapId('cfg-fake', conf.maintenanceHost);
-                      mapId('cfg-relay', conf.backupRelay);
-                      mapId('cfg-tg-token', conf.tgToken);
-                      mapId('cfg-tg-chat', conf.tgChatId);
-                      mapId('cfg-tg-admin', conf.tgAdminId);
-                      mapId('cfg-cf-acc', conf.cfAccountId);
-                      mapId('cfg-cf-token', conf.cfApiToken);
-                      mapId('cfg-cf-worker', conf.cfWorkerName);
-                      mapId('cfg-sub-ua', conf.subUserAgent);
-                      mapId('cfg-custom-panel-url', conf.customPanelUrl);
-                      
-                      if (conf.enableOpt1 !== undefined) document.getElementById('cfg-tfo').checked = conf.enableOpt1;
-                      if (conf.enableOpt2 !== undefined) document.getElementById('cfg-ech').checked = conf.enableOpt2;
-                      if (conf.isPaused !== undefined) document.getElementById('cfg-pause').checked = conf.isPaused;
-                      if (conf.silentAlerts !== undefined) document.getElementById('cfg-silent').checked = conf.silentAlerts;
-                      mapId('cfg-nat64', conf.nat64Prefix);
-                      if (conf.enableDirectConfigs !== undefined && document.getElementById('cfg-direct-configs')) document.getElementById('cfg-direct-configs').checked = conf.enableDirectConfigs;
-                      if (document.getElementById('cfg-sync-api-key')) document.getElementById('cfg-sync-api-key').value = conf.syncApiKey || '';
-                      if (conf.autoUpdate !== undefined && document.getElementById('cfg-auto-update')) {
-                          document.getElementById('cfg-auto-update').checked = conf.autoUpdate;
-                          const wrap = document.getElementById('auto-update-format-wrap');
-                          if (wrap) wrap.classList.toggle('hidden', !conf.autoUpdate);
-                      }
-                      if (conf.autoUpdateFormat) {
-                          const radio = document.querySelector(\`input[name="auto-update-format"][value="\${conf.autoUpdateFormat}"]\`);
-                          if (radio) radio.checked = true;
-                      }
-                      
-                      if (conf.fakeConfigs) renderFakeConfigs(conf.fakeConfigs);
-                      if (conf.linkedPanels) {
-                          if (!window.lowkeyConfig) window.lowkeyConfig = {};
-                          window.lowkeyConfig.linkedPanels = conf.linkedPanels;
-                          renderLinkedNodes();
-                      }
-                      
-                      updateUI();
-                      alert(lang === 'fa' ? 'پیکربندی با موفقیت وارد شد! روی ذخیره کلیک کنید.' : 'Configuration parsed! Click save to write changes.');
-                  } catch(err) {
-                      alert(lang === 'fa' ? 'فایل نامعتبر است!' : 'Invalid configuration file!');
-                  }
-              };
-              reader.readAsText(file);
-          }
-  
-          // Browser-level latency check diagnostics
-          async function runPingTest() {
-              const rawIps = document.getElementById('cfg-ips').value || "";
-              let ipsList = rawIps.replace(/,/g, '\\n').replace(/;/g, '\\n').split('\\n').map(s=>s.trim()).filter(Boolean);
-              let targetIP = ipsList.length > 0 ? ipsList[0] : (hostName.endsWith('.pages.dev') ? 'time.is' : hostName);
-              
-              const resultsDiv = document.getElementById('ping-results');
-              resultsDiv.classList.remove('hidden');
-              
-              document.getElementById('ping-target').textContent = targetIP;
-              document.getElementById('ping-time').textContent = 'Testing...';
-              document.getElementById('ping-status').textContent = 'Dialing...';
-              document.getElementById('ping-port').textContent = window.location.port || (window.location.protocol === 'https:' ? '443' : '80');
-              
-              const startTime = performance.now();
-              try {
-                  await fetch('https://' + targetIP + '/favicon.ico?cb=' + startTime, { mode: 'no-cors', cache: 'no-store' });
-                  const duration = Math.round(performance.now() - startTime);
-                  document.getElementById('ping-time').textContent = duration + ' ms';
-                  document.getElementById('ping-status').className = "text-sm font-bold text-emerald-500";
-                  document.getElementById('ping-status').textContent = "Success";
-              } catch (err) {
-                  const duration = Math.round(performance.now() - startTime);
-                  if (duration < 1500) {
-                      document.getElementById('ping-time').textContent = duration + ' ms';
-                      document.getElementById('ping-status').className = "text-sm font-bold text-amber-500";
-                      document.getElementById('ping-status').textContent = "Indirect-OK";
-                  } else {
-                      document.getElementById('ping-time').textContent = 'Timeout';
-                      document.getElementById('ping-status').className = "text-sm font-bold text-red-500";
-                      document.getElementById('ping-status').textContent = "Unreachable";
-                  }
-              }
-          }
-  
-          function togglePortCheckbox(val, checked) {
-              const sel = document.getElementById('cfg-port');
-              const opt = Array.from(sel.options).find(o => o.value === val);
-              if (opt) {
-                  opt.selected = checked;
-                  sel.dispatchEvent(new Event('change'));
-              }
-          }
-          function syncCheckboxesFromSelect() {
-              const sel = document.getElementById('cfg-port');
-              const ports = Array.from(sel.selectedOptions).map(o => o.value);
-              const checkboxes = document.querySelectorAll('#port-checkboxes-container input[type="checkbox"]');
-              checkboxes.forEach(cb => {
-                  cb.checked = ports.includes(cb.value);
-              });
-          }
-
-          async function doLogin(silent = false) {
-              const btn = document.querySelector('button[onclick="doLogin()"]');
-              const origText = btn.innerText; 
-              if(!silent) btn.innerText = "...";
-              try {
-                  const pass = silent ? sessionKey : document.getElementById('pwd').value;
-                  const res = await fetch(baseRoute + '/api/auth', { method: 'POST', body: JSON.stringify({ key: pass }) });
-                  const data = await res.json();
-                  if (data.success) {
-                      sessionKey = pass; localUUID = data.deviceId;
-                      localStorage.setItem('lowkey_session', JSON.stringify({ key: pass, expiry: Date.now() + 30 * 60 * 1000 }));
-                      
-                      document.getElementById('login-box').classList.add('hidden');
-                      document.getElementById('dash-box').classList.remove('hidden');
-                      document.getElementById('dash-box').classList.add('flex');
-                      document.getElementById('btn-logout-mob').classList.remove('hidden');
-                      document.body.classList.add('logged-in');
-                      
-                      document.getElementById('net-ip').textContent = data.network.ip;
-                      document.getElementById('net-colo').textContent = data.network.colo;
-                      document.getElementById('net-loc').textContent = data.network.loc;
-                      const conf = data.config;
-                      document.getElementById('cfg-proto').value = conf.mode || 'alpha';
-                      let pList = (conf.socketPorts || conf.socketPort || '443').split(',');
-                      Array.from(document.getElementById('cfg-port').options).forEach(o => o.selected = pList.includes(o.value));
-                      syncCheckboxesFromSelect();
-                      document.getElementById('cfg-uuid').value = conf.deviceId || '';
-                      document.getElementById('cfg-path').value = conf.apiRoute || '';
-                      document.getElementById('cfg-pass').value = conf.masterKey || '';
-                      document.getElementById('cfg-fp').value = conf.agent || 'chrome';
-                      document.getElementById('cfg-dns').value = conf.resolveIp || '';
-                      document.getElementById('cfg-custom-dns').value = conf.customDns || 'https://cloudflare-dns.com/dns-query';
-                      document.getElementById('cfg-ips').value = conf.cleanIps || '';
-                      if (document.getElementById('cfg-fake')) document.getElementById('cfg-fake').value = conf.maintenanceHost || '';
-                       document.getElementById('cfg-relay').value = conf.backupRelay || '';
-                       if (document.getElementById('cfg-nat64')) document.getElementById('cfg-nat64').value = conf.nat64Prefix || '';
-                       if (document.getElementById('cfg-direct-configs')) document.getElementById('cfg-direct-configs').checked = conf.enableDirectConfigs || false;
-                       if (document.getElementById('cfg-sync-api-key')) document.getElementById('cfg-sync-api-key').value = conf.syncApiKey || '';
-                       if (document.getElementById('cfg-auto-update')) {
-                           document.getElementById('cfg-auto-update').checked = conf.autoUpdate || false;
-                           const wrap = document.getElementById('auto-update-format-wrap');
-                           if (wrap) wrap.classList.toggle('hidden', !conf.autoUpdate);
-                       }
-                       if (conf.autoUpdateFormat) {
-                           const radio = document.querySelector(\`input[name="auto-update-format"][value="\${conf.autoUpdateFormat}"]\`);
-                           if (radio) radio.checked = true;
-                       }
-                      document.getElementById('cfg-tfo').checked = conf.enableOpt1 || false;
-                      document.getElementById('cfg-ech').checked = conf.enableOpt2 || false;
-                      document.getElementById('cfg-tg-token').value = conf.tgToken || '';
-                      document.getElementById('cfg-tg-chat').value = conf.tgChatId || '';
-                      document.getElementById('cfg-tg-admin').value = conf.tgAdminId || '';
-                      document.getElementById('cfg-cf-acc').value = conf.cfAccountId || '';
-                      document.getElementById('cfg-cf-token').value = conf.cfApiToken || '';
-                      document.getElementById('cfg-cf-worker').value = conf.cfWorkerName || '';
-                      document.getElementById('cfg-pause').checked = conf.isPaused || false;
-                      document.getElementById('cfg-silent').checked = conf.silentAlerts || false;
-                      document.getElementById('cfg-name-strategy').value = conf.nameStrategy || 'default';
-                      document.getElementById('cfg-name-prefix').value = conf.namePrefix || 'lowkey';
-                      document.getElementById('cfg-sub-ua').value = conf.subUserAgent || '';
-                      document.getElementById('cfg-custom-panel-url').value = conf.customPanelUrl || '';
-                      renderFakeConfigs(conf.fakeConfigs || [
-                          { name: "📊 {usage}", enabled: true },
-                          { name: "📅 {expiry}", enabled: true }
-                      ]);
-  
-                      window.lowkeyConfig = JSON.parse(JSON.stringify(conf));
-                      window.lowkeyUsage = data.sysUsage || {};
-                      window.lowkeyProfiles = data.profiles || [];
-                      renderUsersTable();
-                      renderLinkedNodes();
-                       if (!silent) switchTab('overview');
-
-                      ['cfg-proto','cfg-port','cfg-fp','cfg-ips','cfg-path', 'cfg-relay', 'cfg-name-strategy', 'cfg-name-prefix', 'cfg-sub-ua', 'cfg-custom-panel-url'].forEach(id => {
-                          const el = document.getElementById(id);
-                          if(el) { el.addEventListener('input', updateUI); el.addEventListener('change', updateUI); }
-                      });
-                      ['cfg-ech','cfg-tfo'].forEach(id => {
-                          const el = document.getElementById(id);
-                          if(el) el.addEventListener('change', updateUI);
-                      });
-                      const autoUpdateEl = document.getElementById('cfg-auto-update');
-                      if (autoUpdateEl) {
-                          autoUpdateEl.addEventListener('change', () => {
-                              const wrap = document.getElementById('auto-update-format-wrap');
-                              if (wrap) wrap.classList.toggle('hidden', !autoUpdateEl.checked);
-                          });
-                      }
-                const pCont = document.getElementById('dyn-profiles-container');
-                let profilesHtml = '';
-                data.profiles.forEach(p => {
-                            const isDef = p.name === 'Default';
-                            let html = \`<div class="bg-white dark:bg-darkcard rounded-3xl shadow-sm border border-slate-200 dark:border-darkborder relative mb-4 break-inside-avoid inline-block w-full" data-accordion>
-    <div class="absolute top-0 end-0 w-32 h-32 bg-primary/5 rounded-bl-[100px] -z-10"></div>
-    <button onclick="toggleAccordion(this)" class="w-full flex items-center justify-between p-5 md:p-6">
-        <h3 class="text-lg font-bold text-slate-800 dark:text-white flex items-center">
-            <svg class="w-5 h-5 me-2 text-primary" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M13.828 10.172a4 4 0 00-5.656 0l-4 4a4 4 0 105.656 5.656l1.102-1.101m-.758-4.899a4 4 0 005.656 0l4-4a4 4 0 00-5.656-5.656l-1.1 1.1"></path></svg>
-            \${p.name}
-        </h3>
-        <div class="flex items-center gap-2">
-            \${isDef ? '<span class="text-[10px] bg-slate-100 text-slate-500 px-2 py-1 rounded font-bold uppercase">Master</span>' : ''}
-            <svg class="w-4 h-4 text-slate-400 accordion-icon transition-transform duration-300" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M19 9l-7 7-7-7"></path></svg>
+        async function logoutAdmin() {
+            if (confirm('⚠️ آیا می‌خواهید از پنل خارج شوید؟')) {
+                try {
+                    await fetch('/api/logout', { method: 'POST' });
+                } catch (err) {}
+                window.location.reload();
+            }
+        }
+const CURRENT_VERSION = '1.5.4';
+		async function checkForUpdates(isManual = false) {
+            if (isManual) {
+                alert('شما در حال استفاده از آخرین نسخه (v' + CURRENT_VERSION + ') هستید.');
+            }
+        }
+        async function applyUpdate() {
+            toggleUpdateModal(false);
+            alert('بروزرسانی خودکار در این نسخه غیرفعال است.');
+        }
+let cachedIpsData = {};
+async function fetchIpsList() {
+    try {
+        const response = await fetch('https://raw.githubusercontent.com/IR-NETLIFY/zeus/refs/heads/main/ips.txt');
+        if (!response.ok) throw new Error('Fetch failed');
+        const text = await response.text();
+        const blocks = text.split('----------');
+        cachedIpsData = {};
+        blocks.forEach(block => {
+            const lines = block.trim().split('\\n').map(l => l.trim()).filter(l => l.length > 0);
+            if (lines.length === 0) return;
+            let opName = "Unknown";
+            const ips = [];
+            lines.forEach(line => {
+                if (line.includes('#')) {
+                    opName = line.split('#')[1].trim();
+                } else if (!line.startsWith('[source')) {
+                    ips.push(line);
+                }
+            });
+            if (ips.length > 0) {
+                cachedIpsData[opName] = ips;
+            }
+        });
+        populateIpSelect();
+    } catch (err) {
+        alert('Failed to load IP list from GitHub.');
+        toggleIpSelectorModal(false);
+    }
+}
+function populateIpSelect() {
+    const select = document.getElementById('ip-operator-select');
+    select.innerHTML = '<option value="all">All</option>';
+    Object.keys(cachedIpsData).forEach(op => {
+        const option = document.createElement('option');
+        option.value = op;
+        option.textContent = op;
+        select.appendChild(option);
+    });
+}
+function toggleIpSelectorModal(show) {
+    const modal = document.getElementById('ip-selector-modal');
+    const card = modal.querySelector('div');
+    if (show) {
+        modal.classList.remove('opacity-0', 'pointer-events-none');
+        modal.classList.add('opacity-100', 'pointer-events-auto');
+        card.classList.remove('opacity-0', 'scale-95');
+        card.classList.add('opacity-100', 'scale-100');
+    } else {
+        modal.classList.remove('opacity-100', 'pointer-events-auto');
+        modal.classList.add('opacity-0', 'pointer-events-none');
+        card.classList.remove('opacity-100', 'scale-100');
+        card.classList.add('opacity-0', 'scale-95');
+    }
+}
+async function openIpSelectorModal() {
+    toggleIpSelectorModal(true);
+    document.getElementById('ip-loading-state').classList.remove('hidden');
+    document.getElementById('ip-selection-form').classList.add('hidden');
+    await fetchIpsList();
+    document.getElementById('ip-loading-state').classList.add('hidden');
+    document.getElementById('ip-selection-form').classList.remove('hidden');
+}
+function applySelectedIps() {
+    const operator = document.getElementById('ip-operator-select').value;
+    let count = parseInt(document.getElementById('ip-count-input').value, 10);
+    if (isNaN(count) || count < 1) count = 10;
+    let availableIps = [];
+    if (operator === 'all') {
+        Object.values(cachedIpsData).forEach(ips => {
+            availableIps = availableIps.concat(ips);
+        });
+    } else {
+        availableIps = cachedIpsData[operator] || [];
+    }
+    availableIps = [...new Set(availableIps)];
+    let selectedIps = [];
+    if (count >= availableIps.length) {
+        selectedIps = availableIps;
+    } else {
+        const shuffled = availableIps.slice();
+        for (let i = shuffled.length - 1; i > 0; i--) {
+            const j = Math.floor(Math.random() * (i + 1));
+            [shuffled[i], shuffled[j]] = [shuffled[j], shuffled[i]];
+        }
+        selectedIps = shuffled.slice(0, count);
+    }
+    document.getElementById('input-ips').value = selectedIps.join('\\n');
+    toggleIpSelectorModal(false);
+}
+document.addEventListener('DOMContentLoaded', () => {
+        if (localStorage.getItem('lowkey_path_warned_' + CURRENT_VERSION) !== 'true') {
+            const modal = document.getElementById('path-warning-modal');
+            const card = modal.querySelector('div');
+            modal.classList.remove('opacity-0', 'pointer-events-none');
+            modal.classList.add('opacity-100', 'pointer-events-auto');
+            card.classList.remove('opacity-0', 'scale-95');
+            card.classList.add('opacity-100', 'scale-100');
+        }			
+            const versionBadge = document.getElementById('panel-version');
+            if (versionBadge) versionBadge.innerText = 'v' + CURRENT_VERSION;
+            renderPortCheckboxes();
+            loadUsers();
+            loadLocations();
+            setInterval(() => loadUsers(true), 2000);
+            setTimeout(() => checkForUpdates(false), 2000);
+        });
+    </script>
+</body>
+</html>`,
+	status: `<!DOCTYPE html>
+<html lang="fa" dir="rtl" class="dark">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>وضعیت اشتراک کاربر</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/qrcodejs/1.0.0/qrcode.min.js"></script>
+    <link href="https://cdn.jsdelivr.net/gh/rastikerdar/vazirmatn@v33.003/Vazirmatn-font-face.css" rel="stylesheet" type="text/css" />
+    <script>
+        tailwind.config = {
+            darkMode: 'class',
+            theme: {
+                extend: {
+                    fontFamily: { sans: ['Vazirmatn', 'sans-serif'] },
+                    colors: { amoled: { bg: '#000000', card: '#080b0f', input: '#0d1117', border: '#1c2330' } }
+                }
+            }
+        }
+    </script>
+    <style>
+        body { font-family: 'Vazirmatn', sans-serif; }
+        .glass {
+            background: rgba(10, 10, 10, 0.6);
+            backdrop-filter: blur(12px);
+            -webkit-backdrop-filter: blur(12px);
+            border: 1px solid rgba(255, 255, 255, 0.05);
+        }
+    </style>
+</head>
+<body class="bg-gray-50 text-gray-900 dark:bg-amoled-bg dark:text-zinc-100 min-h-screen flex flex-col items-center py-12 px-4">
+    <div class="w-full max-w-xl glass rounded-3xl shadow-2xl p-6 md:p-8 relative overflow-hidden">
+        <!-- Background Orbs -->
+        <div class="absolute -left-12 -top-12 w-40 h-40 bg-blue-500/10 rounded-full blur-3xl pointer-events-none"></div>
+        <div class="absolute -right-12 -bottom-12 w-40 h-40 bg-purple-500/10 rounded-full blur-3xl pointer-events-none"></div>
+        <div class="text-center mb-8 relative z-10">
+            <div class="inline-block p-3.5 bg-blue-600/10 text-blue-500 rounded-3xl mb-3 border border-blue-500/20 shadow-lg shadow-blue-500/5">
+                <svg class="w-9 h-9" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="1.5" d="M9 12l2 2 4-4m5.618-4.016A11.955 11.955 0 0112 2.944a11.955 11.955 0 01-8.618 3.04A12.02 12.02 0 003 9c0 5.591 3.824 10.29 9 11.622 5.176-1.332 9-6.03 9-11.622 0-1.042-.133-2.052-.382-3.016z"></path></svg>
+            </div>
+            <h1 class="text-xl font-bold tracking-tight text-gray-900 dark:text-white mb-1">پنل lowkey - وضعیت اشتراک</h1>
+            <p id="display-username" class="text-sm font-bold text-blue-500 tracking-wide font-mono mb-2"></p>
+            <div id="live-connections-badge" class="hidden inline-flex items-center gap-1.5 px-3 py-1 bg-emerald-500/10 border border-emerald-500/20 text-emerald-500 rounded-full text-xs font-bold shadow-sm">
+                <span class="w-2 h-2 rounded-full bg-emerald-500 animate-pulse"></span>
+                <span id="live-connections-text" dir="rtl">۰ دستگاه متصل</span>
+            </div>
         </div>
-    </button>
-    <div class="transition-all duration-300" style="max-height:0;overflow:hidden;" data-accordion-content>
-        <div class="space-y-3 px-5 md:px-6 pb-5 md:pb-6">
-            <div>
-                <label class="block text-[10px] font-bold text-slate-400 uppercase tracking-wider mb-1">UUID</label>
-                <div class="bg-slate-50 dark:bg-slate-800 border border-slate-100 dark:border-darkborder px-3 py-2 rounded-lg text-xs font-mono text-slate-500">\${p.id}</div>
+        <!-- Connection Status -->
+        <div id="status-card" class="mb-6 rounded-2xl p-4 text-center border font-bold relative z-10 transition duration-300">
+            <span id="status-text" class="text-sm">در حال بارگذاری وضعیت...</span>
+        </div>
+        <!-- Progress Cards -->
+        <div class="space-y-5 mb-8 relative z-10">
+            <!-- Traffic usage card -->
+            <div class="bg-white/40 dark:bg-zinc-900/30 border border-gray-200 dark:border-amoled-border rounded-2xl p-5 shadow-sm">
+                <div class="flex justify-between items-center mb-3">
+                    <span class="text-xs font-semibold text-gray-500 dark:text-zinc-400 flex items-center gap-1.5">
+                        <svg class="w-4 h-4 text-blue-500" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M19 11H5m14 0a2 2 0 012 2v6a2 2 0 01-2 2H5a2 2 0 01-2-2v-6a2 2 0 012-2m14 0V9a2 2 0 00-2-2M5 11V9a2 2 0 012-2m0 0V5a2 2 0 012-2h6a2 2 0 012 2v2M7 7h10"></path></svg>
+                        میزان حجم مصرفی
+                    </span>
+                    <span id="volume-pct" class="text-xs font-bold text-blue-500">۰٪</span>
+                </div>
+                <div class="w-full bg-gray-200 dark:bg-zinc-800 rounded-full h-2.5 overflow-hidden mb-3">
+                    <div id="volume-progress" class="bg-blue-600 h-2.5 rounded-full transition-all duration-1000" style="width: 0%"></div>
+                </div>
+                <div class="flex justify-between text-xs text-gray-500 dark:text-zinc-400 font-medium">
+                    <span>مصرف شده: <span id="used-vol" class="font-bold text-gray-800 dark:text-zinc-200">-</span></span>
+                    <span>حجم کل: <span id="limit-vol" class="font-bold text-gray-800 dark:text-zinc-200">-</span></span>
+                </div>
             </div>
-            <div class="relative">
-                <label class="block text-[10px] font-semibold text-emerald-500 uppercase tracking-wider mb-1 flex items-center gap-1.5"><span class="w-1.5 h-1.5 rounded-full bg-emerald-500"></span>Universal Sync URL</label>
-                <input type="text" id="sync-\${p.id}" readonly value="\${p.sync}" class="w-full bg-slate-50 dark:bg-darkbg border border-slate-200 dark:border-darkborder px-4 py-2.5 rounded-xl text-xs outline-none font-mono text-slate-600 dark:text-slate-400 truncate pe-12">
-                <button data-id="\${p.id}" onclick="handleCopy(this)" class="absolute bottom-1 end-1 text-primary p-1.5 hover:bg-slate-200 dark:hover:bg-slate-700 rounded-md"><svg class="w-4.5 h-4.5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M8 16H6a2 2 0 01-2-2V6a2 2 0 012-2h8a2 2 0 012 2v2m-6 12h8a2 2 0 002-2v-8a2 2 0 00-2-2h-8a2 2 0 00-2 2v8a2 2 0 002 2z"></path></svg></button>
+            <!-- Expiry card -->
+            <div class="bg-white/40 dark:bg-zinc-900/30 border border-gray-200 dark:border-amoled-border rounded-2xl p-5 shadow-sm">
+                <div class="flex justify-between items-center mb-3">
+                    <span class="text-xs font-semibold text-gray-500 dark:text-zinc-400 flex items-center gap-1.5">
+                        <svg class="w-4 h-4 text-purple-500" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 8v4l3 3m6-3a9 9 0 11-18 0 9 9 0 0118 0z"></path></svg>
+                        زمان باقی‌مانده اشتراک
+                    </span>
+                    <span id="expiry-pct" class="text-xs font-bold text-purple-500">۰٪</span>
+                </div>
+                <div class="w-full bg-gray-200 dark:bg-zinc-800 rounded-full h-2.5 overflow-hidden mb-3 flex justify-end">
+                    <div id="expiry-progress" class="bg-purple-600 h-2.5 rounded-full transition-all duration-1000" style="width: 0%"></div>
+                </div>
+                <div class="flex justify-between text-xs text-gray-500 dark:text-zinc-400 font-medium">
+                    <span>باقی‌مانده: <span id="days-remaining" class="font-bold text-gray-800 dark:text-zinc-200">-</span></span>
+                    <span>کل اعتبار: <span id="total-days" class="font-bold text-gray-800 dark:text-zinc-200">-</span></span>
+                </div>
             </div>
-            <div class="mt-2">
-                <button data-id="\${p.id}" data-name="\${p.name}" onclick="handleQR(this)" class="w-full flex items-center justify-center p-2.5 bg-slate-50 hover:bg-slate-100 dark:bg-slate-800 dark:hover:bg-slate-700 border border-slate-200 dark:border-darkborder rounded-xl transition-all gap-1.5 text-[11px] font-bold text-slate-600 dark:text-slate-400">
-                    <svg class="w-4 h-4 text-slate-500" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 4v1m0 11v1m5-7h1m-13 0h1m2-5a2 2 0 00-2 2v10a2 2 0 002 2h8a2 2 0 002-2V6a2 2 0 00-2-2h-8zM9 9h1m0 0v1m2-1h1m0 0v1"></path></svg>
-                    <span data-i18n="show_qr">Show QR Code</span>
+            <div class="bg-white/40 dark:bg-zinc-900/30 border border-gray-200 dark:border-amoled-border rounded-2xl p-5 shadow-sm">
+                <div class="flex justify-between items-center mb-3">
+                    <span class="text-xs font-semibold text-gray-500 dark:text-zinc-400 flex items-center gap-1.5">
+                        <svg class="w-4 h-4 text-emerald-500" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M13 10V3L4 14h7v7l9-11h-7z"></path></svg>
+                        وضعیت ریکوئست‌ها
+                    </span>
+                    <span id="req-pct" class="text-xs font-bold text-emerald-500">۰٪</span>
+                </div>
+                <div class="w-full bg-gray-200 dark:bg-zinc-800 rounded-full h-2.5 overflow-hidden mb-3">
+                    <div id="req-progress" class="bg-emerald-600 h-2.5 rounded-full transition-all duration-1000" style="width: 0%"></div>
+                </div>
+                <div class="flex justify-between text-xs text-gray-500 dark:text-zinc-400 font-medium">
+                    <span>مصرف شده: <span id="used-req" class="font-bold text-gray-800 dark:text-zinc-200">-</span></span>
+                    <span>سقف کل: <span id="limit-req" class="font-bold text-gray-800 dark:text-zinc-200">-</span></span>
+                </div>
+            </div>
+            <div class="bg-white/40 dark:bg-zinc-900/30 border border-gray-200 dark:border-amoled-border rounded-2xl p-5 shadow-sm">
+                <div class="flex justify-between items-center mb-3">
+                    <span class="text-xs font-semibold text-gray-500 dark:text-zinc-400 flex items-center gap-1.5">
+                        <svg class="w-4 h-4 text-sky-500" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M17 20h5v-2a3 3 0 00-5.356-1.857M17 20H7m10 0v-2c0-.656-.126-1.283-.356-1.857M7 20H2v-2a3 3 0 015.356-1.857M7 20v-2c0-.656.126-1.283.356-1.857m0 0a5.002 5.002 0 019.288 0M15 7a3 3 0 11-6 0 3 3 0 016 0zm6 3a2 2 0 11-4 0 2 2 0 014 0zM7 10a2 2 0 11-4 0 2 2 0 014 0z"></path></svg>
+                        دستگاه‌های متصل
+                    </span>
+                    <span id="online-pct" class="text-xs font-bold text-sky-500">۰٪</span>
+                </div>
+                <div class="w-full bg-gray-200 dark:bg-zinc-800 rounded-full h-2.5 overflow-hidden mb-3">
+                    <div id="online-progress" class="bg-sky-600 h-2.5 rounded-full transition-all duration-1000" style="width: 0%"></div>
+                </div>
+                <div class="flex justify-between text-xs text-gray-500 dark:text-zinc-400 font-medium">
+                    <span>متصل در لحظه: <span id="online-count" class="font-bold text-gray-800 dark:text-zinc-200">۰</span></span>
+                    <span>سقف همزمان: <span id="limit-online" class="font-bold text-gray-800 dark:text-zinc-200">-</span></span>
+                </div>
+            </div>
+        </div>
+        <!-- Configurations Card -->
+        <div class="border-t border-gray-100 dark:border-zinc-800 pt-6 relative z-10">
+            <h2 class="text-sm font-bold mb-4 flex items-center gap-2">
+                <svg class="w-4 h-4 text-emerald-500" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M8 16H6a2 2 0 01-2-2V6a2 2 0 012-2h8a2 2 0 012 2v2m-6 12h8a2 2 0 002-2v-8a2 2 0 00-2-2h-8a2 2 0 00-2 2v8a2 2 0 002 2z"></path></svg>
+                دریافت کانفیگ و اشتراک‌ها
+            </h2>
+            <div class="space-y-3">
+                <button onclick="copyTextSub()" class="w-full flex justify-between items-center px-4 py-3 bg-white dark:bg-amoled-card border border-gray-200 dark:border-amoled-border hover:border-indigo-500 dark:hover:border-indigo-500 rounded-xl text-xs font-medium transition shadow-sm">
+                    <span class="flex items-center gap-2">⛓️ کپی لینک ساب‌اسکریپشن متنی</span>
+                    <span class="text-indigo-500">کپی</span>
+                </button>
+                <button onclick="copyVlessConfig()" class="w-full flex justify-between items-center px-4 py-3 bg-white dark:bg-amoled-card border border-gray-200 dark:border-amoled-border hover:border-blue-500 dark:hover:border-blue-500 rounded-xl text-xs font-medium transition shadow-sm">
+                    <span class="flex items-center gap-2">🚀 کپی کانفیگ VLESS (مستقیم)</span>
+                    <span class="text-blue-500">کپی</span>
                 </button>
             </div>
         </div>
     </div>
-</div>\`;
-                         profilesHtml += html;
-                      });
-                      pCont.innerHTML = profilesHtml;
-
-
-
-                      // Inject usage metrics table
-                      const usageCont = document.getElementById('usage-metrics-container');
-                      if(usageCont && data.usage) {
-                          let usageHtml = '';
-                          data.profiles.forEach(p => {
-                              let hash = p.id.replace(/-/g, '').toLowerCase();
-                              let use = data.usage[hash];
-                              if(use) {
-                                  let timeStr = new Date(use.last).toLocaleTimeString([], {hour: '2-digit', minute:'2-digit', second:'2-digit'});
-                                  usageHtml += \`<div class="flex items-center justify-between p-3 border-b border-slate-100 dark:border-darkborder/50 last:border-0"><div class="flex flex-col"><span class="text-sm font-bold text-slate-700 dark:text-slate-200">\${p.name}</span><span class="text-[10px] text-slate-400 font-mono">\${p.id.split('-')[0]}...</span></div><div class="flex flex-col items-end"><span class="text-xs font-bold text-emerald-500">\${use.connects} Conns</span><span class="text-[10px] text-slate-400">\${timeStr}</span></div></div>\`;
-                              }
-                          });
-                          usageCont.innerHTML = usageHtml || '<p class="text-xs text-slate-400 text-center py-4">' + (i18n[lang]?.no_active_conn || 'No active connection data yet.') + '</p>';
-                      }
-                      
-                      updateUI();
-                  } else { 
-                      if(!silent) { document.getElementById('err-msg').classList.remove('hidden'); btn.innerText = origText; }
-                      else { localStorage.removeItem('lowkey_session'); }
-                  }
-              } catch (err) { if(!silent) btn.innerText = origText; }
-          }
-  
-          async function doSave() {
-              const el = id => document.getElementById(id);
-              const payload = {
-                  key: sessionKey,
-                  config: {
-                      mode: el('cfg-proto').value, socketPorts: Array.from(el('cfg-port').selectedOptions).map(o=>o.value).join(','), deviceId: el('cfg-uuid').value,
-                      apiRoute: el('cfg-path').value, masterKey: el('cfg-pass').value, agent: el('cfg-fp').value,
-                      resolveIp: el('cfg-dns').value, customDns: el('cfg-custom-dns').value ? el('cfg-custom-dns').value : 'https://cloudflare-dns.com/dns-query', cleanIps: el('cfg-ips').value, maintenanceHost: el('cfg-fake') ? el('cfg-fake').value : '', backupRelay: el('cfg-relay').value, nat64Prefix: el('cfg-nat64') ? el('cfg-nat64').value : '', enableDirectConfigs: el('cfg-direct-configs') ? el('cfg-direct-configs').checked : false, syncApiKey: el('cfg-sync-api-key') ? el('cfg-sync-api-key').value.trim() : '', autoUpdate: el('cfg-auto-update') ? el('cfg-auto-update').checked : false, autoUpdateFormat: document.querySelector('input[name="auto-update-format"]:checked')?.value || 'normal',
-                      enableOpt1: el('cfg-tfo').checked, enableOpt2: el('cfg-ech').checked,
-                      tgToken: el('cfg-tg-token').value, tgChatId: el('cfg-tg-chat').value, tgAdminId: el('cfg-tg-admin').value,
-                      cfAccountId: el('cfg-cf-acc').value, cfApiToken: el('cfg-cf-token').value,
-                      cfWorkerName: el('cfg-cf-worker').value,
-                      isPaused: el('cfg-pause').checked, silentAlerts: el('cfg-silent').checked,
-                          subUserAgent: el('cfg-sub-ua').value,
-                      customPanelUrl: el('cfg-custom-panel-url').value,
-                      nameStrategy: el('cfg-name-strategy').value,
-                      namePrefix: el('cfg-name-prefix').value,
-                      fakeConfigs: getFakeConfigsFromUI(),
-                      linkedPanels: (window.lowkeyConfig && Array.isArray(window.lowkeyConfig.linkedPanels)) ? window.lowkeyConfig.linkedPanels : []
-                  }
-              };
-                        //update user port after change global
-                     const globalPorts = (payload.config.socketPorts || '443').split(',').map(s=>s.trim()).filter(Boolean);
-                     payload.config.users = (window.lowkeyConfig.users || []).map(u => {
-                     if (!u.userPorts) return u;
-                        const filtered = u.userPorts.split(',').map(s=>s.trim()).filter(p => globalPorts.includes(p));
-                      u.userPorts = filtered.length ? filtered.join(',') : globalPorts[0];
-                          return u;
-                          });
-              const stat = el('save-status'); stat.textContent = i18n[lang].msg_saving; stat.className = "text-sm font-bold text-primary animate-pulse md:me-4";
-              try {
-                  const res = await fetch(baseRoute + '/api/sync', { method: 'POST', body: JSON.stringify(payload) });
-                  const data = await res.json();
-                  if (data.success) {
-                      stat.textContent = i18n[lang].msg_saved; stat.className = "text-sm font-bold text-emerald-500 md:me-4";
-                      if (Array.isArray(window.lowkeyConfig?.linkedPanels) && window.lowkeyConfig.linkedPanels.length > 0) {
-                          const sc = payload.config;
-                          const slaveCfg = { ...sc };
-                          delete slaveCfg.tgToken; delete slaveCfg.tgChatId; delete slaveCfg.tgAdminId; delete slaveCfg.tgBotLang;
-                          delete slaveCfg.cfAccountId; delete slaveCfg.cfApiToken; delete slaveCfg.cfWorkerName;
-                          delete slaveCfg.panelApiKeys; delete slaveCfg.linkedPanels; delete slaveCfg.slaveNodes; delete slaveCfg.syncApiKey;
-                          const synced = new Set();
-                          window.lowkeyConfig.linkedPanels.forEach(p => {
-                              if (!p || !p.url || !p.apiKey) return;
-                              const h = p.url.trim().replace(/^https?:\\/\\//, '').replace(/\\/.*$/, '');
-                              if (!h || synced.has(h.toLowerCase())) return;
-                              synced.add(h.toLowerCase());
-                              fetch('https://' + h + '/' + encodeURIComponent(sc.apiRoute || 'sync') + '/api/sync', {
-                                  method: 'POST',
-                                  headers: { 'Content-Type': 'application/json' },
-                                  body: JSON.stringify({ key: p.apiKey, config: slaveCfg, fromMaster: true })
-                              }).then(r => { if (!r.ok) console.error('Sync to ' + h + ' failed: HTTP ' + r.status); }).catch(e => { console.error('Sync to ' + h + ' error:', e.message); });
-                          });
-                      }
-                      setTimeout(() => window.location.href = '/' + data.newRoute + '/dash', 1000);
-                  } else { stat.textContent = i18n[lang].msg_err; stat.className = "text-sm font-bold text-red-500 md:me-4"; }
-              } catch(e) { stat.textContent = i18n[lang].msg_err; stat.className = "text-sm font-bold text-red-500 md:me-4"; }
-          }
-
-          document.getElementById('pwd').addEventListener('keypress', e => { if (e.key === 'Enter') doLogin(); });
-  
-          function renderUsersTable() {
-              const tbl = document.getElementById('tbl-users');
-              if(!tbl) return;
-              let users = window.lowkeyConfig?.users || [];
-              let usage = window.lowkeyUsage || {};
-              
-              // Calculate stats metrics
-              let totalUsersVal = users.length;
-              let activeSubscribers = users.filter(u => !u.isPaused && (!u.expiryMs || Date.now() <= u.expiryMs)).length;
-              let autoDisabledCount = users.filter(u => u.isPaused && u.disabledReason).length;
-              let pausedSubscribers = users.filter(u => u.isPaused && !u.disabledReason).length;
-              let expiredCount = users.filter(u => u.expiryMs && Date.now() > u.expiryMs && !u.isPaused).length;
-              let totalReqsSum = 0;
-              users.forEach(u => {
-                  let sysU = usage[u.id.replace(/-/g,'').toLowerCase()] || {reqs: 0};
-                  totalReqsSum += (sysU.reqs || 0);
-              });
-              let totalGBSum = (totalReqsSum / 6000).toFixed(2);
-
-              // Update stats elements in DOM if they exist
-              const totalUsersEl = document.getElementById('stat-total-users');
-              if (totalUsersEl) totalUsersEl.textContent = totalUsersVal;
-              const activeUsersEl = document.getElementById('stat-active-users');
-              if (activeUsersEl) activeUsersEl.textContent = \`\${activeSubscribers} / \${pausedSubscribers}\`;
-              const totalTrafficEl = document.getElementById('stat-total-traffic');
-              if (totalTrafficEl) totalTrafficEl.textContent = \`\${totalGBSum} \${i18n[lang]?.ov_gb_unit || 'GB'}\`;
-              const autoDisabledEl = document.getElementById('stat-auto-disabled');
-              if (autoDisabledEl) autoDisabledEl.textContent = autoDisabledCount;
-
-              // Render Recently Disabled Users Panel
-              const disabledPanel = document.getElementById('disabled-users-panel');
-              const disabledList = document.getElementById('disabled-users-list');
-              const disabledBadge = document.getElementById('disabled-panel-badge');
-              if (disabledPanel && disabledList) {
-                  const autoDisabledUsers = users.filter(u => u.isPaused && u.disabledReason)
-                      .sort((a, b) => (b.disabledAt || 0) - (a.disabledAt || 0));
-                  if (autoDisabledUsers.length > 0) {
-                      disabledPanel.classList.remove('hidden');
-                      if (disabledBadge) disabledBadge.textContent = autoDisabledUsers.length;
-                      disabledList.innerHTML = autoDisabledUsers.map(u => {
-                          let timeStr = u.disabledAt ? new Date(u.disabledAt).toLocaleString() : '-';
-                          let reasonIcon = u.disabledReason.includes('Traffic') ? '📊' : (u.disabledReason.includes('Expiration') ? '📅' : '⚠️');
-                          let btnLabel = lang === 'fa' ? 'فعال‌سازی مجدد' : 'Re-enable';
-                          return \`
-                              <div class="flex items-center justify-between p-3 bg-white/70 dark:bg-slate-800/50 rounded-xl border border-red-100 dark:border-red-800/20 hover:shadow-md transition-shadow">
-                                  <div class="flex items-center gap-3 flex-1 min-w-0">
-                                      <div class="text-lg">\${reasonIcon}</div>
-                                      <div class="min-w-0">
-                                          <div class="text-sm font-bold text-slate-700 dark:text-slate-200 truncate">\${u.name}</div>
-                                          <div class="text-[11px] text-red-500 dark:text-red-400 font-medium">\${u.disabledReason}</div>
-                                          <div class="text-[10px] text-slate-400 mt-0.5">\${timeStr}</div>
-                                      </div>
-                                  </div>
-                                  <button onclick="togglePauseUser('\${u.id}')" class="ml-3 px-3 py-1.5 bg-emerald-500 hover:bg-emerald-600 text-white text-[11px] font-bold rounded-lg shadow-sm transition-colors whitespace-nowrap">\${btnLabel}</button>
-                              </div>
-                          \`;
-                      }).join('');
-                  } else {
-                      disabledPanel.classList.add('hidden');
-                  }
-              }
-
-              // Apply Status Filter
-              const statusFilter = document.getElementById('user-status-filter')?.value || 'all';
-              const searchVal = document.getElementById('user-search-input')?.value.toLowerCase().trim() || '';
-              let filteredUsers = users.filter(u => {
-                  if (statusFilter === 'active' && (u.isPaused || (u.expiryMs && Date.now() > u.expiryMs))) return false;
-                  if (statusFilter === 'paused' && (!u.isPaused || u.disabledReason)) return false;
-                  if (statusFilter === 'auto-disabled' && !(u.isPaused && u.disabledReason)) return false;
-                  return u.name.toLowerCase().includes(searchVal) || u.id.toLowerCase().includes(searchVal);
-              });
-
-              tbl.innerHTML = '';
-              if (filteredUsers.length === 0) {
-                  tbl.innerHTML = '<div class="col-span-full px-4 py-8 text-center text-slate-400 text-sm">' + (i18n[lang]?.no_matching_users || 'No matching subscribers found') + '</div>';
-                  return;
-              }
-              
-              // Alias users to the filtered list for downstream compatibility
-              users = filteredUsers;
-              if (users.length === 0) {
-                  tbl.innerHTML = \`<div class="col-span-full px-4 py-8 text-center text-slate-400 text-sm" data-i18n="no_users">\${i18n[lang].no_users}</div>\`;
-                  return;
-              }
-              let tblHtml = '';
-              users.forEach((u, i) => {
-                  let sysU = usage[u.id.replace(/-/g,'').toLowerCase()] || {reqs: 0, dReqs: 0, lastDay: ''};
-                  let userReqs = sysU.reqs || 0;
-                  let userDReqs = sysU.lastDay === new Date().toISOString().split('T')[0] ? (sysU.dReqs || 0) : 0;
-                  
-                  const unlimitedTxt = lang === 'fa' ? 'نامحدود' : 'Unlimited';
-                  let limitTotalTxt = u.limitTotalReq ? u.limitTotalReq : unlimitedTxt;
-                  let limitDailyTxt = u.limitDailyReq ? u.limitDailyReq : unlimitedTxt;
-                  
-                  let perT = u.limitTotalReq ? Math.min(100, (userReqs / u.limitTotalReq) * 100).toFixed(1) + '%' : '-';
-                  let perD = u.limitDailyReq ? Math.min(100, (userDReqs / u.limitDailyReq) * 100).toFixed(1) + '%' : '-';
-                  
-                  let expTxt = unlimitedTxt;
-                  let isExp = false;
-                  if (u.expiryMs) {
-                      let date = new Date(u.expiryMs);
-                      expTxt = lang === 'fa' ? date.toLocaleDateString('fa-IR') : date.toLocaleDateString();
-                      if (Date.now() > u.expiryMs) { 
-                          const expiredTxt = lang === 'fa' ? ' (منقضی شده)' : ' (Expired)';
-                          expTxt += \` <span class="text-xs text-red-500 font-bold">\${expiredTxt}</span>\`; 
-                          isExp = true; 
-                      }
-                  }
-                  
-                  const totalLabel = lang === 'fa' ? 'کل:' : 'Total:';
-                  const dailyLabel = lang === 'fa' ? 'روزانه:' : 'Daily:';
-                  const rLabel = lang === 'fa' ? 'درخواست' : 'r';
-
-                  let linkTitle = lang === 'fa' ? 'کپی لینک ساب' : 'Copy Subscription Link';
-                  let pauseTitle = u.isPaused ? (lang === 'fa' ? 'فعال‌سازی کاربر' : 'Resume User') : (lang === 'fa' ? 'توقف کاربر' : 'Pause User');
-                  let editTitle = lang === 'fa' ? 'ویرایش کاربر' : 'Edit Subscriber';
-                  let resetTitle = lang === 'fa' ? 'بازنشانی مصرف ترافیک' : 'Reset Traffic Metrics';
-                  let deleteTitle = lang === 'fa' ? 'حذف کاربر' : 'Delete User';
-
-                   let linkHtml = \`<button onclick="copyData('sync-\${u.id}')" class="native-press flex-1 flex items-center justify-center text-primary hover:text-indigo-700 bg-indigo-50 hover:bg-indigo-100 dark:bg-indigo-900/30 dark:hover:bg-indigo-800/50 py-2 rounded-lg" title="\${linkTitle}">🔗</button>\`;
-                   
-                   let pauseBtnHtml = \`<button onclick="togglePauseUser('\${u.id}')" class="native-press flex-1 flex items-center justify-center \${u.isPaused ? 'text-green-500 hover:text-green-700 bg-green-50 hover:bg-green-100 dark:bg-green-900/30 dark:hover:bg-green-800/50' : 'text-amber-500 hover:text-amber-700 bg-amber-50 hover:bg-amber-100 dark:bg-amber-900/30 dark:hover:bg-amber-800/50'} py-2 rounded-lg" title="\${pauseTitle}">\\s*\${u.isPaused ? '▶️' : '⏸️'}</button>\`;
-
-                   let editBtnHtml = \`<button onclick="editUser('\${u.id}')" class="native-press flex-1 flex items-center justify-center text-indigo-500 hover:text-indigo-700 bg-indigo-50 hover:bg-indigo-100 dark:bg-indigo-900/30 dark:hover:bg-indigo-800/50 py-2 rounded-lg" title="\${editTitle}">✏️</button>\`;
-
-                   let resetBtnHtml = \`<button onclick="resetUserTraffic('\${u.id}')" class="native-press flex-1 flex items-center justify-center text-violet-500 hover:text-violet-700 bg-violet-50 hover:bg-violet-100 dark:bg-violet-900/30 dark:hover:bg-violet-800/50 py-2 rounded-lg" title="\${resetTitle}">🔄</button>\`;
-
-                  let isAutoDisabled = u.isPaused && u.disabledReason;
-                  let disableInfoHtml = '';
-                  if (isAutoDisabled) {
-                      let reasonLabel = u.disabledReason;
-                      let timeLabel = u.disabledAt ? new Date(u.disabledAt).toLocaleString() : '';
-                      let reasonTitle = lang === 'fa' ? 'علت غیرفعال‌سازی' : 'Disable Reason';
-                      let timeTitle = lang === 'fa' ? 'زمان غیرفعال‌سازی' : 'Disabled At';
-                      disableInfoHtml = \`
-                          <div class="mt-2 p-2 rounded-lg bg-red-50 dark:bg-red-900/20 border border-red-200 dark:border-red-800/30">
-                              <div class="flex items-center gap-1.5 text-[10px] font-bold text-red-600 dark:text-red-400">
-                                  <span>⚠️</span>
-                                  <span>\${reasonTitle}:</span>
-                              </div>
-                              <div class="text-[10px] text-red-500 dark:text-red-300 mt-0.5">\${reasonLabel}</div>
-                              \${timeLabel ? \`<div class="text-[9px] text-slate-400 mt-1">\${timeTitle}: \${timeLabel}</div>\` : ''}
-                          </div>
-                      \`;
-                  }
-
-                  let rawSync = window.lowkeyProfiles?.find(p => p.id === u.id)?.sync || '';
-                  if (rawSync) {
-                      rawSync += rawSync.includes('?') ? '&flag=a' : '?flag=a';
-                  }
-
-                  tblHtml += \`<div class="native-press bg-white dark:bg-darkcard rounded-2xl border border-slate-200 dark:border-darkborder p-4 hover:shadow-md transition-shadow">
-                      <div class="flex items-center justify-between mb-3">
-                          <div class="flex items-center gap-2 min-w-0 flex-1">
-                              <span class="w-2 h-2 rounded-full shrink-0 \${u.isPaused ? (isAutoDisabled ? 'bg-red-500' : 'bg-amber-500') : (isExp ? 'bg-red-400' : 'bg-emerald-500')}"></span>
-                              <span class="font-bold text-sm text-slate-800 dark:text-slate-100 truncate">\${u.name}</span>
-                              \${u.proxyIpGeo ? \`<span class="text-[10px] px-1.5 py-0.5 rounded bg-violet-50 dark:bg-violet-900/30 text-violet-600 dark:text-violet-300 font-semibold shrink-0">\${u.proxyIpGeo.flag}</span>\` : ''}
-                          </div>
-                          <input type="hidden" id="sync-\${u.id}" value="\${rawSync}">
-                      </div>
-                      <div class="flex items-center gap-1 mb-3">
-                          \${linkHtml}
-                          \${pauseBtnHtml}
-                          \${editBtnHtml}
-                          \${resetBtnHtml}
-                          <button onclick="deleteUser('\${u.id}')" class="native-press flex-1 flex items-center justify-center text-red-400 hover:text-red-600 hover:bg-red-50 dark:hover:bg-red-900/20 py-2 rounded-lg transition-colors text-sm" title="\${deleteTitle}">🗑️</button>
-                      </div>
-                      <div class="flex flex-wrap gap-1 mb-3">
-                          \${u.isPaused && u.disabledReason ? \`<span class="text-[9px] font-bold px-1.5 py-0.5 rounded bg-red-100 dark:bg-red-900/40 text-red-600 dark:text-red-300">Auto-Disabled</span>\` : ''}
-                          \${u.userMode ? \`<span class="text-[9px] font-bold px-1.5 py-0.5 rounded bg-indigo-50 dark:bg-indigo-900/30 text-indigo-600 dark:text-indigo-300">\${u.userMode === 'alpha' ? 'VLESS' : u.userMode === 'beta' ? 'Trojan' : 'Both'}</span>\` : ''}
-                          \${u.userPorts ? \`<span class="text-[9px] font-bold px-1.5 py-0.5 rounded bg-emerald-50 dark:bg-emerald-900/30 text-emerald-600 dark:text-emerald-300">\${u.userPorts}</span>\` : ''}
-                           \${u.maxConfigs ? \`<span class="text-[9px] font-bold px-1.5 py-0.5 rounded bg-amber-50 dark:bg-amber-900/30 text-amber-600 dark:text-amber-300">\${u.maxConfigs} cfgs</span>\` : ''}
-                           \${u.connLimit ? \`<span class="text-[9px] font-bold px-1.5 py-0.5 rounded bg-cyan-50 dark:bg-cyan-900/30 text-cyan-600 dark:text-cyan-300">\${u.connLimit} conn</span>\` : ''}
-                      </div>
-                      \${disableInfoHtml}
-                      <div class="grid grid-cols-2 gap-3">
-                          <div class="bg-slate-50 dark:bg-slate-800/50 rounded-xl p-2.5">
-                              <div class="text-[9px] font-bold text-slate-400 uppercase tracking-wider mb-1">\${totalLabel}</div>
-                              <div class="text-sm font-black text-slate-800 dark:text-white">\${(userReqs/6000).toFixed(2)} <span class="text-[10px] font-semibold text-slate-400">GB</span></div>
-                              \${u.limitTotalReq ? \`
-                              <div class="w-full bg-slate-200 dark:bg-slate-700 h-1.5 rounded-full overflow-hidden mt-1.5">
-                                  <div class="bg-gradient-to-r \${parseFloat(perT) > 85 ? 'from-red-500 to-rose-600' : parseFloat(perT) > 60 ? 'from-amber-500 to-orange-500' : 'from-emerald-500 to-teal-500'} h-full rounded-full" style="width: \${perT}"></div>
-                              </div>
-                              <div class="flex items-center justify-between mt-1">
-                                  <span class="text-[9px] text-slate-400">/ \${(u.limitTotalReq/6000).toFixed(2)} GB</span>
-                                  \${perT !== '-' ? \`<span class="text-[9px] font-bold \${parseFloat(perT) > 85 ? 'text-red-500' : parseFloat(perT) > 60 ? 'text-amber-500' : 'text-emerald-500'}">\${perT}</span>\` : ''}
-                              </div>
-                              \` : '<div class="text-[9px] text-slate-400 mt-1">' + unlimitedTxt + '</div>'}
-                          </div>
-                          <div class="bg-slate-50 dark:bg-slate-800/50 rounded-xl p-2.5">
-                              <div class="text-[9px] font-bold text-slate-400 uppercase tracking-wider mb-1">\${dailyLabel}</div>
-                              <div class="text-sm font-black text-slate-800 dark:text-white">\${userDReqs} <span class="text-[10px] font-semibold text-slate-400">\${rLabel}</span></div>
-                              \${u.limitDailyReq ? \`
-                              <div class="w-full bg-slate-200 dark:bg-slate-700 h-1.5 rounded-full overflow-hidden mt-1.5">
-                                  <div class="bg-gradient-to-r \${parseFloat(perD) > 85 ? 'from-red-500 to-rose-600' : parseFloat(perD) > 60 ? 'from-amber-500 to-orange-500' : 'from-emerald-500 to-teal-500'} h-full rounded-full" style="width: \${perD}"></div>
-                              </div>
-                              <div class="flex items-center justify-between mt-1">
-                                  <span class="text-[9px] text-slate-400">/ \${(u.limitDailyReq/6000).toFixed(2)} GB</span>
-                                  \${perD !== '-' ? \`<span class="text-[9px] font-bold \${parseFloat(perD) > 85 ? 'text-red-500' : parseFloat(perD) > 60 ? 'text-amber-500' : 'text-emerald-500'}">\${perD}</span>\` : ''}
-                              </div>
-                              \` : '<div class="text-[9px] text-slate-400 mt-1">' + unlimitedTxt + '</div>'}
-                          </div>
-                      </div>
-                      <div class="flex items-center justify-between mt-2 pt-2 border-t border-slate-100 dark:border-slate-800">
-                          <span class="text-[10px] text-slate-400">📅 \${expTxt}</span>
-                      </div>
-                  \`;
-                  tblHtml += '</div>';
-              });
-              tbl.innerHTML = tblHtml;
-              applyLang();
-          }
-
-          async function resetUserTraffic(uuid) {
-              const resetMsg = lang === 'fa' ? 'آیا از بازنشانی وضعیت ترافیک (کل و روزانه) این مشترک مطمئن هستید؟' : 'Are you sure you want to reset all traffic metrics (Total and Daily) for this subscriber?';
-              if(!confirm(resetMsg)) return;
-              try {
-                  const res = await fetch(baseRoute + '/api/sync', {
-                      method: 'POST',
-                      headers: {'Content-Type': 'application/json'},
-                      body: JSON.stringify({ key: sessionKey, resetUUID: uuid })
-                  });
-                  if (res.ok) {
-                      const successMsg = lang === 'fa' ? 'ترافیک مشترک با موفقیت بازنشانی شد!' : 'Subscriber traffic metrics successfully reset!';
-                      alert(successMsg);
-                      doLogin(true); // reload usage data from server
-                  } else {
-                      const errMsg = lang === 'fa' ? 'سرور در بازنشانی ترافیک خطا بازگرداند.' : 'Server returned error while resetting metrics.';
-                      alert(errMsg);
-                  }
-              } catch(e) {
-                  const netErr = lang === 'fa' ? 'خطای ارتباط با شبکه.' : 'Network connection error.';
-                  alert(netErr);
-              }
-          }
-
-          function deleteUser(uuid) {
-              const deleteMsg = lang === 'fa' ? 'آیا از حذف این کاربر مطمئن هستید؟' : 'Are you sure you want to delete this user?';
-              if(!confirm(deleteMsg)) return;
-              if(window.lowkeyConfig && window.lowkeyConfig.users) {
-                  window.lowkeyConfig.users = window.lowkeyConfig.users.filter(u => u.id !== uuid);
-              }
-              // Automatically sync
-              renderUsersTable();
-              doSaveDirectly();
-          }
-
-          function togglePauseUser(uuid) {
-              if(window.lowkeyConfig && window.lowkeyConfig.users) {
-                  let usr = window.lowkeyConfig.users.find(u => u.id === uuid);
-                  if (usr) {
-                      usr.isPaused = !usr.isPaused;
-                      if (!usr.isPaused) {
-                          usr.disabledReason = null;
-                          usr.disabledAt = null;
-                      }
-                      renderUsersTable();
-                      doSaveDirectly();
-                  }
-              }
-          }
-
-          function getGlobalPorts() {
-              return (window.lowkeyConfig && window.lowkeyConfig.socketPorts)
-                  ? window.lowkeyConfig.socketPorts.split(',').map(s=>s.trim()).filter(Boolean)
-                  : ['443'];
-          }
-
-          function getGlobalMode() {
-              return (window.lowkeyConfig && window.lowkeyConfig.mode) ? window.lowkeyConfig.mode : 'alpha';
-          }
-
-          function openAddUserPage() {
-              document.getElementById('view-users').classList.add('hidden');
-              document.getElementById('view-add-user').classList.remove('hidden');
-              var sc = document.querySelector('.scroll-content');
-              sc.style.overflow = 'hidden';
-              sc.classList.add('flex', 'flex-col');
-              sc.firstElementChild.classList.add('flex-1', 'min-h-0', 'flex', 'flex-col');
-              updateTitleText('Add User');
-              buildPortCheckboxes('add-user-ports-wrap', null);
-              buildModeCheckboxes('add-user-mode-wrap', null);
-              buildIPCheckboxes("add-user-clean-ips-wrap", "", (window.lowkeyConfig?.cleanIps||"").split(/[\\s,;]+/).map(s=>s.trim()).filter(Boolean));
-              buildIPCheckboxes("add-user-proxy-ips-wrap", "", (window.lowkeyConfig?.backupRelay||"").split(/[\\s,;]+/).map(s=>s.trim()).filter(Boolean));
-              buildNodeCheckboxes("add-user-nodes-wrap", "", getGlobalNodeList());
-          }
-          function closeAddUserPage() {
-              document.getElementById('view-add-user').classList.add('hidden');
-              document.getElementById('view-users').classList.remove('hidden');
-              var sc = document.querySelector('.scroll-content');
-              sc.style.overflow = '';
-              sc.classList.remove('flex', 'flex-col');
-              sc.firstElementChild.classList.remove('flex-1', 'min-h-0', 'flex', 'flex-col');
-              updateTitle();
-          }
-          function closeEditUserPage() {
-              document.getElementById('view-edit-user').classList.add('hidden');
-              document.getElementById('view-users').classList.remove('hidden');
-              var sc = document.querySelector('.scroll-content');
-              sc.style.overflow = '';
-              sc.classList.remove('flex', 'flex-col');
-              sc.firstElementChild.classList.remove('flex-1', 'min-h-0', 'flex', 'flex-col');
-              updateTitle();
-          }
-          function updateTitleText(txt) {
-              var el = document.getElementById('view-title');
-              if (el) el.innerText = txt;
-          }
-
-          
-function buildIPCheckboxes(wrapId, selectedIps, allIps) {
-    const wrap = document.getElementById(wrapId);
-    if(!wrap) return;
-    wrap.innerHTML = '';
-    if(!allIps || allIps.length === 0) {
-        wrap.innerHTML = '<span class="text-xs text-slate-400">' + (i18n[lang]?.no_ips_advanced || 'No IPs added in Advanced Tab') + '</span>';
-        return;
-    }
-    const selArr = selectedIps ? selectedIps.split(',').map(s=>s.trim()).filter(Boolean) : [];
-    allIps.forEach(ip => {
-        const lbl = document.createElement('label');
-        lbl.className = "flex items-center gap-1.5 text-sm cursor-pointer border border-slate-200 dark:border-darkborder px-2 py-1 rounded-lg";
-        const cb = document.createElement('input');
-        cb.type = "checkbox";
-        cb.className = "accent-primary";
-        cb.value = ip;
-        if(selArr.includes(ip)) cb.checked = true;
-        
-        lbl.appendChild(cb);
-        const span = document.createElement('span');
-        span.innerText = ip;
-        lbl.appendChild(span);
-        wrap.appendChild(lbl);
-    });
-}
-function getSelectedCheckboxes(wrapId) {
-    const wrap = document.getElementById(wrapId);
-    if(!wrap) return '';
-    const checked = Array.from(wrap.querySelectorAll('input:checked')).map(cb => cb.value);
-    return checked.join(',');
-}
-function getGlobalNodeList() {
-    var nodes = (window.lowkeyConfig && window.lowkeyConfig.slaveNodes ? window.lowkeyConfig.slaveNodes : "").split(/[\\s,;]+/).map(function(s){return s.trim();}).filter(Boolean);
-    var lp = (window.lowkeyConfig && Array.isArray(window.lowkeyConfig.linkedPanels)) ? window.lowkeyConfig.linkedPanels : [];
-    lp.forEach(function(p){
-        var raw = (p && typeof p === 'object') ? (p.url || '') : (p || '');
-        raw = String(raw).trim();
-        if(!raw) return;
-        raw = raw.replace(/^[a-zA-Z]+:\\/\\//, '').split('/')[0].split('@').pop();
-        var h = raw.indexOf('[') === 0 ? raw.slice(0, raw.indexOf(']') + 1) : raw.split(':')[0];
-        h = h.trim();
-        if(h) nodes.push(h);
-    });
-    return nodes.filter(function(v,i,a){return a.indexOf(v) === i;});
-}
-function buildNodeCheckboxes(wrapId, selectedNodes, allNodes) {
-    const wrap = document.getElementById(wrapId);
-    if(!wrap) return;
-    wrap.innerHTML = '';
-    if(!allNodes || allNodes.length === 0) {
-        wrap.innerHTML = '<span class="text-xs text-slate-400">' + (i18n[lang]?.no_nodes_advanced || 'No slave nodes in Advanced Tab') + '</span>';
-        return;
-    }
-    const selArr = selectedNodes ? selectedNodes.split(',').map(s=>s.trim()).filter(Boolean) : [];
-    allNodes.forEach(node => {
-        const lbl = document.createElement('label');
-        lbl.className = "flex items-center gap-1.5 text-sm cursor-pointer border border-slate-200 dark:border-darkborder px-2 py-1 rounded-lg";
-        const cb = document.createElement('input');
-        cb.type = "checkbox";
-        cb.className = "accent-primary";
-        cb.value = node;
-        if(selArr.includes(node)) cb.checked = true;
-        lbl.appendChild(cb);
-        const span = document.createElement('span');
-        span.innerText = node;
-        lbl.appendChild(span);
-        wrap.appendChild(lbl);
-    });
-}
-
-function buildPortCheckboxes(wrapId, selectedPorts) {
-              const wrap = document.getElementById(wrapId);
-              if (!wrap) return;
-              const globalPorts = getGlobalPorts();
-              const sel = selectedPorts ? selectedPorts.split(',').map(s=>s.trim()) : ['443'];
-              wrap.innerHTML = globalPorts.map(function(p) {
-                  return '<label class="flex items-center gap-1.5 text-sm cursor-pointer"><input type="checkbox" value="' + p + '" class="' + wrapId + '-port-cb accent-primary"' + (sel.includes(p) ? ' checked' : '') + '><span>' + p + '</span></label>';
-              }).join('');
-          }
-
-          function buildModeCheckboxes(wrapId, userMode) {
-              const globalMode = getGlobalMode();
-              const alphaAllowed = globalMode === 'alpha' || globalMode === 'both';
-              const betaAllowed = globalMode === 'beta' || globalMode === 'both';
-              const selAlpha = userMode === 'alpha' || userMode === 'both' || (!userMode && alphaAllowed);
-              const selBeta = userMode === 'beta' || userMode === 'both' || (!userMode && betaAllowed);
-              const wrap = document.getElementById(wrapId);
-              if (!wrap) return;
-              wrap.querySelectorAll('input[type=checkbox]').forEach(cb => {
-                  if (cb.value === 'alpha') { cb.disabled = !alphaAllowed; cb.checked = selAlpha && alphaAllowed; cb.closest			('label').style.opacity = alphaAllowed ? '1' : '0.35'; }
-                  if (cb.value === 'beta')  { cb.disabled = !betaAllowed;  cb.checked = selBeta && betaAllowed;  cb.closest			('label').style.opacity = betaAllowed  ? '1' : '0.35'; }
-              });
-          }
-
-          function readModeFromCheckboxes(cbClass) {
-             const cbs = [...document.querySelectorAll('.' + cbClass + ':checked')].map(c=>c.value);
-              if (cbs.includes('alpha') && cbs.includes('beta')) return 'both';
-              if (cbs.includes('alpha')) return 'alpha';
-              if (cbs.includes('beta')) return 'beta';
-              return getGlobalMode();
-          }
-
-          function readPortsFromCheckboxes(wrapId) {
-             const ports = [...document.querySelectorAll('#' + wrapId + ' input[type=checkbox]:checked')].map(c=>c.value);
-              return ports.length ? ports.join(',') : getGlobalPorts()[0];
-          }
-
-          function commitAddUser() {
-              const name = document.getElementById('add-user-name').value.trim();
-              let tReq = document.getElementById('add-user-total-reqs').value;
-              tReq = tReq? Math.floor(parseFloat(tReq) * 6000): null;
-              let dReq = document.getElementById('add-user-daily-reqs').value;
-              dReq = dReq? Math.floor(parseFloat(dReq) * 6000): null;
-              let days = document.getElementById('add-user-days').value;
-               const cleanIpsCheckbox = getSelectedCheckboxes("add-user-clean-ips-wrap");
-               const cleanIpsCustom = document.getElementById("add-user-custom-clean").value.trim();
-               let cleanIpArray = [];
-               if (cleanIpsCheckbox) cleanIpArray.push(...cleanIpsCheckbox.split(','));
-               if (cleanIpsCustom) {
-                   cleanIpArray.push(...cleanIpsCustom.split(/[\\s,;]+/).map(s=>s.trim()).filter(Boolean));
-               }
-               const cleanIp = cleanIpArray.length ? cleanIpArray.join(',') : null;
-               const proxyIpsCheckbox = getSelectedCheckboxes("add-user-proxy-ips-wrap");
-               const proxyIpsCustom = document.getElementById("add-user-custom-proxy").value.trim();
-               let proxyIpArray = [];
-               if (proxyIpsCheckbox) proxyIpArray.push(...proxyIpsCheckbox.split(','));
-               if (proxyIpsCustom) {
-                   proxyIpArray.push(...proxyIpsCustom.split(/[\\s,;]+/).map(s=>s.trim()).filter(Boolean));
-               }
-               const proxyIp = proxyIpArray.length ? proxyIpArray.join(',') : null;
-               
-               const customName = document.getElementById('add-user-custom-name').value.trim() || null;
-               const userMode = readModeFromCheckboxes('add-mode-cb');
-               const userPorts = readPortsFromCheckboxes('add-user-ports-wrap');
-               let maxConfigs = document.getElementById('add-user-max-configs').value;
-               maxConfigs = maxConfigs ? parseInt(maxConfigs) : null;
-               const nodesCheckbox = getSelectedCheckboxes("add-user-nodes-wrap");
-               const nodesCustom = document.getElementById("add-user-custom-nodes").value.trim();
-               let nodesArray = [];
-               if (nodesCheckbox) nodesArray.push(...nodesCheckbox.split(','));
-               if (nodesCustom) nodesArray.push(...nodesCustom.split(/[\\s,;]+/).map(s=>s.trim()).filter(Boolean));
-               const userNodes = nodesArray.length ? nodesArray.join(',') : null;
-               const nat64 = document.getElementById('edit-user-nat64').value.trim() || null;
-               
-               if(!name) {
-                   alert(lang === 'fa' ? 'لطفاً نام را وارد کنید' : 'Please enter a name');
-                  return;
-              }
-
-              if(!window.lowkeyConfig) window.lowkeyConfig = {};
-              if(!window.lowkeyConfig.users) window.lowkeyConfig.users = [];
-
-              if(window.lowkeyConfig.users.some(u => u.name.trim().toLowerCase() === name.toLowerCase())) {
-                  alert(lang === 'fa' ? 'این نام قبلاً استفاده شده است' : 'This name is already taken');
-                  return;
-              }
-
-               tReq = tReq ? parseInt(tReq) : null;
-               dReq = dReq ? parseInt(dReq) : null;
-               days = days ? parseInt(days) : null;
-               let connLimit = document.getElementById('add-user-conn-limit').value;
-               connLimit = connLimit ? parseInt(connLimit) : null;
-               const userPanelUrl = document.getElementById('add-user-panel-url').value.trim() || null;
-               
-               let newId = Array.from(crypto.getRandomValues(new Uint8Array(16)))
-                   .map((b,i) => (i===4||i===6||i===8||i===10?'-':'') + b.toString(16).padStart(2,'0')).join('');
-               
-                const u = {
-                    id: newId,
-                    name: name,
-                    limitTotalReq: tReq,
-                    limitDailyReq: dReq,
-                    expiryMs: days ? Date.now() + days*86400000 : null,
-                    proxyIp: proxyIp,
-                     cleanIp: cleanIp,
-                     customName: customName,
-                     userMode: userMode,
-                     userPorts: userPorts,
-                     maxConfigs: maxConfigs,
-                     userNodes: userNodes,
-                     nat64: nat64,
-                     connLimit: connLimit,
-                     userPanelUrl: userPanelUrl,
-                     createdAt: Date.now()
-                };
-              
-              window.lowkeyConfig.users.push(u);
-              document.getElementById('view-add-user').classList.add('hidden');
-              document.getElementById('view-users').classList.remove('hidden');
-              var sc = document.querySelector('.scroll-content');
-              sc.style.overflow = '';
-              sc.classList.remove('flex', 'flex-col');
-              sc.firstElementChild.classList.remove('flex-1', 'min-h-0', 'flex', 'flex-col');
-              updateTitle();
-              document.getElementById('add-user-name').value = '';
-               document.getElementById('add-user-custom-name').value = '';
-               document.getElementById('add-user-custom-clean').value = '';
-               document.getElementById('add-user-custom-proxy').value = '';
-               document.getElementById('add-user-custom-nodes').value = '';
-              document.getElementById('add-user-total-reqs').value = '';
-              document.getElementById('add-user-daily-reqs').value = '';
-              document.getElementById('add-user-days').value = '';
-              document.getElementById('add-user-max-configs').value = '';
-              document.getElementById('add-user-conn-limit').value = '';
-              document.getElementById('add-user-panel-url').value = '';
-              
-              renderUsersTable();
-              doSaveDirectly();
-          }
-
-          function editUser(uuid) {
-              if(!window.lowkeyConfig || !window.lowkeyConfig.users) return;
-              let u = window.lowkeyConfig.users.find(usr => usr.id === uuid);
-              if(!u) return;
-              
-              document.getElementById('edit-user-id').value = u.id;
-              document.getElementById('edit-user-name').value = u.name;
-              document.getElementById('edit-user-total-reqs').value = u.limitTotalReq? (u.limitTotalReq / 6000).toFixed(2): '';
-              document.getElementById('edit-user-daily-reqs').value = u.limitDailyReq? (u.limitDailyReq / 6000).toFixed(2): '';
-                            const globalCleanIps = (window.lowkeyConfig?.cleanIps||"").split(/[\\r\\n,;]+/).map(s=>s.trim()).filter(Boolean);
-              const userCleanIps = (u.cleanIp || "").split(/[\\r\\n,;]+/).map(s=>s.trim()).filter(Boolean);
-              const checkedGlobalClean = [];
-              const customClean = [];
-              userCleanIps.forEach(ip => {
-                  let hostOnly = ip.split('#')[0].split(':')[0].trim();
-                  let isFound = globalCleanIps.some(g => g.split('#')[0].split(':')[0].trim() === hostOnly || g === ip);
-                  if (isFound) checkedGlobalClean.push(ip);
-                  else customClean.push(ip);
-              });
-              buildIPCheckboxes("edit-user-clean-ips-wrap", checkedGlobalClean.join(','), globalCleanIps);
-              document.getElementById('edit-user-custom-clean').value = customClean.join(', ');
-
-              const globalProxyIps = (window.lowkeyConfig?.backupRelay||"").split(/[\\r\\n,;]+/).map(s=>s.trim()).filter(Boolean);
-              const userProxyIps = (u.proxyIp || "").split(/[\\r\\n,;]+/).map(s=>s.trim()).filter(Boolean);
-              const checkedGlobalProxy = [];
-              const customProxy = [];
-              userProxyIps.forEach(ip => {
-                  let hostOnly = ip.split('#')[0].split(':')[0].trim();
-                  let isFound = globalProxyIps.some(g => g.split('#')[0].split(':')[0].trim() === hostOnly || g === ip);
-                  if (isFound) checkedGlobalProxy.push(ip);
-                  else customProxy.push(ip);
-              });
-               buildIPCheckboxes("edit-user-proxy-ips-wrap", checkedGlobalProxy.join(','), globalProxyIps);
-               document.getElementById('edit-user-custom-proxy').value = customProxy.join(', ');
-
-               const globalNodes = getGlobalNodeList();
-               const userNodesList = (u.userNodes || "").split(/[\\r\\n,;]+/).map(s=>s.trim()).filter(Boolean);
-               const checkedGlobalNodes = [];
-               const customNodes = [];
-               userNodesList.forEach(node => {
-                   let isFound = globalNodes.some(g => g === node);
-                   if (isFound) checkedGlobalNodes.push(node);
-                   else customNodes.push(node);
-               });
-               buildNodeCheckboxes("edit-user-nodes-wrap", checkedGlobalNodes.join(','), globalNodes);
-               document.getElementById('edit-user-custom-nodes').value = customNodes.join(', ');
-               document.getElementById('edit-user-nat64').value = u.nat64 || '';
-
-               document.getElementById('edit-user-custom-name').value = u.customName || '';
-              
-              document.getElementById('edit-user-max-configs').value = u.maxConfigs || '';
-              document.getElementById('edit-user-conn-limit').value = u.connLimit || '';
-              document.getElementById('edit-user-panel-url').value = u.userPanelUrl || '';
-              
-              buildPortCheckboxes('edit-user-ports-wrap', u.userPorts);
-              buildModeCheckboxes('edit-user-mode-wrap', u.userMode);
-
-              let daysLeft = '';
-              if(u.expiryMs) {
-                  let diff = u.expiryMs - Date.now();
-                  daysLeft = diff > 0 ? Math.ceil(diff / 86400000) : 0;
-              }
-              document.getElementById('edit-user-days').value = daysLeft;
-              
-              document.getElementById('view-users').classList.add('hidden');
-              document.getElementById('view-edit-user').classList.remove('hidden');
-              var sc = document.querySelector('.scroll-content');
-              sc.style.overflow = 'hidden';
-              sc.classList.add('flex', 'flex-col');
-              sc.firstElementChild.classList.add('flex-1', 'min-h-0', 'flex', 'flex-col');
-              updateTitleText('Edit Subscriber');
-          }
-
-          function commitEditUser() {
-              const uuid = document.getElementById('edit-user-id').value;
-              const name = document.getElementById('edit-user-name').value.trim();
-              let tReq = document.getElementById('edit-user-total-reqs').value;
-              tReq = tReq? Math.floor(parseFloat(tReq) * 6000): null;
-              let dReq = document.getElementById('edit-user-daily-reqs').value;
-              dReq = dReq? Math.floor(parseFloat(dReq) * 6000): null;
-              let days = document.getElementById('edit-user-days').value;
-                             const proxyIpsCheckbox = getSelectedCheckboxes("edit-user-proxy-ips-wrap");
-               const proxyIpsCustom = document.getElementById("edit-user-custom-proxy").value.trim();
-               let proxyIpArray = [];
-               if (proxyIpsCheckbox) proxyIpArray.push(...proxyIpsCheckbox.split(','));
-               if (proxyIpsCustom) {
-                   proxyIpArray.push(...proxyIpsCustom.split(/[\\s,;]+/).map(s=>s.trim()).filter(Boolean));
-               }
-               const proxyIp = proxyIpArray.length ? proxyIpArray.join(',') : null;
-               
-               const customName = document.getElementById('edit-user-custom-name').value.trim() || null;
-               const cleanIpsCheckbox = getSelectedCheckboxes("edit-user-clean-ips-wrap");
-               const cleanIpsCustom = document.getElementById("edit-user-custom-clean").value.trim();
-               let cleanIpArray = [];
-               if (cleanIpsCheckbox) cleanIpArray.push(...cleanIpsCheckbox.split(','));
-               if (cleanIpsCustom) {
-                   cleanIpArray.push(...cleanIpsCustom.split(/[\\s,;]+/).map(s=>s.trim()).filter(Boolean));
-               }
-               const cleanIp = cleanIpArray.length ? cleanIpArray.join(',') : null;
-              const userMode = readModeFromCheckboxes('edit-mode-cb');
-              const userPorts = readPortsFromCheckboxes('edit-user-ports-wrap');
-               let maxConfigs = document.getElementById('edit-user-max-configs').value;
-               maxConfigs = maxConfigs ? parseInt(maxConfigs) : null;
-               const nodesCheckbox = getSelectedCheckboxes("edit-user-nodes-wrap");
-               const nodesCustom = document.getElementById("edit-user-custom-nodes").value.trim();
-               let nodesArray = [];
-               if (nodesCheckbox) nodesArray.push(...nodesCheckbox.split(','));
-               if (nodesCustom) nodesArray.push(...nodesCustom.split(/[\\s,;]+/).map(s=>s.trim()).filter(Boolean));
-               const userNodes = nodesArray.length ? nodesArray.join(',') : null;
-                const nat64 = document.getElementById('add-user-nat64').value.trim() || null;
-                let connLimit = document.getElementById('edit-user-conn-limit').value;
-                connLimit = connLimit ? parseInt(connLimit) : null;
-                const userPanelUrl = document.getElementById('edit-user-panel-url').value.trim() || null;
-               
-               if(!name) {
-                  alert(lang === 'fa' ? 'لطفاً نام را وارد کنید' : 'Please enter a name');
-                  return;
-              }
-              tReq = tReq ? parseInt(tReq) : null;
-              dReq = dReq ? parseInt(dReq) : null;
-              days = days ? parseInt(days) : null;
-              
-              if(!window.lowkeyConfig || !window.lowkeyConfig.users) return;
-
-              if(window.lowkeyConfig.users.some(u => u.id !== uuid && u.name.trim().toLowerCase() === name.toLowerCase())) {
-                  alert(lang === 'fa' ? 'این نام قبلاً استفاده شده است' : 'This name is already taken');
-                  return;
-              }
-
-              let u = window.lowkeyConfig.users.find(usr => usr.id === uuid);
-              if(!u) return;
-              
-              u.name = name;
-              u.limitTotalReq = tReq;
-              u.limitDailyReq = dReq;
-              u.expiryMs = days ? Date.now() + days*86400000 : null;
-              u.proxyIp = proxyIp;
-               u.cleanIp = cleanIp;
-               u.customName = customName;
-              u.userMode = userMode;
-              u.userPorts = userPorts;
-              u.maxConfigs = maxConfigs;
-              u.userNodes = userNodes;
-              u.nat64 = nat64;
-              u.connLimit = connLimit;
-              u.userPanelUrl = userPanelUrl;
-              
-              document.getElementById('view-edit-user').classList.add('hidden');
-              document.getElementById('view-users').classList.remove('hidden');
-              var sc = document.querySelector('.scroll-content');
-              sc.style.overflow = '';
-              sc.classList.remove('flex', 'flex-col');
-              sc.firstElementChild.classList.remove('flex-1', 'min-h-0', 'flex', 'flex-col');
-              renderUsersTable();
-              doSaveDirectly();
-          }
-
-          async function loadApiKeys() {
-              try {
-                  const res = await fetch(baseRoute + '/api/keys', {
-                      headers: { 'Authorization': 'Bearer ' + sessionKey }
-                  });
-                  const data = await res.json();
-                  if (data.success) {
-                      const list = document.getElementById('api-keys-list');
-                      if (!list) return;
-                      if (!data.keys || data.keys.length === 0) {
-                          list.innerHTML = '<p class="text-xs text-slate-400 dark:text-slate-500">' + (i18n[lang]?.api_keys_empty || 'No API keys generated yet.') + '</p>';
-                          return;
-                      }
-                      list.innerHTML = data.keys.map(k => {
-                          const created = new Date(k.createdAt).toLocaleDateString();
-                          const lastUsed = k.lastUsed ? new Date(k.lastUsed).toLocaleDateString() : (i18n[lang]?.never || 'Never');
-                          return '<div class="flex items-center justify-between p-3 bg-slate-50 dark:bg-slate-800/50 rounded-xl border border-slate-200 dark:border-darkborder">' +
-                              '<div class="flex-1 min-w-0">' +
-                              '<p class="text-xs font-bold text-slate-700 dark:text-slate-200 truncate">' + (k.name || 'Unnamed') + '</p>' +
-                              '<p class="text-[10px] font-mono text-slate-400 mt-0.5">' + k.keyPreview + '</p>' +
-                              '<p class="text-[10px] text-slate-400 mt-0.5">' + (i18n[lang]?.created || 'Created') + ': ' + created + ' · ' + (i18n[lang]?.last_used || 'Last used') + ': ' + lastUsed + '</p>' +
-                              '</div>' +
-                              '<button onclick="revokeApiKey(\\'' + k.id + '\\')" class="ms-3 px-3 py-1.5 bg-red-50 dark:bg-red-900/20 text-red-600 dark:text-red-400 text-[10px] font-bold rounded-lg border border-red-200 dark:border-red-800 hover:bg-red-100 dark:hover:bg-red-900/40 transition-colors">' + (i18n[lang]?.revoke || 'Revoke') + '</button>' +
-                              '</div>';
-                      }).join('');
-                  }
-              } catch(e) {}
-          }
-
-          async function generateApiKey() {
-              const name = prompt(i18n[lang]?.enter_key_name || 'Enter a name for this API key:');
-              if (!name) return;
-              try {
-                  const res = await fetch(baseRoute + '/api/keys', {
-                      method: 'POST',
-                      headers: { 'Content-Type': 'application/json', 'Authorization': 'Bearer ' + sessionKey },
-                      body: JSON.stringify({ action: 'create', name })
-                  });
-                  const data = await res.json();
-                  if (data.success && data.key) {
-                      const newBox = document.getElementById('api-key-new');
-                      const keyInput = document.getElementById('api-key-value');
-                      keyInput.value = data.key.key;
-                      newBox.classList.remove('hidden');
-                      loadApiKeys();
-                  } else {
-                      alert(data.error || 'Failed to create key');
-                  }
-              } catch(e) { alert('Error: ' + e.message); }
-          }
-
-          async function revokeApiKey(id) {
-              if (!confirm(i18n[lang]?.confirm_revoke || 'Revoke this API key? The remote panel will lose access.')) return;
-              try {
-                  const res = await fetch(baseRoute + '/api/keys', {
-                      method: 'POST',
-                      headers: { 'Content-Type': 'application/json', 'Authorization': 'Bearer ' + sessionKey },
-                      body: JSON.stringify({ action: 'revoke', id })
-                  });
-                  const data = await res.json();
-                  if (data.success) loadApiKeys();
-                  else alert(data.error || 'Failed to revoke key');
-              } catch(e) { alert('Error: ' + e.message); }
-          }
-
-          function copyApiKey() {
-              const input = document.getElementById('api-key-value');
-              navigator.clipboard.writeText(input.value);
-              const stat = document.getElementById('save-status');
-              if (stat) { stat.textContent = "Copied!"; stat.className = "text-sm font-bold text-emerald-500 md:me-4"; setTimeout(() => { stat.textContent = ""; }, 2000); }
-          }
-
-          async function doSaveDirectly() {
-              const btn = document.querySelector('button[onclick="doSave()"]');
-              const origText = btn.innerText; btn.innerText = "...";
-              try {
-                  const res = await fetch(baseRoute + '/api/sync', {
-                      method: 'POST',
-                      headers: {'Content-Type': 'application/json'},
-                      body: JSON.stringify({ key: sessionKey, config: window.lowkeyConfig })
-                  });
-                  if(res.ok) {
-                       const stat = document.getElementById('save-status');
-                       stat.textContent = "Saved. Refreshing...";
-                       setTimeout(() => { doLogin(true); stat.textContent = ""; }, 1000);
-                  }
-              } catch(e) {}
-              btn.innerText = origText;
-          }
-
-          async function resolveSmartCleanIps() {
-              const btn = document.getElementById('btn-resolve-smart-ips');
-              const origText = btn.innerHTML;
-              btn.disabled = true;
-              btn.innerHTML = '⚡ Resolving CDN & Clean IPs...';
-              
-              const domains = [
-                  'www.speedtest.net',
-                  'grok.com',
-                  'feedback.spotify.com',
-                  'www.hcaptcha.com',
-                  'chatgpt.com',
-                  'sourceforge.net',
-                  'snapp.ir',
-                  'digikala.com',
-                  'divar.ir',
-                  'cafebazaar.ir',
-                  'shaparak.ir',
-                  'aparat.com',
-                  'soft98.ir',
-                  'varzesh3.com'
-              ];
-              
-              let resolvedIps = new Set();
-              const cleanIpsTextarea = document.getElementById('cfg-ips');
-              
-              async function resolveOne(domain) {
-                  try {
-                      const res = await fetch(\`https://cloudflare-dns.com/dns-query?name=\${encodeURIComponent(domain)}&type=A\`, { 
-                          headers: { 'accept': 'application/dns-json' }
-                      });
-                      const data = await res.json();
-                      if (data && data.Answer) {
-                          data.Answer.forEach(ans => {
-                              if (ans.type === 1 && ans.data) {
-                                  resolvedIps.add(ans.data);
-                              }
-                          });
-                      }
-                  } catch(e) {
-                      try {
-                          const res = await fetch(\`https://dns.google/resolve?name=\${encodeURIComponent(domain)}&type=A\`);
-                          const data = await res.json();
-                          if (data && data.Answer) {
-                              data.Answer.forEach(ans => {
-                                  if (ans.type === 1 && ans.data) {
-                                      resolvedIps.add(ans.data);
-                                  }
-                              });
-                          }
-                      } catch(ge) {}
-                  }
-              }
-              
-              try {
-                  await Promise.all(domains.map(d => resolveOne(d)));
-              } catch(err) {
-                  console.error("DNS resolving process encountered an issue:", err);
-              }
-              
-              if (resolvedIps.size > 0) {
-                  const ipList = Array.from(resolvedIps).join('\\n');
-                  cleanIpsTextarea.value = ipList;
-                  cleanIpsTextarea.dispatchEvent(new Event('input'));
-                  cleanIpsTextarea.dispatchEvent(new Event('change'));
-                  alert((lang === 'fa' ? 'با موفقیت حل شد و ' : 'Successfully resolved and loaded ') + resolvedIps.size + (lang === 'fa' ? ' آی‌پی تمیز بارگذاری شد!' : ' clean IPs!'));
-              } else {
-                  alert(lang === 'fa' ? 'خطا در تبدیل دامنه به آی‌پی. لطفاً اتصال اینترنت یا DNS سفارشی خود را بررسی کنید.' : 'Failed to resolve domains to IPs. Please verify your internet connection or custom DNS.');
-              }
-              
-              btn.disabled = false;
-              btn.innerHTML = origText;
-          }
-
-
-          
-          function parseMarkdown(md) {
-              if (!md) return '';
-              let lines = md.split(/\\r?\\n/);
-              let htmlLines = [];
-              let inCodeBlock = false;
-              let codeContent = [];
-              let activeBlockLang = null;
-
-              for (let line of lines) {
-                  let trimmed = line.trim();
-
-                  if (trimmed === '<!-- LANG:EN -->' || trimmed === '<!--LANG:EN-->') {
-                      if (activeBlockLang === 'en') {
-                          activeBlockLang = null;
-                      } else {
-                          activeBlockLang = 'en';
-                      }
-                      continue;
-                  }
-                  if (trimmed === '<!-- LANG:FA -->' || trimmed === '<!--LANG:FA-->') {
-                      if (activeBlockLang === 'fa') {
-                          activeBlockLang = null;
-                      } else {
-                          activeBlockLang = 'fa';
-                      }
-                      continue;
-                  }
-
-                  if (activeBlockLang !== null && activeBlockLang !== lang) {
-                      continue;
-                  }
-
-                  // Toggle code block
-                  if (trimmed.startsWith('\\x60\\x60\\x60')) {
-                      if (inCodeBlock) {
-                          // Close code block
-                          let codeText = codeContent.join('\\n')
-                              .replace(/&/g, "&amp;")
-                              .replace(/</g, "&lt;")
-                              .replace(/>/g, "&gt;");
-                          htmlLines.push('<pre class="bg-slate-900/90 text-slate-100 p-3 rounded-xl my-2 font-mono text-[10px] overflow-x-auto border border-slate-800 max-h-40">' + codeText + '</pre>');
-                          codeContent = [];
-                          inCodeBlock = false;
-                      } else {
-                          inCodeBlock = true;
-                      }
-                      continue;
-                  }
-
-                  if (inCodeBlock) {
-                      codeContent.push(line);
-                      continue;
-                  }
-
-                  if (!trimmed) {
-                      continue; 
-                  }
-
-                  // Process headers
-                  if (trimmed.startsWith('### ')) {
-                      let text = trimmed.slice(4);
-                      htmlLines.push('<h5 class="text-sm font-bold text-amber-800 dark:text-amber-400 mt-3 mb-1">' + parseInlineMarkdown(text) + '</h5>');
-                      continue;
-                  }
-                  if (trimmed.startsWith('## ')) {
-                      let text = trimmed.slice(3);
-                      htmlLines.push('<h4 class="text-sm font-extrabold text-amber-800 dark:text-amber-400 mt-4 mb-2">' + parseInlineMarkdown(text) + '</h4>');
-                      continue;
-                  }
-                  if (trimmed.startsWith('# ')) {
-                      let text = trimmed.slice(2);
-                      htmlLines.push('<h3 class="text-base font-black text-amber-900 dark:text-amber-300 mt-4 mb-2">' + parseInlineMarkdown(text) + '</h3>');
-                      continue;
-                  }
-
-                  // Process lists
-                  let listMatch = line.match(/^(\\s*)([-*+])\\s+(.*)$/);
-                  if (listMatch) {
-                      let text = listMatch[3];
-                      htmlLines.push('<div class="flex items-start gap-2 my-1"><span class="text-amber-500 mt-0.5">▪</span><span class="flex-1">' + parseInlineMarkdown(text) + '</span></div>');
-                      continue;
-                  }
-
-                  // Standard line
-                  htmlLines.push('<p class="my-1">' + parseInlineMarkdown(line) + '</p>');
-              }
-
-              // Guard for unclosed code block
-              if (inCodeBlock && codeContent.length > 0) {
-                  let codeText = codeContent.join('\\n')
-                      .replace(/&/g, "&amp;")
-                      .replace(/</g, "&lt;")
-                      .replace(/>/g, "&gt;");
-                  htmlLines.push('<pre class="bg-slate-900/90 text-slate-100 p-3 rounded-xl my-2 font-mono text-[10px] overflow-x-auto border border-slate-800 max-h-40">' + codeText + '</pre>');
-              }
-
-              return htmlLines.join('\\n');
-
-              function parseInlineMarkdown(text) {
-                  let safe = text
-                      .replace(/&/g, "&amp;")
-                      .replace(/</g, "&lt;")
-                      .replace(/>/g, "&gt;");
-                  // Bold
-                  safe = safe.replace(/\\*\\*(.*?)\\*\\*/g, '<strong class="font-extrabold text-slate-800 dark:text-slate-200">\$1</strong>');
-                  // Italic
-                  safe = safe.replace(/\\*(.*?)\\*/g, '<em class="italic">\$1</em>');
-                  // Inline code
-                  safe = safe.replace(/[\\x60](.*?)[\\x60]/g, '<code class="bg-amber-500/10 dark:bg-slate-800 px-1.5 py-0.5 rounded text-rose-500 font-mono text-[11px]">\$1</code>');
-                  return safe;
-              }
-          }
-
-          //DateTime Function
-            const _dtFormatter = new Intl.DateTimeFormat('fa-IR', {
-        year: 'numeric',
-        month: 'long',
-        day: 'numeric',
-        hour: '2-digit',
-        minute: '2-digit',
-        second: '2-digit'
-    });
-            function updatePersianDateTime() {
-    const now = new Date();
-    const parts = _dtFormatter.formatToParts(now);
-
-    const map = {};
-    parts.forEach(p => {
-        map[p.type] = p.value;
-    });
-
-  
-      
-        const custom = \`\${map.day} \${map.month} \${map.year} \${map.hour}:\${map.minute}:\${map.second}\`;
-
-    document.getElementById("net-datetime").innerText = custom;
-    
-}
-
-                updatePersianDateTime();
-                setInterval(updatePersianDateTime, 1000);
-
-
-
-
-          document.addEventListener('DOMContentLoaded', () => {
-              const cached = localStorage.getItem('lowkey_session');
-              if(cached) {
-                  try {
-                      const session = JSON.parse(cached);
-                      if (Date.now() < session.expiry) {
-                          document.getElementById('pwd').value = session.key;
-                          doLogin(true);
-                      } else { localStorage.removeItem('lowkey_session'); }
-                  } catch(e) { localStorage.removeItem('lowkey_session'); }
-              }
-          });
-      </script>
-  </body>
-  </html>
-    `;
-  } 
+<div class="flex items-center gap-4 mt-6 z-10">
+    <a href="https://t.me/lowkey878" target="_blank" class="flex items-center gap-2 px-4 py-2 bg-white dark:bg-amoled-card border border-gray-200 dark:border-amoled-border rounded-full shadow-sm hover:shadow-md transition text-sm font-bold text-gray-700 dark:text-zinc-300 hover:text-sky-500 dark:hover:text-sky-400 group">
+        <svg class="w-5 h-5 text-sky-500 group-hover:scale-110 transition" viewBox="0 0 24 24" fill="currentColor"><path d="M12 2C6.48 2 2 6.48 2 12s4.48 10 10 10 10-4.48 10-10S17.52 2 12 2zm4.64 6.8c-.15 1.58-.8 5.42-1.13 7.19-.14.75-.42 1-.68 1.03-.58.05-1.02-.38-1.58-.75-.88-.58-1.38-.94-2.23-1.5-.99-.65-.35-1.01.22-1.59.15-.15 2.71-2.48 2.76-2.69a.2.2 0 00-.05-.18c-.06-.05-.14-.03-.21-.02-.09.02-1.49.94-4.22 2.79-.4.27-.76.41-1.08.4-.36-.01-1.04-.2-1.55-.37-.63-.2-1.12-.31-1.08-.66.02-.18.27-.36.74-.55 2.92-1.27 4.86-2.11 5.83-2.51 2.78-1.16 3.35-1.36 3.73-1.37.08 0 .27.02.39.12.1.08.13.19.14.27-.01.06.01.24 0 .24z"/></svg>
+        lowkey878@
+    </a>
+</div>
+    <script>
+        /* {{USER_DATA_PLACEHOLDER}} */
+        function getHost() {
+            return window.location.host;
+        }
+        function getVlessLink() {
+            const u = window.statusUser;
+            const host = getHost();
+            var ips = [host];
+            if (u.ips) {
+                ips = u.ips.split('\\n').map(function(ip) { return ip.trim(); }).filter(function(ip) { return ip.length > 0; });
+                if (ips.length === 0) ips = [host];
+            }
+            var ports = String(u.port || '443').split(',').map(function(p) { return p.trim(); }).filter(function(p) { return p.length > 0; });
+            var fp = u.fingerprint || 'chrome';
+            var links = [];
+            ips.forEach(function(ip, ipIndex) {
+                ports.forEach(function(portStr) {
+                    var isTlsPort = ['443', '2053', '2083', '2087', '2096', '8443'].includes(portStr);
+                    var tlsVal = isTlsPort ? 'tls' : 'none';
+                    var remark = ips.length > 1 ? (u.username + '-' + (ipIndex + 1) + '-' + portStr) : (u.username + '-' + portStr);
+                    links.push('vle' + 'ss://' + (u.uuid || '') + '@' + ip + ':' + portStr + '?path=%2FIn_Panel_Rayeghan_Ast_Va_Gheyre_Ghabele_Foroosh&security=' + tlsVal + '&encryption=none&insecure=0&host=' + host + '&fp=' + fp + '&type=ws&allowInsecure=0&sni=' + host + '#' + encodeURIComponent(remark));
+                });
+            });
+            return links.join('\\n');
+        }
+        function copyVlessConfig() {
+            navigator.clipboard.writeText(getVlessLink()).then(() => alert('✅ کانفیگ VLESS با موفقیت کپی شد!'));
+        }
+        function copyTextSub() {
+            const link = window.location.protocol + '//' + getHost() + '/sub/' + encodeURIComponent(window.statusUser.username);
+            navigator.clipboard.writeText(link).then(() => alert('✅ لینک ساب متنی کپی شد!'));
+        }
+        document.addEventListener('DOMContentLoaded', () => {
+            const u = window.statusUser;
+            if (!u) return;
+            const limit = u.ip_limit !== undefined ? u.ip_limit : u.max_connections;
+            document.getElementById('display-username').innerText = u.username;
+            const badge = document.getElementById('live-connections-badge');
+            badge.classList.remove('hidden');
+            if (u.online_count && u.online_count > 0) {
+                document.getElementById('live-connections-text').innerText = u.online_count + (limit ? '/' + limit : '') + ' دستگاه متصل';
+                badge.className = 'inline-flex items-center gap-1.5 px-3 py-1 bg-emerald-500/10 border border-emerald-500/20 text-emerald-500 rounded-full text-xs font-bold shadow-sm';
+                badge.querySelector('span.w-2').className = 'w-2 h-2 rounded-full bg-emerald-500 animate-pulse';
+            } else {
+                document.getElementById('live-connections-text').innerText = '۰ دستگاه متصل';
+                badge.className = 'inline-flex items-center gap-1.5 px-3 py-1 bg-gray-500/10 border border-gray-500/20 text-gray-500 dark:text-zinc-400 rounded-full text-xs font-bold shadow-sm';
+                badge.querySelector('span.w-2').className = 'w-2 h-2 rounded-full bg-gray-500';
+            }
+            // Compute volume
+            const usedGb = u.used_gb || 0;
+            const limitGb = u.limit_gb;
+            const formattedUsed = usedGb < 1 ? (usedGb * 1024).toFixed(0) + ' MB' : usedGb.toFixed(2) + ' GB';
+            document.getElementById('used-vol').innerText = formattedUsed;
+            let isVolumeExpired = false;
+            if (limitGb) {
+                document.getElementById('limit-vol').innerText = limitGb + ' GB';
+                const pct = Math.min((usedGb / limitGb) * 100, 100);
+                document.getElementById('volume-pct').innerText = pct.toFixed(0) + '٪';
+                document.getElementById('volume-progress').style.width = pct + '%';
+                // Color bar
+                const hue = 120 - (pct * 1.2);
+                document.getElementById('volume-progress').style.backgroundColor = 'hsl(' + hue + ', 80%, 45%)';
+                if (usedGb >= limitGb) isVolumeExpired = true;
+            } else {
+                document.getElementById('limit-vol').innerText = 'نامحدود';
+                document.getElementById('volume-pct').innerText = '۰٪';
+                document.getElementById('volume-progress').style.width = '100%';
+                document.getElementById('volume-progress').style.backgroundColor = '#2dd4bf';
+            }
+            // Compute Expiry
+            let daysRemaining = 'نامحدود';
+            let totalDays = 'نامحدود';
+            let isTimeExpired = false;
+            if (u.expiry_days) {
+                totalDays = u.expiry_days + ' روز';
+                if (u.created_at) {
+                    const created = new Date(u.created_at);
+                    const expiryDate = new Date(created.getTime() + (u.expiry_days * 24 * 60 * 60 * 1000));
+                    const diffDays = Math.ceil((expiryDate - new Date()) / (1000 * 60 * 60 * 24));
+                    daysRemaining = diffDays > 0 ? diffDays : 0;
+                    const pct = Math.max(0, Math.min(100, (daysRemaining / u.expiry_days) * 100));
+                    document.getElementById('expiry-pct').innerText = pct.toFixed(0) + '٪';
+                    document.getElementById('expiry-progress').style.width = pct + '%';
+                    const hue = pct * 1.2;
+                    document.getElementById('expiry-progress').style.backgroundColor = 'hsl(' + hue + ', 80%, 45%)';
+                    if (new Date() > expiryDate) isTimeExpired = true;
+                }
+            } else {
+                document.getElementById('expiry-pct').innerText = '۰٪';
+                document.getElementById('expiry-progress').style.width = '100%';
+                document.getElementById('expiry-progress').style.backgroundColor = '#14b8a6';
+            }
+            document.getElementById('days-remaining').innerText = daysRemaining === 'نامحدود' ? 'نامحدود' : daysRemaining + ' روز';
+            document.getElementById('total-days').innerText = totalDays;
+            const usedReq = u.used_req || 0;
+            const limitReq = u.limit_req;
+            document.getElementById('used-req').innerText = usedReq.toLocaleString();
+            let isReqExpired = false;
+            if (limitReq) {
+                document.getElementById('limit-req').innerText = limitReq.toLocaleString();
+                const rPct = Math.min((usedReq / limitReq) * 100, 100);
+                document.getElementById('req-pct').innerText = rPct.toFixed(0) + '٪';
+                document.getElementById('req-progress').style.width = rPct + '%';
+                const rHue = 120 - (rPct * 1.2);
+                document.getElementById('req-progress').style.backgroundColor = 'hsl(' + rHue + ', 80%, 45%)';
+                if (usedReq >= limitReq) isReqExpired = true;
+            } else {
+                document.getElementById('limit-req').innerText = 'نامحدود';
+                document.getElementById('req-pct').innerText = '۰٪';
+                document.getElementById('req-progress').style.width = '100%';
+                document.getElementById('req-progress').style.backgroundColor = '#10b981';
+            }
+            const onlineCount = u.online_count || 0;
+            document.getElementById('online-count').innerText = onlineCount;
+            if (limit) {
+                document.getElementById('limit-online').innerText = limit;
+                const oPct = Math.min((onlineCount / limit) * 100, 100);
+                document.getElementById('online-pct').innerText = oPct.toFixed(0) + '٪';
+                document.getElementById('online-progress').style.width = oPct + '%';
+                const oHue = 120 - (oPct * 1.2);
+                document.getElementById('online-progress').style.backgroundColor = 'hsl(' + oHue + ', 80%, 45%)';
+            } else {
+                document.getElementById('limit-online').innerText = 'نامحدود';
+                document.getElementById('online-pct').innerText = '۰٪';
+                document.getElementById('online-progress').style.width = '100%';
+                document.getElementById('online-progress').style.backgroundColor = onlineCount > 0 ? '#0ea5e9' : '#9ca3af'; 
+            }
+            const statusCard = document.getElementById('status-card');
+            const statusText = document.getElementById('status-text');
+            if (u.is_active === 0) {
+                statusCard.className = 'mb-6 rounded-2xl p-4 text-center border font-bold relative z-10 bg-red-500/10 border-red-500/30 text-red-500 shadow-md shadow-red-500/5';
+                statusCard.style.boxShadow = 'inset 0 0 12px rgba(239, 68, 68, 0.1)';
+                statusText.innerText = '❌ وضعیت اشتراک: غیرفعال / مسدود دستی';
+            } else if (isVolumeExpired) {
+                statusCard.className = 'mb-6 rounded-2xl p-4 text-center border font-bold relative z-10 bg-yellow-500/10 border-yellow-500/30 text-yellow-500 shadow-md shadow-yellow-500/5';
+                statusText.innerText = '⚠️ وضعیت اشتراک: تمام شدن حجم مجاز';
+            } else if (isReqExpired) {
+                statusCard.className = 'mb-6 rounded-2xl p-4 text-center border font-bold relative z-10 bg-yellow-500/10 border-yellow-500/30 text-yellow-500 shadow-md shadow-yellow-500/5';
+                statusText.innerText = '⚠️ وضعیت اشتراک: تمام شدن ریکوئست مجاز';
+            } else if (isTimeExpired) {
+                statusCard.className = 'mb-6 rounded-2xl p-4 text-center border font-bold relative z-10 bg-yellow-500/10 border-yellow-500/30 text-yellow-500 shadow-md shadow-yellow-500/5';
+                statusText.innerText = '⏳ وضعیت اشتراک: منقضی شده (پایان زمان اعتبار)';
+            } else {
+                statusCard.className = 'mb-6 rounded-2xl p-4 text-center border font-bold relative z-10 bg-emerald-500/10 border-emerald-500/30 text-emerald-500 shadow-md shadow-emerald-500/5';
+                statusText.innerText = '✅ وضعیت اشتراک: فعال و متصل';
+            }
+        });
+    </script>
+</body>
+</html>`,
+};
