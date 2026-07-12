@@ -4779,6 +4779,6 @@ const HTML_TEMPLATES = {
             console.log('🌟 Neon Origami Panel v1.5.10 Loaded Successfully!');
         </script>
     </body>
-    </html>
+    </html>`,
     
-};
+}; 
