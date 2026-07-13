@@ -18,43 +18,6 @@ const DOWNSTREAM_GRAIN_TAIL_THRESHOLD = 512;
 const DOWNSTREAM_GRAIN_SILENT_MS = 1;
 const TCP_CONCURRENCY = 2;
 const PRELOAD_RACE_DIAL = true;
-
-const RES_TYPES = ["vless", "vmess", "trojan", "shadowsocks", "wireguard", "hysteria2", "tuic"];
-const RES_ALL = [...RES_TYPES, "custom"];
-const RES_NAMES = { vless: "VLESS", vmess: "VMess", trojan: "Trojan", shadowsocks: "Shadowsocks", wireguard: "WireGuard", hysteria2: "Hysteria2", tuic: "TUIC", custom: "Custom" };
-
-function detectResourceType(c) {
-	c = (c || "").trim();
-	if (c.startsWith("{")) return "custom";
-	if (c.startsWith("vmess://")) return "vmess";
-	if (c.startsWith("vless://")) return "vless";
-	if (c.startsWith("trojan://")) return "trojan";
-	if (c.startsWith("ss://")) return "shadowsocks";
-	if (c.startsWith("wg://") || c.startsWith("wireguard://")) return "wireguard";
-	if (c.startsWith("hysteria2://") || c.startsWith("hy2://")) return "hysteria2";
-	if (c.startsWith("tuic://")) return "tuic";
-	return null;
-}
-
-async function getResourcesData(db) {
-	let data = {};
-	try {
-		const row = await db.prepare("SELECT value FROM settings WHERE key = 'resources_data'").first();
-		data = row && row.value ? JSON.parse(row.value) : {};
-	} catch (e) {
-		data = {};
-	}
-	RES_ALL.forEach((k) => {
-		if (!data[k]) data[k] = [];
-	});
-	return data;
-}
-
-async function saveResourcesData(db, data) {
-	const json = JSON.stringify(data);
-	await db.prepare("INSERT INTO settings (key, value) VALUES ('resources_data', ?) ON CONFLICT(key) DO UPDATE SET value = ?").bind(json, json).run();
-}
-
 export default {
 	async fetch(request, env, ctx) {
 		trackRequest(env, ctx);
@@ -65,9 +28,6 @@ export default {
 		}
 		if (Router.isSubscriptionPath(url.pathname)) {
 			return await Router.handleSubscription(url, env);
-		}
-		if (url.pathname.startsWith("/res/")) {
-			return await Router.handleResourceFeed(url, env);
 		}
 		if (url.pathname.startsWith("/api/") || url.pathname === "/locations") {
 			return await Router.handleApi(request, url, env, ctx);
@@ -124,42 +84,6 @@ const Router = {
 			return await SubscriptionService.generateText(user, host);
 		} catch (err) {
 			return new Response("Error building config: " + err.message, { status: 500 });
-		}
-	},
-	async handleResourceFeed(url, env) {
-		const parts = url.pathname.split("/");
-		const type = parts[2];
-		try {
-			const data = await getResourcesData(env.DB);
-			if (type === "mix") {
-				let r = [];
-				RES_TYPES.forEach((t) => {
-					(data[t] || []).forEach((i) => {
-						if (i.e) r.push(i.c);
-					});
-				});
-				return new Response(btoa(unescape(encodeURIComponent(r.join("\n")))), { headers: { "content-type": "text/plain; charset=utf-8" } });
-			}
-			if (type === "custom") {
-				const j = (data.custom || [])
-					.filter((i) => i.e)
-					.map((i) => {
-						try {
-							return JSON.parse(i.c);
-						} catch (e) {
-							return null;
-						}
-					})
-					.filter((i) => i !== null);
-				return new Response(JSON.stringify(j, null, 2), { headers: { "content-type": "application/json; charset=utf-8" } });
-			}
-			if (RES_TYPES.includes(type)) {
-				const r = (data[type] || []).filter((i) => i.e).map((i) => i.c);
-				return new Response(btoa(unescape(encodeURIComponent(r.join("\n")))), { headers: { "content-type": "text/plain; charset=utf-8" } });
-			}
-			return new Response(null, { status: 400 });
-		} catch (err) {
-			return new Response("Error building resource feed: " + err.message, { status: 500 });
 		}
 	},
 	async handlePanel(request, env) {
@@ -347,68 +271,6 @@ const Router = {
 				status: 401,
 				headers: { "Content-Type": "application/json; charset=utf-8" },
 			});
-		}
-		if (url.pathname === "/api/resources" && request.method === "GET") {
-			const data = await getResourcesData(env.DB);
-			return new Response(JSON.stringify(data), { headers: { "Content-Type": "application/json; charset=utf-8" } });
-		}
-		if (url.pathname === "/api/resources/add" && request.method === "POST") {
-			const body = await request.json().catch(() => ({}));
-			let c = (body.content || "").trim();
-			const t = detectResourceType(c);
-			if (!t) return new Response(JSON.stringify({ error: "لینک یا فرمت کانفیگ نامعتبر است" }), { status: 400, headers: { "Content-Type": "application/json; charset=utf-8" } });
-			const data = await getResourcesData(env.DB);
-			if (t === "custom") {
-				try {
-					c = JSON.stringify(JSON.parse(c));
-				} catch (e) {}
-			}
-			if (data[t].some((x) => x.c === c)) {
-				return new Response(JSON.stringify({ error: "این کانفیگ تکراری است" }), { status: 409, headers: { "Content-Type": "application/json; charset=utf-8" } });
-			}
-			data[t].push({ c, e: 1 });
-			await saveResourcesData(env.DB, data);
-			return new Response(JSON.stringify({ success: true }), { headers: { "Content-Type": "application/json; charset=utf-8" } });
-		}
-		if (url.pathname === "/api/resources/edit" && request.method === "POST") {
-			const body = await request.json().catch(() => ({}));
-			const data = await getResourcesData(env.DB);
-			if (data[body.type] && data[body.type][body.index] !== undefined) {
-				let nc = (body.newContent || "").trim();
-				const nt = detectResourceType(nc);
-				if (nt !== body.type) {
-					return new Response(JSON.stringify({ error: "نوع پروتکل کانفیگ جدید با نوع قبلی مطابقت ندارد" }), { status: 400, headers: { "Content-Type": "application/json; charset=utf-8" } });
-				}
-				if (nt === "custom") {
-					try {
-						nc = JSON.stringify(JSON.parse(nc));
-					} catch (e) {}
-				}
-				data[body.type][body.index].c = nc;
-				await saveResourcesData(env.DB, data);
-				return new Response(JSON.stringify({ success: true }), { headers: { "Content-Type": "application/json; charset=utf-8" } });
-			}
-			return new Response(JSON.stringify({ error: "آیتم یافت نشد" }), { status: 404, headers: { "Content-Type": "application/json; charset=utf-8" } });
-		}
-		if (url.pathname === "/api/resources/del" && request.method === "POST") {
-			const body = await request.json().catch(() => ({}));
-			const data = await getResourcesData(env.DB);
-			if (data[body.type] && data[body.type][body.index] !== undefined) {
-				data[body.type].splice(body.index, 1);
-				await saveResourcesData(env.DB, data);
-				return new Response(JSON.stringify({ success: true }), { headers: { "Content-Type": "application/json; charset=utf-8" } });
-			}
-			return new Response(JSON.stringify({ error: "آیتم یافت نشد" }), { status: 404, headers: { "Content-Type": "application/json; charset=utf-8" } });
-		}
-		if (url.pathname === "/api/resources/toggle" && request.method === "POST") {
-			const body = await request.json().catch(() => ({}));
-			const data = await getResourcesData(env.DB);
-			if (data[body.type] && data[body.type][body.index] !== undefined) {
-				data[body.type][body.index].e = data[body.type][body.index].e ? 0 : 1;
-				await saveResourcesData(env.DB, data);
-				return new Response(JSON.stringify({ success: true }), { headers: { "Content-Type": "application/json; charset=utf-8" } });
-			}
-			return new Response(JSON.stringify({ error: "آیتم یافت نشد" }), { status: 404, headers: { "Content-Type": "application/json; charset=utf-8" } });
 		}
 		if (url.pathname === "/api/update-panel" && request.method === "POST") {
 			const body = await request.json().catch(() => ({}));
@@ -2490,7 +2352,7 @@ async function connectHttp(proxyStr, destAddr, destPort, initialData) {
 
 const HTML_TEMPLATES = {
 	nginx: `<!DOCTYPE html>
-<html lang="fa" dir="rtl" class="dark">
+<html lang="fa" dir="rtl">
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
@@ -2503,97 +2365,19 @@ const HTML_TEMPLATES = {
             theme: {
                 extend: {
                     fontFamily: { sans: ['Vazirmatn', 'sans-serif'] },
-                    colors: {
-                        amoled: { bg: '#0a0a12', card: '#131320', input: '#181826', border: '#26263b' },
-                        brand: { primary: '#4F46E5', accent: '#22C55E', danger: '#EF4444' }
-                    },
-                    boxShadow: {
-                        glow: '0 8px 30px -8px rgba(79,70,229,0.35)',
-                        card: '0 1px 2px rgba(0,0,0,0.04), 0 8px 24px -12px rgba(15,23,42,0.12)'
-                    }
+                    colors: { amoled: { bg: '#0a0612', card: '#120c1f', input: '#170f28', border: '#2c1f45' } }
                 }
             }
         }
     </script>
     <style>
-        /* ===== LowKey Premium UI Kit ===== */
-        :root{
-            --lk-primary:#4F46E5; --lk-primary-light:#6366F1; --lk-primary-dark:#4338CA;
-            --lk-accent:#22C55E; --lk-danger:#EF4444; --lk-warning:#F59E0B;
-        }
-        .lk-glass{
-            background:rgba(255,255,255,.72); backdrop-filter:blur(16px) saturate(160%);
-            -webkit-backdrop-filter:blur(16px) saturate(160%);
-            border:1px solid rgba(148,163,184,.18);
-        }
-        .dark .lk-glass{ background:rgba(19,19,32,.62); border-color:rgba(148,163,184,.10); }
-        .lk-fade-in{ opacity:0; transform:translateY(10px); animation:lkFadeIn .5s cubic-bezier(.16,1,.3,1) forwards; }
-        @keyframes lkFadeIn{ to{ opacity:1; transform:translateY(0); } }
-        .lk-stagger > *{ opacity:0; transform:translateY(8px); animation:lkFadeIn .45s cubic-bezier(.16,1,.3,1) forwards; }
-        .lk-stagger > *:nth-child(1){ animation-delay:.02s } .lk-stagger > *:nth-child(2){ animation-delay:.06s }
-        .lk-stagger > *:nth-child(3){ animation-delay:.10s } .lk-stagger > *:nth-child(4){ animation-delay:.14s }
-        .lk-stagger > *:nth-child(5){ animation-delay:.18s } .lk-stagger > *:nth-child(6){ animation-delay:.22s }
-        .lk-stagger > *:nth-child(n+7){ animation-delay:.26s }
-        .lk-skeleton{
-            position:relative; overflow:hidden; background:#e5e7eb; border-radius:.5rem;
-            background-image:linear-gradient(90deg, rgba(255,255,255,0) 0, rgba(255,255,255,.55) 20%, rgba(255,255,255,0) 40%);
-            background-size:200% 100%; animation:lkShimmer 1.4s ease-in-out infinite;
-        }
-        .dark .lk-skeleton{ background:#1c1c2e; background-image:linear-gradient(90deg, rgba(255,255,255,0) 0, rgba(255,255,255,.06) 20%, rgba(255,255,255,0) 40%); background-size:200% 100%; }
-        @keyframes lkShimmer{ 0%{ background-position:150% 0 } 100%{ background-position:-50% 0 } }
-        .lk-btn{
-            display:inline-flex; align-items:center; justify-content:center; gap:.4rem;
-            font-weight:600; border-radius:.85rem; padding:.55rem 1.1rem; font-size:.85rem;
-            transition:transform .15s ease, box-shadow .2s ease, filter .2s ease, background-color .2s ease;
-            border:1px solid transparent; white-space:nowrap;
-        }
-        .lk-btn:active{ transform:scale(.96); }
-        .lk-btn-primary{ background:linear-gradient(135deg, var(--lk-primary-light), var(--lk-primary)); color:#fff; box-shadow:0 6px 18px -6px rgba(79,70,229,.55); }
-        .lk-btn-primary:hover{ filter:brightness(1.08); box-shadow:0 10px 24px -6px rgba(79,70,229,.6); }
-        .lk-btn-accent{ background:linear-gradient(135deg, #34D399, var(--lk-accent)); color:#fff; box-shadow:0 6px 18px -6px rgba(34,197,94,.5); }
-        .lk-btn-accent:hover{ filter:brightness(1.08); }
-        .lk-btn-danger{ background:linear-gradient(135deg, #F87171, var(--lk-danger)); color:#fff; box-shadow:0 6px 18px -6px rgba(239,68,68,.5); }
-        .lk-btn-danger:hover{ filter:brightness(1.08); }
-        .lk-btn-ghost{ background:rgba(148,163,184,.12); color:inherit; }
-        .lk-btn-ghost:hover{ background:rgba(148,163,184,.22); }
-        .lk-card{
-            border-radius:1.1rem; border:1px solid rgba(148,163,184,.16);
-            box-shadow:0 1px 2px rgba(15,23,42,.04), 0 10px 28px -14px rgba(15,23,42,.14);
-            transition:transform .25s cubic-bezier(.16,1,.3,1), box-shadow .25s ease, border-color .25s ease;
-        }
-        .lk-card:hover{ transform:translateY(-3px); box-shadow:0 18px 36px -16px rgba(79,70,229,.30); border-color:rgba(79,70,229,.35); }
-        .lk-badge{
-            display:inline-flex; align-items:center; gap:.3rem; font-size:.68rem; font-weight:700;
-            padding:.22rem .6rem; border-radius:999px; letter-spacing:.01em; line-height:1.4;
-        }
-        .lk-badge-dot{ width:6px; height:6px; border-radius:999px; flex-shrink:0; }
-        .lk-badge-success{ background:rgba(34,197,94,.12); color:#16A34A; }
-        .dark .lk-badge-success{ background:rgba(34,197,94,.14); color:#4ADE80; }
-        .lk-badge-danger{ background:rgba(239,68,68,.12); color:#DC2626; }
-        .dark .lk-badge-danger{ background:rgba(239,68,68,.14); color:#F87171; }
-        .lk-badge-warning{ background:rgba(245,158,11,.14); color:#B45309; }
-        .dark .lk-badge-warning{ background:rgba(245,158,11,.16); color:#FBBF24; }
-        .lk-badge-neutral{ background:rgba(148,163,184,.16); color:#475569; }
-        .dark .lk-badge-neutral{ background:rgba(148,163,184,.14); color:#CBD5E1; }
-        .lk-modal-backdrop{ backdrop-filter:blur(6px); -webkit-backdrop-filter:blur(6px); animation:lkFadeIn .2s ease forwards; }
-        .lk-modal-panel{ animation:lkModalIn .28s cubic-bezier(.16,1,.3,1) forwards; }
-        @keyframes lkModalIn{ from{ opacity:0; transform:translateY(14px) scale(.97) } to{ opacity:1; transform:translateY(0) scale(1) } }
-        table.lk-table tbody tr{ transition:background-color .15s ease; }
-        table.lk-table tbody tr:hover{ background:rgba(79,70,229,.05); }
-        .dark table.lk-table tbody tr:hover{ background:rgba(99,102,241,.08); }
-        input:focus, select:focus, textarea:focus{ outline:none; box-shadow:0 0 0 3px rgba(79,70,229,.18); border-color:var(--lk-primary) !important; }
-        ::selection{ background:rgba(79,70,229,.25); }
-        @media (prefers-reduced-motion: reduce){
-            .lk-fade-in, .lk-stagger > *, .lk-skeleton, .lk-modal-panel{ animation:none !important; opacity:1 !important; transform:none !important; }
-        }
-
         :root {
-            --brand-1: #4F46E5;
-            --brand-2: #6366F1;
-            --brand-3: #22C55E;
+            --brand-1: #4f46e5;
+            --brand-2: #7c3aed;
+            --brand-3: #14b8a6;
         }
         body { font-family: 'Vazirmatn', sans-serif; }
-        .bg-blobs { position: fixed; inset: 0; overflow: hidden; z-index: -1; pointer-events: none; }
+        .bg-blobs { position: fixed; inset: 0; overflow: hidden; z-index: -1; pointer-events: none; display: none; }
         .bg-blobs::before, .bg-blobs::after {
             content: ''; position: absolute; width: 30rem; height: 30rem; border-radius: 9999px;
             filter: blur(80px); opacity: 0.14; animation: blob-float 16s ease-in-out infinite;
@@ -2606,10 +2390,7 @@ const HTML_TEMPLATES = {
         }
         .brand-bar { height: 3px; background: linear-gradient(90deg, var(--brand-2), var(--brand-1), var(--brand-3)); }
         .btn-shine { position: relative; overflow: hidden; }
-        .btn-shine::after {
-            content: ''; position: absolute; inset: 0; background: linear-gradient(120deg, transparent 30%, rgba(255,255,255,0.28) 50%, transparent 70%);
-            transform: translateX(-100%); transition: transform 0.6s ease;
-        }
+        .btn-shine::after { display: none; }
         .btn-shine:hover::after { transform: translateX(100%); }
     </style>
 </head>
@@ -2624,10 +2405,10 @@ const HTML_TEMPLATES = {
         <h2 class="text-xl font-bold text-gray-900 dark:text-white">ورود به پنل مدیریت</h2>
         <p class="text-sm text-gray-600 dark:text-gray-400 leading-relaxed mt-2">
             برای ورود به پنل، لطفاً عبارت 
-            <span class="inline-block px-2 py-1 bg-gray-100 dark:bg-amoled-input border border-gray-200 dark:border-zinc-800 rounded-lg font-mono text-indigo-500 font-bold mx-1 shadow-md" dir="ltr">/panel</span> 
+            <span class="inline-block px-2 py-1 bg-gray-100 dark:bg-amoled-input border border-gray-200 dark:border-zinc-800 rounded-md font-mono text-indigo-500 font-bold mx-1 shadow-sm" dir="ltr">/panel</span> 
             را به انتهای آدرس مرورگر خود اضافه کنید.
         </p>
-        <button onclick="window.location.href='/panel'" class="btn-shine mt-4 w-full py-2.5 bg-gradient-to-r from-indigo-600 to-violet-600 border-0 text-white hover:from-indigo-500 hover:to-violet-500 hover:shadow-xl hover:shadow-indigo-500/30 font-medium rounded-2xl text-sm transition-colors duration-300 shadow-xl font-bold">
+        <button onclick="window.location.href='/panel'" class="btn-shine mt-4 w-full py-2.5 bg-indigo-600 border-0 text-white hover:bg-indigo-500 hover:shadow-md font-medium rounded-xl text-sm transition-colors duration-200 shadow-lg font-bold">
             ورود به پنل
         </button>
         </div>
@@ -2635,7 +2416,7 @@ const HTML_TEMPLATES = {
 </body>
 </html>`,
 	setup: `<!DOCTYPE html>
-<html lang="fa" dir="rtl" class="dark">
+<html lang="fa" dir="rtl">
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
@@ -2648,93 +2429,15 @@ const HTML_TEMPLATES = {
             theme: {
                 extend: {
                     fontFamily: { sans: ['Vazirmatn', 'sans-serif'] },
-                    colors: {
-                        amoled: { bg: '#0a0a12', card: '#131320', input: '#181826', border: '#26263b' },
-                        brand: { primary: '#4F46E5', accent: '#22C55E', danger: '#EF4444' }
-                    },
-                    boxShadow: {
-                        glow: '0 8px 30px -8px rgba(79,70,229,0.35)',
-                        card: '0 1px 2px rgba(0,0,0,0.04), 0 8px 24px -12px rgba(15,23,42,0.12)'
-                    }
+                    colors: { amoled: { bg: '#0a0612', card: '#120c1f', input: '#170f28', border: '#2c1f45' } }
                 }
             }
         }
     </script>
     <style>
-        /* ===== LowKey Premium UI Kit ===== */
-        :root{
-            --lk-primary:#4F46E5; --lk-primary-light:#6366F1; --lk-primary-dark:#4338CA;
-            --lk-accent:#22C55E; --lk-danger:#EF4444; --lk-warning:#F59E0B;
-        }
-        .lk-glass{
-            background:rgba(255,255,255,.72); backdrop-filter:blur(16px) saturate(160%);
-            -webkit-backdrop-filter:blur(16px) saturate(160%);
-            border:1px solid rgba(148,163,184,.18);
-        }
-        .dark .lk-glass{ background:rgba(19,19,32,.62); border-color:rgba(148,163,184,.10); }
-        .lk-fade-in{ opacity:0; transform:translateY(10px); animation:lkFadeIn .5s cubic-bezier(.16,1,.3,1) forwards; }
-        @keyframes lkFadeIn{ to{ opacity:1; transform:translateY(0); } }
-        .lk-stagger > *{ opacity:0; transform:translateY(8px); animation:lkFadeIn .45s cubic-bezier(.16,1,.3,1) forwards; }
-        .lk-stagger > *:nth-child(1){ animation-delay:.02s } .lk-stagger > *:nth-child(2){ animation-delay:.06s }
-        .lk-stagger > *:nth-child(3){ animation-delay:.10s } .lk-stagger > *:nth-child(4){ animation-delay:.14s }
-        .lk-stagger > *:nth-child(5){ animation-delay:.18s } .lk-stagger > *:nth-child(6){ animation-delay:.22s }
-        .lk-stagger > *:nth-child(n+7){ animation-delay:.26s }
-        .lk-skeleton{
-            position:relative; overflow:hidden; background:#e5e7eb; border-radius:.5rem;
-            background-image:linear-gradient(90deg, rgba(255,255,255,0) 0, rgba(255,255,255,.55) 20%, rgba(255,255,255,0) 40%);
-            background-size:200% 100%; animation:lkShimmer 1.4s ease-in-out infinite;
-        }
-        .dark .lk-skeleton{ background:#1c1c2e; background-image:linear-gradient(90deg, rgba(255,255,255,0) 0, rgba(255,255,255,.06) 20%, rgba(255,255,255,0) 40%); background-size:200% 100%; }
-        @keyframes lkShimmer{ 0%{ background-position:150% 0 } 100%{ background-position:-50% 0 } }
-        .lk-btn{
-            display:inline-flex; align-items:center; justify-content:center; gap:.4rem;
-            font-weight:600; border-radius:.85rem; padding:.55rem 1.1rem; font-size:.85rem;
-            transition:transform .15s ease, box-shadow .2s ease, filter .2s ease, background-color .2s ease;
-            border:1px solid transparent; white-space:nowrap;
-        }
-        .lk-btn:active{ transform:scale(.96); }
-        .lk-btn-primary{ background:linear-gradient(135deg, var(--lk-primary-light), var(--lk-primary)); color:#fff; box-shadow:0 6px 18px -6px rgba(79,70,229,.55); }
-        .lk-btn-primary:hover{ filter:brightness(1.08); box-shadow:0 10px 24px -6px rgba(79,70,229,.6); }
-        .lk-btn-accent{ background:linear-gradient(135deg, #34D399, var(--lk-accent)); color:#fff; box-shadow:0 6px 18px -6px rgba(34,197,94,.5); }
-        .lk-btn-accent:hover{ filter:brightness(1.08); }
-        .lk-btn-danger{ background:linear-gradient(135deg, #F87171, var(--lk-danger)); color:#fff; box-shadow:0 6px 18px -6px rgba(239,68,68,.5); }
-        .lk-btn-danger:hover{ filter:brightness(1.08); }
-        .lk-btn-ghost{ background:rgba(148,163,184,.12); color:inherit; }
-        .lk-btn-ghost:hover{ background:rgba(148,163,184,.22); }
-        .lk-card{
-            border-radius:1.1rem; border:1px solid rgba(148,163,184,.16);
-            box-shadow:0 1px 2px rgba(15,23,42,.04), 0 10px 28px -14px rgba(15,23,42,.14);
-            transition:transform .25s cubic-bezier(.16,1,.3,1), box-shadow .25s ease, border-color .25s ease;
-        }
-        .lk-card:hover{ transform:translateY(-3px); box-shadow:0 18px 36px -16px rgba(79,70,229,.30); border-color:rgba(79,70,229,.35); }
-        .lk-badge{
-            display:inline-flex; align-items:center; gap:.3rem; font-size:.68rem; font-weight:700;
-            padding:.22rem .6rem; border-radius:999px; letter-spacing:.01em; line-height:1.4;
-        }
-        .lk-badge-dot{ width:6px; height:6px; border-radius:999px; flex-shrink:0; }
-        .lk-badge-success{ background:rgba(34,197,94,.12); color:#16A34A; }
-        .dark .lk-badge-success{ background:rgba(34,197,94,.14); color:#4ADE80; }
-        .lk-badge-danger{ background:rgba(239,68,68,.12); color:#DC2626; }
-        .dark .lk-badge-danger{ background:rgba(239,68,68,.14); color:#F87171; }
-        .lk-badge-warning{ background:rgba(245,158,11,.14); color:#B45309; }
-        .dark .lk-badge-warning{ background:rgba(245,158,11,.16); color:#FBBF24; }
-        .lk-badge-neutral{ background:rgba(148,163,184,.16); color:#475569; }
-        .dark .lk-badge-neutral{ background:rgba(148,163,184,.14); color:#CBD5E1; }
-        .lk-modal-backdrop{ backdrop-filter:blur(6px); -webkit-backdrop-filter:blur(6px); animation:lkFadeIn .2s ease forwards; }
-        .lk-modal-panel{ animation:lkModalIn .28s cubic-bezier(.16,1,.3,1) forwards; }
-        @keyframes lkModalIn{ from{ opacity:0; transform:translateY(14px) scale(.97) } to{ opacity:1; transform:translateY(0) scale(1) } }
-        table.lk-table tbody tr{ transition:background-color .15s ease; }
-        table.lk-table tbody tr:hover{ background:rgba(79,70,229,.05); }
-        .dark table.lk-table tbody tr:hover{ background:rgba(99,102,241,.08); }
-        input:focus, select:focus, textarea:focus{ outline:none; box-shadow:0 0 0 3px rgba(79,70,229,.18); border-color:var(--lk-primary) !important; }
-        ::selection{ background:rgba(79,70,229,.25); }
-        @media (prefers-reduced-motion: reduce){
-            .lk-fade-in, .lk-stagger > *, .lk-skeleton, .lk-modal-panel{ animation:none !important; opacity:1 !important; transform:none !important; }
-        }
-
-        :root { --brand-1: #4F46E5; --brand-2: #6366F1; --brand-3: #22C55E; }
+        :root { --brand-1: #4f46e5; --brand-2: #7c3aed; --brand-3: #14b8a6; }
         body { font-family: 'Vazirmatn', sans-serif; }
-        .bg-blobs { position: fixed; inset: 0; overflow: hidden; z-index: -1; pointer-events: none; }
+        .bg-blobs { position: fixed; inset: 0; overflow: hidden; z-index: -1; pointer-events: none; display: none; }
         .bg-blobs::before, .bg-blobs::after {
             content: ''; position: absolute; width: 30rem; height: 30rem; border-radius: 9999px;
             filter: blur(80px); opacity: 0.14; animation: blob-float 16s ease-in-out infinite;
@@ -2747,10 +2450,7 @@ const HTML_TEMPLATES = {
         }
         .brand-bar { height: 3px; background: linear-gradient(90deg, var(--brand-2), var(--brand-1), var(--brand-3)); }
         .btn-shine { position: relative; overflow: hidden; }
-        .btn-shine::after {
-            content: ''; position: absolute; inset: 0; background: linear-gradient(120deg, transparent 30%, rgba(255,255,255,0.28) 50%, transparent 70%);
-            transform: translateX(-100%); transition: transform 0.6s ease;
-        }
+        .btn-shine::after { display: none; }
         .btn-shine:hover::after { transform: translateX(100%); }
     </style>
 </head>
@@ -2759,18 +2459,18 @@ const HTML_TEMPLATES = {
     <div class="w-full max-w-md bg-white dark:bg-amoled-card border border-gray-200 dark:border-amoled-border rounded-2xl shadow-xl overflow-hidden relative z-10">
         <div class="brand-bar w-full"></div>
         <div class="p-6">
-        <h2 class="text-xl font-bold mb-2 text-center bg-gradient-to-r from-indigo-400 via-violet-500 to-indigo-500 bg-clip-text text-transparent">تنظیم رمز عبور جدید</h2>
+        <h2 class="text-xl font-bold mb-2 text-center bg-gradient-to-r from-purple-500 via-indigo-500 to-teal-400 bg-clip-text text-transparent">تنظیم رمز عبور جدید</h2>
         <p class="text-sm text-gray-500 dark:text-gray-400 text-center mb-6">این اولین ورود شما به پنل مدیریت است. لطفاً رمز عبور خود را تعیین کنید.</p>
         <form onsubmit="handleSetup(event)" class="space-y-4">
             <div>
                 <label class="block text-sm font-medium mb-1.5">رمز عبور</label>
-                <input type="password" id="password" class="w-full px-3 py-2 bg-gray-50 dark:bg-amoled-input border border-gray-300 dark:border-amoled-border rounded-xl focus:outline-none focus:ring-2 focus:ring-indigo-500 text-sm text-center font-mono" required minlength="4">
+                <input type="password" id="password" class="w-full px-3 py-2 bg-gray-50 dark:bg-amoled-input border border-gray-300 dark:border-amoled-border rounded-lg focus:outline-none focus:ring-2 focus:ring-indigo-500 text-sm text-center font-mono" required minlength="4">
             </div>
             <div>
                 <label class="block text-sm font-medium mb-1.5">تکرار رمز عبور</label>
-                <input type="password" id="confirm-password" class="w-full px-3 py-2 bg-gray-50 dark:bg-amoled-input border border-gray-300 dark:border-amoled-border rounded-xl focus:outline-none focus:ring-2 focus:ring-indigo-500 text-sm text-center font-mono" required minlength="4">
+                <input type="password" id="confirm-password" class="w-full px-3 py-2 bg-gray-50 dark:bg-amoled-input border border-gray-300 dark:border-amoled-border rounded-lg focus:outline-none focus:ring-2 focus:ring-indigo-500 text-sm text-center font-mono" required minlength="4">
             </div>
-            <button type="submit" id="submit-btn" class="btn-shine w-full py-2.5 bg-gradient-to-r from-indigo-600 to-violet-600 border-0 text-white hover:from-indigo-500 hover:to-violet-500 hover:shadow-xl hover:shadow-indigo-500/30 font-medium rounded-xl text-sm transition font-bold">ثبت و ورود</button>
+            <button type="submit" id="submit-btn" class="btn-shine w-full py-2.5 bg-indigo-600 border-0 text-white hover:bg-indigo-500 hover:shadow-md font-medium rounded-lg text-sm transition font-bold">ثبت و ورود</button>
         </form>
         </div>
     </div>
@@ -2782,7 +2482,7 @@ const HTML_TEMPLATES = {
             const colors = type === 'error' 
                 ? 'bg-red-50 dark:bg-red-900/40 border-red-200 dark:border-red-800 text-red-600 dark:text-red-400' 
                 : 'bg-green-50 dark:bg-green-900/40 border-green-200 dark:border-green-800 text-green-700 dark:text-green-500';
-            toast.className = 'px-4 py-3 border rounded-2xl shadow-xl font-bold text-sm transform transition-all duration-500 -translate-y-full opacity-0 ' + colors;
+            toast.className = 'px-4 py-3 border rounded-xl shadow-lg font-bold text-sm transform transition-all duration-300 -translate-y-full opacity-0 ' + colors;
             toast.innerText = message;
             container.appendChild(toast);
             requestAnimationFrame(() => {
@@ -2841,7 +2541,7 @@ const HTML_TEMPLATES = {
 </html>`,
 
 	login: `<!DOCTYPE html>
-<html lang="fa" dir="rtl" class="dark">
+<html lang="fa" dir="rtl">
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
@@ -2854,93 +2554,15 @@ const HTML_TEMPLATES = {
             theme: {
                 extend: {
                     fontFamily: { sans: ['Vazirmatn', 'sans-serif'] },
-                    colors: {
-                        amoled: { bg: '#0a0a12', card: '#131320', input: '#181826', border: '#26263b' },
-                        brand: { primary: '#4F46E5', accent: '#22C55E', danger: '#EF4444' }
-                    },
-                    boxShadow: {
-                        glow: '0 8px 30px -8px rgba(79,70,229,0.35)',
-                        card: '0 1px 2px rgba(0,0,0,0.04), 0 8px 24px -12px rgba(15,23,42,0.12)'
-                    }
+                    colors: { amoled: { bg: '#0a0612', card: '#120c1f', input: '#170f28', border: '#2c1f45' } }
                 }
             }
         }
     </script>
     <style>
-        /* ===== LowKey Premium UI Kit ===== */
-        :root{
-            --lk-primary:#4F46E5; --lk-primary-light:#6366F1; --lk-primary-dark:#4338CA;
-            --lk-accent:#22C55E; --lk-danger:#EF4444; --lk-warning:#F59E0B;
-        }
-        .lk-glass{
-            background:rgba(255,255,255,.72); backdrop-filter:blur(16px) saturate(160%);
-            -webkit-backdrop-filter:blur(16px) saturate(160%);
-            border:1px solid rgba(148,163,184,.18);
-        }
-        .dark .lk-glass{ background:rgba(19,19,32,.62); border-color:rgba(148,163,184,.10); }
-        .lk-fade-in{ opacity:0; transform:translateY(10px); animation:lkFadeIn .5s cubic-bezier(.16,1,.3,1) forwards; }
-        @keyframes lkFadeIn{ to{ opacity:1; transform:translateY(0); } }
-        .lk-stagger > *{ opacity:0; transform:translateY(8px); animation:lkFadeIn .45s cubic-bezier(.16,1,.3,1) forwards; }
-        .lk-stagger > *:nth-child(1){ animation-delay:.02s } .lk-stagger > *:nth-child(2){ animation-delay:.06s }
-        .lk-stagger > *:nth-child(3){ animation-delay:.10s } .lk-stagger > *:nth-child(4){ animation-delay:.14s }
-        .lk-stagger > *:nth-child(5){ animation-delay:.18s } .lk-stagger > *:nth-child(6){ animation-delay:.22s }
-        .lk-stagger > *:nth-child(n+7){ animation-delay:.26s }
-        .lk-skeleton{
-            position:relative; overflow:hidden; background:#e5e7eb; border-radius:.5rem;
-            background-image:linear-gradient(90deg, rgba(255,255,255,0) 0, rgba(255,255,255,.55) 20%, rgba(255,255,255,0) 40%);
-            background-size:200% 100%; animation:lkShimmer 1.4s ease-in-out infinite;
-        }
-        .dark .lk-skeleton{ background:#1c1c2e; background-image:linear-gradient(90deg, rgba(255,255,255,0) 0, rgba(255,255,255,.06) 20%, rgba(255,255,255,0) 40%); background-size:200% 100%; }
-        @keyframes lkShimmer{ 0%{ background-position:150% 0 } 100%{ background-position:-50% 0 } }
-        .lk-btn{
-            display:inline-flex; align-items:center; justify-content:center; gap:.4rem;
-            font-weight:600; border-radius:.85rem; padding:.55rem 1.1rem; font-size:.85rem;
-            transition:transform .15s ease, box-shadow .2s ease, filter .2s ease, background-color .2s ease;
-            border:1px solid transparent; white-space:nowrap;
-        }
-        .lk-btn:active{ transform:scale(.96); }
-        .lk-btn-primary{ background:linear-gradient(135deg, var(--lk-primary-light), var(--lk-primary)); color:#fff; box-shadow:0 6px 18px -6px rgba(79,70,229,.55); }
-        .lk-btn-primary:hover{ filter:brightness(1.08); box-shadow:0 10px 24px -6px rgba(79,70,229,.6); }
-        .lk-btn-accent{ background:linear-gradient(135deg, #34D399, var(--lk-accent)); color:#fff; box-shadow:0 6px 18px -6px rgba(34,197,94,.5); }
-        .lk-btn-accent:hover{ filter:brightness(1.08); }
-        .lk-btn-danger{ background:linear-gradient(135deg, #F87171, var(--lk-danger)); color:#fff; box-shadow:0 6px 18px -6px rgba(239,68,68,.5); }
-        .lk-btn-danger:hover{ filter:brightness(1.08); }
-        .lk-btn-ghost{ background:rgba(148,163,184,.12); color:inherit; }
-        .lk-btn-ghost:hover{ background:rgba(148,163,184,.22); }
-        .lk-card{
-            border-radius:1.1rem; border:1px solid rgba(148,163,184,.16);
-            box-shadow:0 1px 2px rgba(15,23,42,.04), 0 10px 28px -14px rgba(15,23,42,.14);
-            transition:transform .25s cubic-bezier(.16,1,.3,1), box-shadow .25s ease, border-color .25s ease;
-        }
-        .lk-card:hover{ transform:translateY(-3px); box-shadow:0 18px 36px -16px rgba(79,70,229,.30); border-color:rgba(79,70,229,.35); }
-        .lk-badge{
-            display:inline-flex; align-items:center; gap:.3rem; font-size:.68rem; font-weight:700;
-            padding:.22rem .6rem; border-radius:999px; letter-spacing:.01em; line-height:1.4;
-        }
-        .lk-badge-dot{ width:6px; height:6px; border-radius:999px; flex-shrink:0; }
-        .lk-badge-success{ background:rgba(34,197,94,.12); color:#16A34A; }
-        .dark .lk-badge-success{ background:rgba(34,197,94,.14); color:#4ADE80; }
-        .lk-badge-danger{ background:rgba(239,68,68,.12); color:#DC2626; }
-        .dark .lk-badge-danger{ background:rgba(239,68,68,.14); color:#F87171; }
-        .lk-badge-warning{ background:rgba(245,158,11,.14); color:#B45309; }
-        .dark .lk-badge-warning{ background:rgba(245,158,11,.16); color:#FBBF24; }
-        .lk-badge-neutral{ background:rgba(148,163,184,.16); color:#475569; }
-        .dark .lk-badge-neutral{ background:rgba(148,163,184,.14); color:#CBD5E1; }
-        .lk-modal-backdrop{ backdrop-filter:blur(6px); -webkit-backdrop-filter:blur(6px); animation:lkFadeIn .2s ease forwards; }
-        .lk-modal-panel{ animation:lkModalIn .28s cubic-bezier(.16,1,.3,1) forwards; }
-        @keyframes lkModalIn{ from{ opacity:0; transform:translateY(14px) scale(.97) } to{ opacity:1; transform:translateY(0) scale(1) } }
-        table.lk-table tbody tr{ transition:background-color .15s ease; }
-        table.lk-table tbody tr:hover{ background:rgba(79,70,229,.05); }
-        .dark table.lk-table tbody tr:hover{ background:rgba(99,102,241,.08); }
-        input:focus, select:focus, textarea:focus{ outline:none; box-shadow:0 0 0 3px rgba(79,70,229,.18); border-color:var(--lk-primary) !important; }
-        ::selection{ background:rgba(79,70,229,.25); }
-        @media (prefers-reduced-motion: reduce){
-            .lk-fade-in, .lk-stagger > *, .lk-skeleton, .lk-modal-panel{ animation:none !important; opacity:1 !important; transform:none !important; }
-        }
-
-        :root { --brand-1: #4F46E5; --brand-2: #6366F1; --brand-3: #22C55E; }
+        :root { --brand-1: #4f46e5; --brand-2: #7c3aed; --brand-3: #14b8a6; }
         body { font-family: 'Vazirmatn', sans-serif; }
-        .bg-blobs { position: fixed; inset: 0; overflow: hidden; z-index: -1; pointer-events: none; }
+        .bg-blobs { position: fixed; inset: 0; overflow: hidden; z-index: -1; pointer-events: none; display: none; }
         .bg-blobs::before, .bg-blobs::after {
             content: ''; position: absolute; width: 30rem; height: 30rem; border-radius: 9999px;
             filter: blur(80px); opacity: 0.14; animation: blob-float 16s ease-in-out infinite;
@@ -2953,10 +2575,7 @@ const HTML_TEMPLATES = {
         }
         .brand-bar { height: 3px; background: linear-gradient(90deg, var(--brand-2), var(--brand-1), var(--brand-3)); }
         .btn-shine { position: relative; overflow: hidden; }
-        .btn-shine::after {
-            content: ''; position: absolute; inset: 0; background: linear-gradient(120deg, transparent 30%, rgba(255,255,255,0.28) 50%, transparent 70%);
-            transform: translateX(-100%); transition: transform 0.6s ease;
-        }
+        .btn-shine::after { display: none; }
         .btn-shine:hover::after { transform: translateX(100%); }
     </style>
 </head>
@@ -2966,24 +2585,24 @@ const HTML_TEMPLATES = {
         <div class="brand-bar w-full"></div>
         <div class="p-6">
         <div id="login-section">
-            <h2 class="text-xl font-bold mb-6 text-center bg-gradient-to-r from-indigo-400 via-violet-500 to-indigo-500 bg-clip-text text-transparent">ورود به پنل مدیریت</h2>
+            <h2 class="text-xl font-bold mb-6 text-center bg-gradient-to-r from-purple-500 via-indigo-500 to-teal-400 bg-clip-text text-transparent">ورود به پنل مدیریت</h2>
             <form onsubmit="handleLogin(event)" class="space-y-4">
                 <div>
                     <label class="block text-sm font-medium mb-1.5">رمز عبور</label>
-                    <input type="password" id="password" class="w-full px-3 py-2 bg-gray-50 dark:bg-amoled-input border border-gray-300 dark:border-amoled-border rounded-xl focus:outline-none focus:ring-2 focus:ring-indigo-500 text-sm text-center font-mono" required>
+                    <input type="password" id="password" class="w-full px-3 py-2 bg-gray-50 dark:bg-amoled-input border border-gray-300 dark:border-amoled-border rounded-lg focus:outline-none focus:ring-2 focus:ring-indigo-500 text-sm text-center font-mono" required>
                 </div>
-                <button type="submit" id="submit-btn" class="btn-shine w-full py-2.5 bg-gradient-to-r from-indigo-600 to-violet-600 border-0 text-white hover:from-indigo-500 hover:to-violet-500 hover:shadow-xl hover:shadow-indigo-500/30 font-medium rounded-xl text-sm transition font-bold">ورود</button>
+                <button type="submit" id="submit-btn" class="btn-shine w-full py-2.5 bg-indigo-600 border-0 text-white hover:bg-indigo-500 hover:shadow-md font-medium rounded-lg text-sm transition font-bold">ورود</button>
             </form>
             <div class="mt-4 text-center">
                 <button onclick="toggleRecovery(true)" class="text-xs text-indigo-500 hover:text-indigo-600 transition font-medium">بازیابی رمز پنل</button>
             </div>
         </div>
         <div id="recovery-section" class="hidden">
-            <h2 class="text-xl font-bold mb-4 text-center text-green-600 dark:text-green-400">بازیابی رمز پنل</h2>
+            <h2 class="text-xl font-bold mb-4 text-center text-teal-600 dark:text-teal-400">بازیابی رمز پنل</h2>
             
-            <div class="mb-5 p-3 bg-green-50 dark:bg-green-900/20 border border-green-200 dark:border-green-800/50 rounded-2xl text-xs leading-relaxed text-green-800 dark:text-green-300">
+            <div class="mb-5 p-3 bg-teal-50 dark:bg-teal-900/20 border border-teal-200 dark:border-teal-800/50 rounded-xl text-xs leading-relaxed text-teal-800 dark:text-teal-300">
                 برای احراز هویت و اثبات مالکیت پنل، از طریق دکمه زیر وارد کلودفلر شوید و توکن دریافتی را کپی کرده و در کادر زیر وارد کنید.
-                <a href="https://dash.cloudflare.com/profile/api-tokens?permissionGroupKeys=%5B%7B%22key%22%3A%22workers_scripts%22%2C%22type%22%3A%22edit%22%7D%2C%7B%22key%22%3A%22workers_kv_storage%22%2C%22type%22%3A%22edit%22%7D%2C%7B%22key%22%3A%22d1%22%2C%22type%22%3A%22edit%22%7D%2C%7B%22key%22%3A%22account_settings%22%2C%22type%22%3A%22read%22%7D%2C%7B%22key%22%3A%22workers_subdomain%22%2C%22type%22%3A%22edit%22%7D%2C%7B%22key%22%3A%22account_analytics%22%2C%22type%22%3A%22read%22%7D%5D&accountId=*&zoneId=all&name=Zeus-Deployer-Token" target="_blank" class="mt-3 w-full flex items-center justify-center gap-2 py-2 bg-gradient-to-r from-indigo-600 to-violet-600 border-0 text-white hover:from-indigo-500 hover:to-violet-500 hover:shadow-xl hover:shadow-indigo-500/30 rounded-xl font-bold transition shadow-lg">
+                <a href="https://dash.cloudflare.com/profile/api-tokens?permissionGroupKeys=%5B%7B%22key%22%3A%22workers_scripts%22%2C%22type%22%3A%22edit%22%7D%2C%7B%22key%22%3A%22workers_kv_storage%22%2C%22type%22%3A%22edit%22%7D%2C%7B%22key%22%3A%22d1%22%2C%22type%22%3A%22edit%22%7D%2C%7B%22key%22%3A%22account_settings%22%2C%22type%22%3A%22read%22%7D%2C%7B%22key%22%3A%22workers_subdomain%22%2C%22type%22%3A%22edit%22%7D%2C%7B%22key%22%3A%22account_analytics%22%2C%22type%22%3A%22read%22%7D%5D&accountId=*&zoneId=all&name=Zeus-Deployer-Token" target="_blank" class="mt-3 w-full flex items-center justify-center gap-2 py-2 bg-indigo-600 border-0 text-white hover:bg-indigo-500 hover:shadow-md rounded-lg font-bold transition shadow-md">
                     <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M10 6H6a2 2 0 00-2 2v10a2 2 0 002 2h10a2 2 0 002-2v-4M14 4h6m0 0v6m0-6L10 14"></path></svg>
                     دریافت توکن
                 </a>
@@ -2991,11 +2610,11 @@ const HTML_TEMPLATES = {
 
             <form onsubmit="handleRecovery(event)" class="space-y-4">
                 <div>
-                    <input type="password" id="api-token" placeholder="توکن را وارد کنید" class="w-full px-3 py-2 bg-gray-50 dark:bg-amoled-input border border-gray-300 dark:border-amoled-border rounded-xl focus:outline-none focus:ring-2 focus:ring-green-500 text-xs text-center font-mono" required>
+                    <input type="password" id="api-token" placeholder="توکن را وارد کنید" class="w-full px-3 py-2 bg-gray-50 dark:bg-amoled-input border border-gray-300 dark:border-amoled-border rounded-lg focus:outline-none focus:ring-2 focus:ring-teal-500 text-xs text-center font-mono" required>
                 </div>
                 <div class="flex gap-2 pt-2">
-                    <button type="button" onclick="toggleRecovery(false)" class="w-1/3 py-2.5 bg-transparent border-2 border-red-700 text-red-700 hover:bg-red-900/20 hover:text-red-800 dark:border-red-700 dark:text-red-500 dark:hover:bg-red-900/40 dark:hover:text-red-400 font-bold rounded-xl text-sm transition shadow-md">انصراف</button>
-                    <button type="submit" id="recover-btn" class="w-2/3 py-2.5 bg-gradient-to-r from-indigo-600 to-violet-600 border-0 text-white hover:from-indigo-500 hover:to-violet-500 hover:shadow-xl hover:shadow-indigo-500/30 font-medium rounded-xl text-sm transition font-bold">بازیابی رمز پنل</button>
+                    <button type="button" onclick="toggleRecovery(false)" class="w-1/3 py-2.5 bg-transparent border-2 border-rose-700 text-rose-700 hover:bg-rose-900/20 hover:text-rose-800 dark:border-rose-700 dark:text-rose-500 dark:hover:bg-rose-900/40 dark:hover:text-rose-400 font-bold rounded-lg text-sm transition shadow-sm">انصراف</button>
+                    <button type="submit" id="recover-btn" class="w-2/3 py-2.5 bg-indigo-600 border-0 text-white hover:bg-indigo-500 hover:shadow-md font-medium rounded-lg text-sm transition font-bold">بازیابی رمز پنل</button>
                 </div>
             </form>
         </div>
@@ -3009,7 +2628,7 @@ const HTML_TEMPLATES = {
             const colors = type === 'error' 
                 ? 'bg-red-50 dark:bg-red-900/40 border-red-200 dark:border-red-800 text-red-600 dark:text-red-400' 
                 : 'bg-green-50 dark:bg-green-900/40 border-green-200 dark:border-green-800 text-green-700 dark:text-green-500';
-            toast.className = 'px-4 py-3 border rounded-2xl shadow-xl font-bold text-sm transform transition-all duration-500 -translate-y-full opacity-0 ' + colors;
+            toast.className = 'px-4 py-3 border rounded-xl shadow-lg font-bold text-sm transform transition-all duration-300 -translate-y-full opacity-0 ' + colors;
             toast.innerText = message;
             container.appendChild(toast);
             requestAnimationFrame(() => {
@@ -3112,96 +2731,18 @@ const HTML_TEMPLATES = {
             theme: {
                 extend: {
                     fontFamily: { sans: ['Vazirmatn', 'sans-serif'] },
-                    colors: {
-                        amoled: { bg: '#0a0a12', card: '#131320', input: '#181826', border: '#26263b' },
-                        brand: { primary: '#4F46E5', accent: '#22C55E', danger: '#EF4444' }
-                    },
-                    boxShadow: {
-                        glow: '0 8px 30px -8px rgba(79,70,229,0.35)',
-                        card: '0 1px 2px rgba(0,0,0,0.04), 0 8px 24px -12px rgba(15,23,42,0.12)'
-                    }
+                    colors: { amoled: { bg: '#0a0612', card: '#120c1f', input: '#170f28', border: '#2c1f45' } }
                 }
             }
         }
     </script>
     <style>
-        /* ===== LowKey Premium UI Kit ===== */
-        :root{
-            --lk-primary:#4F46E5; --lk-primary-light:#6366F1; --lk-primary-dark:#4338CA;
-            --lk-accent:#22C55E; --lk-danger:#EF4444; --lk-warning:#F59E0B;
-        }
-        .lk-glass{
-            background:rgba(255,255,255,.72); backdrop-filter:blur(16px) saturate(160%);
-            -webkit-backdrop-filter:blur(16px) saturate(160%);
-            border:1px solid rgba(148,163,184,.18);
-        }
-        .dark .lk-glass{ background:rgba(19,19,32,.62); border-color:rgba(148,163,184,.10); }
-        .lk-fade-in{ opacity:0; transform:translateY(10px); animation:lkFadeIn .5s cubic-bezier(.16,1,.3,1) forwards; }
-        @keyframes lkFadeIn{ to{ opacity:1; transform:translateY(0); } }
-        .lk-stagger > *{ opacity:0; transform:translateY(8px); animation:lkFadeIn .45s cubic-bezier(.16,1,.3,1) forwards; }
-        .lk-stagger > *:nth-child(1){ animation-delay:.02s } .lk-stagger > *:nth-child(2){ animation-delay:.06s }
-        .lk-stagger > *:nth-child(3){ animation-delay:.10s } .lk-stagger > *:nth-child(4){ animation-delay:.14s }
-        .lk-stagger > *:nth-child(5){ animation-delay:.18s } .lk-stagger > *:nth-child(6){ animation-delay:.22s }
-        .lk-stagger > *:nth-child(n+7){ animation-delay:.26s }
-        .lk-skeleton{
-            position:relative; overflow:hidden; background:#e5e7eb; border-radius:.5rem;
-            background-image:linear-gradient(90deg, rgba(255,255,255,0) 0, rgba(255,255,255,.55) 20%, rgba(255,255,255,0) 40%);
-            background-size:200% 100%; animation:lkShimmer 1.4s ease-in-out infinite;
-        }
-        .dark .lk-skeleton{ background:#1c1c2e; background-image:linear-gradient(90deg, rgba(255,255,255,0) 0, rgba(255,255,255,.06) 20%, rgba(255,255,255,0) 40%); background-size:200% 100%; }
-        @keyframes lkShimmer{ 0%{ background-position:150% 0 } 100%{ background-position:-50% 0 } }
-        .lk-btn{
-            display:inline-flex; align-items:center; justify-content:center; gap:.4rem;
-            font-weight:600; border-radius:.85rem; padding:.55rem 1.1rem; font-size:.85rem;
-            transition:transform .15s ease, box-shadow .2s ease, filter .2s ease, background-color .2s ease;
-            border:1px solid transparent; white-space:nowrap;
-        }
-        .lk-btn:active{ transform:scale(.96); }
-        .lk-btn-primary{ background:linear-gradient(135deg, var(--lk-primary-light), var(--lk-primary)); color:#fff; box-shadow:0 6px 18px -6px rgba(79,70,229,.55); }
-        .lk-btn-primary:hover{ filter:brightness(1.08); box-shadow:0 10px 24px -6px rgba(79,70,229,.6); }
-        .lk-btn-accent{ background:linear-gradient(135deg, #34D399, var(--lk-accent)); color:#fff; box-shadow:0 6px 18px -6px rgba(34,197,94,.5); }
-        .lk-btn-accent:hover{ filter:brightness(1.08); }
-        .lk-btn-danger{ background:linear-gradient(135deg, #F87171, var(--lk-danger)); color:#fff; box-shadow:0 6px 18px -6px rgba(239,68,68,.5); }
-        .lk-btn-danger:hover{ filter:brightness(1.08); }
-        .lk-btn-ghost{ background:rgba(148,163,184,.12); color:inherit; }
-        .lk-btn-ghost:hover{ background:rgba(148,163,184,.22); }
-        .lk-card{
-            border-radius:1.1rem; border:1px solid rgba(148,163,184,.16);
-            box-shadow:0 1px 2px rgba(15,23,42,.04), 0 10px 28px -14px rgba(15,23,42,.14);
-            transition:transform .25s cubic-bezier(.16,1,.3,1), box-shadow .25s ease, border-color .25s ease;
-        }
-        .lk-card:hover{ transform:translateY(-3px); box-shadow:0 18px 36px -16px rgba(79,70,229,.30); border-color:rgba(79,70,229,.35); }
-        .lk-badge{
-            display:inline-flex; align-items:center; gap:.3rem; font-size:.68rem; font-weight:700;
-            padding:.22rem .6rem; border-radius:999px; letter-spacing:.01em; line-height:1.4;
-        }
-        .lk-badge-dot{ width:6px; height:6px; border-radius:999px; flex-shrink:0; }
-        .lk-badge-success{ background:rgba(34,197,94,.12); color:#16A34A; }
-        .dark .lk-badge-success{ background:rgba(34,197,94,.14); color:#4ADE80; }
-        .lk-badge-danger{ background:rgba(239,68,68,.12); color:#DC2626; }
-        .dark .lk-badge-danger{ background:rgba(239,68,68,.14); color:#F87171; }
-        .lk-badge-warning{ background:rgba(245,158,11,.14); color:#B45309; }
-        .dark .lk-badge-warning{ background:rgba(245,158,11,.16); color:#FBBF24; }
-        .lk-badge-neutral{ background:rgba(148,163,184,.16); color:#475569; }
-        .dark .lk-badge-neutral{ background:rgba(148,163,184,.14); color:#CBD5E1; }
-        .lk-modal-backdrop{ backdrop-filter:blur(6px); -webkit-backdrop-filter:blur(6px); animation:lkFadeIn .2s ease forwards; }
-        .lk-modal-panel{ animation:lkModalIn .28s cubic-bezier(.16,1,.3,1) forwards; }
-        @keyframes lkModalIn{ from{ opacity:0; transform:translateY(14px) scale(.97) } to{ opacity:1; transform:translateY(0) scale(1) } }
-        table.lk-table tbody tr{ transition:background-color .15s ease; }
-        table.lk-table tbody tr:hover{ background:rgba(79,70,229,.05); }
-        .dark table.lk-table tbody tr:hover{ background:rgba(99,102,241,.08); }
-        input:focus, select:focus, textarea:focus{ outline:none; box-shadow:0 0 0 3px rgba(79,70,229,.18); border-color:var(--lk-primary) !important; }
-        ::selection{ background:rgba(79,70,229,.25); }
-        @media (prefers-reduced-motion: reduce){
-            .lk-fade-in, .lk-stagger > *, .lk-skeleton, .lk-modal-panel{ animation:none !important; opacity:1 !important; transform:none !important; }
-        }
-
-        :root { --brand-1: #4F46E5; --brand-2: #6366F1; --brand-3: #22C55E; }
+        :root { --brand-1: #4f46e5; --brand-2: #7c3aed; --brand-3: #14b8a6; }
         body { font-family: 'Vazirmatn', sans-serif; }
 		.dark input[type="checkbox"] {
             filter: invert(1) hue-rotate(180deg);
         }
-        .bg-blobs { position: fixed; inset: 0; overflow: hidden; z-index: -1; pointer-events: none; }
+        .bg-blobs { position: fixed; inset: 0; overflow: hidden; z-index: -1; pointer-events: none; display: none; }
         .bg-blobs::before, .bg-blobs::after {
             content: ''; position: absolute; width: 36rem; height: 36rem; border-radius: 9999px;
             filter: blur(100px); opacity: 0.08; animation: blob-float 18s ease-in-out infinite;
@@ -3213,13 +2754,10 @@ const HTML_TEMPLATES = {
             50% { transform: translate(-2rem, 2rem) scale(1.08); }
         }
         .brand-bar { height: 3px; background: linear-gradient(90deg, var(--brand-2), var(--brand-1), var(--brand-3)); }
-        .card-lift lk-card { transition: transform 0.2s ease, box-shadow 0.2s ease; }
-        .card-lift lk-card:hover { transform: translateY(-2px); box-shadow: 0 12px 28px -12px rgba(79, 70, 229, 0.30); }
+        .card-lift { transition: transform 0.2s ease, box-shadow 0.2s ease; }
+        .card-lift:hover { transform: translateY(-2px); box-shadow: 0 12px 28px -12px rgba(79, 70, 229, 0.30); }
         .btn-shine { position: relative; overflow: hidden; }
-        .btn-shine::after {
-            content: ''; position: absolute; inset: 0; background: linear-gradient(120deg, transparent 30%, rgba(255,255,255,0.28) 50%, transparent 70%);
-            transform: translateX(-100%); transition: transform 0.6s ease;
-        }
+        .btn-shine::after { display: none; }
         .btn-shine:hover::after { transform: translateX(100%); }
         ::-webkit-scrollbar {
             width: 6px;
@@ -3240,17 +2778,17 @@ const HTML_TEMPLATES = {
             background: #0d0a17; 
         }
         .dark ::-webkit-scrollbar-thumb {
-            background: linear-gradient(180deg, #6366F1, #22C55E); 
+            background: linear-gradient(180deg, #4f46e5, #0d9488); 
         }
         .dark ::-webkit-scrollbar-thumb:hover {
-            background: #4F46E5;
+            background: #7c3aed;
         }
         * {
             scrollbar-width: thin;
-            scrollbar-color: #6366F1 #f1f0fb;
+            scrollbar-color: #7c3aed #f1f0fb;
         }
         .dark * {
-            scrollbar-color: #4F46E5 #0d0a17;
+            scrollbar-color: #4f46e5 #0d0a17;
         }
         @media (min-width: 769px) {
             header, main { zoom: 1.18; }
@@ -3260,18 +2798,18 @@ const HTML_TEMPLATES = {
         }
     </style>
 </head>
-<body class="bg-gradient-to-b from-gray-50 to-indigo-50/40 text-gray-900 dark:from-amoled-bg dark:to-amoled-bg dark:text-zinc-100 min-h-screen transition-colors duration-300 relative">
+<body class="bg-gradient-to-b from-gray-50 to-indigo-50/40 text-gray-900 dark:from-amoled-bg dark:to-amoled-bg dark:text-zinc-100 min-h-screen transition-colors duration-200 relative">
     <div class="bg-blobs"></div>
     <div class="brand-bar w-full relative z-10"></div>
-    <header class="sticky top-3 z-20 mx-3 md:mx-6 mt-3 rounded-2xl border border-gray-200/70 dark:border-amoled-border bg-white/80 dark:bg-amoled-card/80 backdrop-blur-lg shadow-xl shadow-indigo-500/5 px-4 py-3">
+    <header class="sticky top-3 z-20 mx-3 md:mx-6 mt-3 rounded-2xl border border-gray-200/70 dark:border-amoled-border bg-white/80 dark:bg-amoled-card/80 backdrop-blur-lg shadow-lg shadow-indigo-500/5 px-4 py-3">
         <div class="max-w-6xl mx-auto flex flex-col md:flex-row justify-between items-center gap-4">
             <div class="flex flex-row flex-wrap justify-center items-center gap-3 w-full md:w-auto">
                 <h1 class="text-lg font-bold flex items-center gap-2" dir="ltr">
-                    <span class="bg-gradient-to-r from-indigo-400 via-violet-500 to-indigo-500 bg-clip-text text-transparent">LOWKEY</span>
-                    <span id="panel-version" class="text-xs px-2 py-0.5 font-semibold bg-gradient-to-r from-indigo-500 to-green-400 text-white rounded-full">v1.5.10</span>
+                    <span class="bg-gradient-to-r from-purple-500 via-indigo-500 to-teal-400 bg-clip-text text-transparent">LOWKEY</span>
+                    <span id="panel-version" class="text-xs px-2 py-0.5 font-semibold bg-gradient-to-r from-purple-500 to-teal-400 text-white rounded-full">v1.5.10</span>
                 </h1>
-                <div class="flex items-center gap-3 bg-gray-100 dark:bg-zinc-800/60 px-3 py-1.5 rounded-full border border-gray-200 dark:border-zinc-800/80 shadow-md flex-shrink-0 w-fit">
-                    <a href="https://t.me/lowkey878" target="_blank" rel="noopener noreferrer" class="text-indigo-500 hover:text-indigo-600 dark:hover:text-indigo-400 transition-all transform hover:scale-125 duration-300 flex-shrink-0" title="Telegram">
+                <div class="flex items-center gap-3 bg-gray-100 dark:bg-zinc-800/60 px-3 py-1.5 rounded-full border border-gray-200 dark:border-zinc-800/80 shadow-sm flex-shrink-0 w-fit">
+                    <a href="https://t.me/lowkey878" target="_blank" rel="noopener noreferrer" class="text-cyan-500 hover:text-cyan-600 dark:hover:text-cyan-400 transition-all transform hover:scale-125 duration-200 flex-shrink-0" title="Telegram">
                         <svg class="w-[22px] h-[22px] flex-shrink-0" viewBox="0 0 24 24" fill="currentColor">
                             <path d="M12 2C6.48 2 2 6.48 2 12s4.48 10 10 10 10-4.48 10-10S17.52 2 12 2zm4.64 6.8c-.15 1.58-.8 5.42-1.13 7.19-.14.75-.42 1-.68 1.03-.58.05-1.02-.38-1.58-.75-.88-.58-1.38-.94-2.23-1.5-.99-.65-.35-1.01.22-1.59.15-.15 2.71-2.48 2.76-2.69a.2.2 0 00-.05-.18c-.06-.05-.14-.03-.21-.02-.09.02-1.49.94-4.22 2.79-.4.27-.76.41-1.08.4-.36-.01-1.04-.2-1.55-.37-.63-.2-1.12-.31-1.08-.66.02-.18.27-.36.74-.55 2.92-1.27 4.86-2.11 5.83-2.51 2.78-1.16 3.35-1.36 3.73-1.37.08 0 .27.02.39.12.1.08.13.19.14.27-.01.06.01.24 0 .24z"/>
                         </svg>
@@ -3283,7 +2821,7 @@ const HTML_TEMPLATES = {
 				<button onclick="restartCore()" 
                         class="p-2 rounded-full 
                                hover:bg-indigo-100 dark:hover:bg-indigo-900/50 
-                               transition-all duration-300 
+                               transition-all duration-200 
                                text-indigo-600 dark:text-indigo-400" 
                         title="ری استارت پنل">
                     <svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
@@ -3294,7 +2832,7 @@ const HTML_TEMPLATES = {
                 <button id="theme-toggle" 
                         class="p-2 rounded-full 
                                hover:bg-amber-100 dark:hover:bg-amber-900/50 
-                               transition-all duration-300 
+                               transition-all duration-200 
                                text-amber-500 dark:text-amber-400"
                         title="تغییر تم">
                     <svg id="sun-icon" class="w-5 h-5 hidden dark:block" fill="none" stroke="currentColor" viewBox="0 0 24 24">
@@ -3305,21 +2843,10 @@ const HTML_TEMPLATES = {
                     </svg>
                 </button>
                 
-                <button onclick="toggleResourcesModal(true)" 
-                        class="p-2 rounded-full 
-                               hover:bg-emerald-100 dark:hover:bg-emerald-900/50 
-                               transition-all duration-300 
-                               text-emerald-600 dark:text-emerald-400" 
-                        title="لینک‌های سایر پروتکل‌ها">
-                    <svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                        <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M13.828 10.172a4 4 0 010 5.656l-4 4a4 4 0 01-5.656-5.656l1.5-1.5M10.172 13.828a4 4 0 010-5.656l4-4a4 4 0 015.656 5.656l-1.5 1.5"></path>
-                    </svg>
-                </button>
-
                 <button onclick="toggleSettingsModal(true)" 
                         class="p-2 rounded-full 
                                hover:bg-gray-200 dark:hover:bg-zinc-700/80 
-                               transition-all duration-300 
+                               transition-all duration-200 
                                text-gray-600 dark:text-zinc-400" 
                         title="تنظیمات">
                     <svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
@@ -3333,7 +2860,7 @@ const HTML_TEMPLATES = {
                     onclick="logoutAdmin()" 
                     class="p-2 rounded-full 
                            hover:bg-red-100 dark:hover:bg-red-900/50 
-                           transition-all duration-300 
+                           transition-all duration-200 
                            text-red-600 dark:text-red-400"
                     title="خروج">
                     <svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
@@ -3343,68 +2870,68 @@ const HTML_TEMPLATES = {
             </div>
         </div>
     </header>
-    <main class="max-w-6xl mx-auto px-4 py-8 pb-56 md:pb-32 lk-fade-in">
-<div class="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-3 mb-6 lk-stagger">
-    <div class="bg-white/80 dark:bg-amoled-card/80 backdrop-blur-sm border border-gray-200 dark:border-amoled-border rounded-2xl p-3 shadow-md card-lift lk-card flex flex-col justify-center gap-1 hover:border-indigo-400 dark:hover:border-indigo-500/50 transition duration-500 relative overflow-hidden group min-h-[68px]">
-        <div class="absolute -right-4 -bottom-4 w-16 h-16 bg-indigo-500/10 rounded-full blur-xl group-hover:scale-150 transition duration-500"></div>
+    <main class="max-w-6xl mx-auto px-4 py-8 pb-56 md:pb-32">
+<div class="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-3 mb-6">
+    <div class="bg-white/80 dark:bg-amoled-card/80 backdrop-blur-sm border border-gray-200 dark:border-amoled-border rounded-2xl p-3 shadow-sm card-lift flex flex-col justify-center gap-1 hover:border-purple-400 dark:hover:border-purple-500/50 transition duration-300 relative overflow-hidden group min-h-[68px]">
+        <div class="absolute -right-4 -bottom-4 w-16 h-16 bg-purple-500/10 rounded-full blur-xl group-hover:scale-150 transition duration-500"></div>
         <div class="flex items-center justify-between relative z-10">
             <span class="text-[11px] sm:text-xs font-semibold text-gray-500 dark:text-zinc-400 whitespace-nowrap">تعداد کل کاربران</span>
-            <div class="w-7 h-7 bg-indigo-100 dark:bg-indigo-900/40 text-indigo-600 dark:text-indigo-400 rounded-full flex items-center justify-center flex-shrink-0">
+            <div class="w-7 h-7 bg-purple-100 dark:bg-purple-900/40 text-purple-600 dark:text-purple-400 rounded-full flex items-center justify-center flex-shrink-0">
                 <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="1.5" d="M17 20h5v-2a3 3 0 00-5.356-1.857M17 20H7m10 0v-2c0-.656-.126-1.283-.356-1.857M7 20H2v-2a3 3 0 015.356-1.857M7 20v-2c0-.656.126-1.283.356-1.857m0 0a5.002 5.002 0 019.288 0M15 7a3 3 0 11-6 0 3 3 0 016 0zm6 3a2 2 0 11-4 0 2 2 0 014 0zM7 10a2 2 0 11-4 0 2 2 0 014 0z"></path></svg>
             </div>
         </div>
         <div class="flex items-end justify-between relative z-10 w-full mt-0.5">
             <div class="text-lg font-black text-gray-900 dark:text-zinc-100 transition-all leading-none" id="stat-total-users">0</div>
-            <span class="text-[9px] text-indigo-500 dark:text-indigo-400 flex items-center gap-1 font-medium whitespace-nowrap leading-none mb-0.5">
-                <span class="w-1 h-1 bg-indigo-500 rounded-full animate-ping"></span>
+            <span class="text-[9px] text-purple-500 dark:text-purple-400 flex items-center gap-1 font-medium whitespace-nowrap leading-none mb-0.5">
+                <span class="w-1 h-1 bg-purple-500 rounded-full animate-ping"></span>
                 کل کاربران تعریف شده
             </span>
         </div>
     </div>
 
-    <div class="bg-white/80 dark:bg-amoled-card/80 backdrop-blur-sm border border-gray-200 dark:border-amoled-border rounded-2xl p-3 shadow-md card-lift lk-card flex flex-col justify-center gap-1 hover:border-green-400 dark:hover:border-green-500/50 transition duration-500 relative overflow-hidden group min-h-[64px]">
-        <div class="absolute -right-4 -bottom-4 w-16 h-16 bg-green-500/10 rounded-full blur-xl group-hover:scale-150 transition duration-500"></div>
+    <div class="bg-white/80 dark:bg-amoled-card/80 backdrop-blur-sm border border-gray-200 dark:border-amoled-border rounded-2xl p-3 shadow-sm card-lift flex flex-col justify-center gap-1 hover:border-emerald-400 dark:hover:border-emerald-500/50 transition duration-300 relative overflow-hidden group min-h-[64px]">
+        <div class="absolute -right-4 -bottom-4 w-16 h-16 bg-emerald-500/10 rounded-full blur-xl group-hover:scale-150 transition duration-500"></div>
         <div class="flex items-center justify-between relative z-10">
             <span class="text-[11px] sm:text-xs font-semibold text-gray-500 dark:text-zinc-400 whitespace-nowrap">کاربران فعال (آنلاین)</span>
-            <div class="w-7 h-7 bg-green-100 dark:bg-green-900/40 text-green-600 dark:text-green-400 rounded-full flex items-center justify-center flex-shrink-0">
+            <div class="w-7 h-7 bg-emerald-100 dark:bg-emerald-900/40 text-emerald-600 dark:text-emerald-400 rounded-full flex items-center justify-center flex-shrink-0">
                 <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="1.5" d="M13 10V3L4 14h7v7l9-11h-7z"></path></svg>
             </div>
         </div>
         <div class="flex items-end justify-between relative z-10 w-full mt-0.5">
-            <div class="text-lg font-black text-green-600 dark:text-green-400 transition-all leading-none" id="stat-active-users">0</div>
-            <span class="text-[9px] text-green-500 dark:text-green-400 flex items-center gap-1 font-medium whitespace-nowrap leading-none mb-0.5">
-                <span class="w-1.5 h-1.5 bg-green-500 rounded-full animate-pulse"></span>
+            <div class="text-lg font-black text-emerald-600 dark:text-emerald-400 transition-all leading-none" id="stat-active-users">0</div>
+            <span class="text-[9px] text-emerald-500 dark:text-emerald-400 flex items-center gap-1 font-medium whitespace-nowrap leading-none mb-0.5">
+                <span class="w-1.5 h-1.5 bg-emerald-500 rounded-full animate-pulse"></span>
                 متصل در این لحظه
             </span>
         </div>
     </div>
 
-    <div id="card-cf-requests" class="bg-white/80 dark:bg-amoled-card/80 backdrop-blur-sm border border-gray-200 dark:border-amoled-border rounded-2xl p-3 shadow-md card-lift lk-card flex flex-col justify-center gap-1 hover:border-green-400 dark:hover:border-green-500/50 transition duration-500 relative overflow-hidden group min-h-[64px]">
-        <div class="absolute -right-4 -bottom-4 w-16 h-16 bg-green-500/10 rounded-full blur-xl group-hover:scale-150 transition duration-500"></div>
+    <div id="card-cf-requests" class="bg-white/80 dark:bg-amoled-card/80 backdrop-blur-sm border border-gray-200 dark:border-amoled-border rounded-2xl p-3 shadow-sm card-lift flex flex-col justify-center gap-1 hover:border-teal-400 dark:hover:border-teal-500/50 transition duration-300 relative overflow-hidden group min-h-[64px]">
+        <div class="absolute -right-4 -bottom-4 w-16 h-16 bg-teal-500/10 rounded-full blur-xl group-hover:scale-150 transition duration-500"></div>
         <div class="flex items-center justify-between relative z-10">
             <span class="text-[11px] sm:text-xs font-semibold text-gray-500 dark:text-zinc-400 whitespace-nowrap">ریکوئست‌های روزانه</span>
-            <div class="w-7 h-7 bg-green-100 dark:bg-green-900/40 text-green-600 dark:text-green-400 rounded-full flex items-center justify-center flex-shrink-0">
+            <div class="w-7 h-7 bg-teal-100 dark:bg-teal-900/40 text-teal-600 dark:text-teal-400 rounded-full flex items-center justify-center flex-shrink-0">
                 <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M3 15a4 4 0 004 4h9a5 5 0 10-.1-9.999 5.002 5.002 0 10-9.78 2.096A4.001 4.001 0 003 15z"></path></svg>
             </div>
         </div>
         <div class="relative z-10 min-w-0 flex-1 w-full mt-0.5">
             <div class="flex items-end justify-between w-full mb-1.5">
                 <div class="flex items-baseline gap-1">
-                    <span class="text-lg font-black text-green-600 dark:text-green-400 transition-all leading-none" id="stat-cf-requests">0</span>
+                    <span class="text-lg font-black text-teal-600 dark:text-teal-400 transition-all leading-none" id="stat-cf-requests">0</span>
                     <span class="text-[9px] font-bold text-gray-400 mr-0.5 leading-none">/ 100k</span>
-                    <button id="cf-warning-btn" onclick="openUsageWarning()" class="hidden flex items-center justify-center w-3 h-3 bg-red-100 dark:bg-red-900/40 text-red-600 dark:text-red-400 rounded-full font-bold text-[9px] animate-bounce shadow-md border border-red-300 dark:border-red-700 mr-1 leading-none">!</button>
+                    <button id="cf-warning-btn" onclick="openUsageWarning()" class="hidden flex items-center justify-center w-3 h-3 bg-red-100 dark:bg-red-900/40 text-red-600 dark:text-red-400 rounded-full font-bold text-[9px] animate-bounce shadow-sm border border-red-300 dark:border-red-700 mr-1 leading-none">!</button>
                 </div>
-                <span class="text-[9px] text-green-500 dark:text-green-400 flex items-center gap-1 font-medium whitespace-nowrap leading-none">
+                <span class="text-[9px] text-teal-500 dark:text-teal-400 flex items-center gap-1 font-medium whitespace-nowrap leading-none">
                     <span>Total: <span id="stat-cf-total">0</span></span>
                 </span>
             </div>
             <div class="w-full bg-gray-100 dark:bg-zinc-800 rounded-full h-1">
-                <div id="stat-cf-progress" class="bg-green-500 h-1 rounded-full transition-all duration-500" style="width: 0%"></div>
+                <div id="stat-cf-progress" class="bg-teal-500 h-1 rounded-full transition-all duration-500" style="width: 0%"></div>
             </div>
         </div>
     </div>
 
-    <div class="bg-white/80 dark:bg-amoled-card/80 backdrop-blur-sm border border-gray-200 dark:border-amoled-border rounded-2xl p-3 shadow-md card-lift lk-card flex flex-col justify-center gap-1 hover:border-indigo-400 dark:hover:border-indigo-500/50 transition duration-500 relative overflow-hidden group min-h-[64px]">
+    <div class="bg-white/80 dark:bg-amoled-card/80 backdrop-blur-sm border border-gray-200 dark:border-amoled-border rounded-2xl p-3 shadow-sm card-lift flex flex-col justify-center gap-1 hover:border-indigo-400 dark:hover:border-indigo-500/50 transition duration-300 relative overflow-hidden group min-h-[64px]">
         <div class="absolute -right-4 -bottom-4 w-16 h-16 bg-indigo-500/10 rounded-full blur-xl group-hover:scale-150 transition duration-500"></div>
         <div class="flex items-center justify-between relative z-10">
             <span class="text-[11px] sm:text-xs font-semibold text-gray-500 dark:text-zinc-400 whitespace-nowrap">ترافیک مصرفی سرور</span>
@@ -3424,15 +2951,15 @@ const HTML_TEMPLATES = {
         <div id="loading-state" class="text-center py-12">
             <span class="text-gray-500 dark:text-gray-400">در حال بارگذاری کاربران...</span>
         </div>
-        <div class="mb-5 flex flex-col md:flex-row gap-2 justify-between items-center bg-white/80 dark:bg-amoled-card/80 backdrop-blur-sm border border-gray-200 dark:border-amoled-border rounded-2xl p-2.5 shadow-md">
+        <div class="mb-5 flex flex-col md:flex-row gap-2 justify-between items-center bg-white/80 dark:bg-amoled-card/80 backdrop-blur-sm border border-gray-200 dark:border-amoled-border rounded-2xl p-2.5 shadow-sm">
             <div class="relative w-full md:w-80">
-                <input type="text" id="search-input" oninput="filterAndRenderUsers()" placeholder="جستجوی نام کاربری یا UUID..." class="w-full pl-3 pr-8 py-1.5 bg-gray-50 dark:bg-amoled-input border border-gray-300 dark:border-amoled-border rounded-xl focus:outline-none focus:ring-2 focus:ring-indigo-500 text-xs">
+                <input type="text" id="search-input" oninput="filterAndRenderUsers()" placeholder="جستجوی نام کاربری یا UUID..." class="w-full pl-3 pr-8 py-1.5 bg-gray-50 dark:bg-amoled-input border border-gray-300 dark:border-amoled-border rounded-lg focus:outline-none focus:ring-2 focus:ring-indigo-500 text-xs">
                 <div class="absolute inset-y-0 right-0 flex items-center pr-2.5 pointer-events-none text-gray-400">
                     <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M21 21l-6-6m2-5a7 7 0 11-14 0 7 7 0 0114 0z"></path></svg>
                 </div>
             </div>
             <div class="flex items-center gap-2 w-full md:w-auto">
-                <select id="filter-status" onchange="filterAndRenderUsers()" class="flex-1 min-w-0 px-2 py-1.5 bg-gray-50 dark:bg-amoled-input border border-gray-300 dark:border-amoled-border rounded-xl text-xs focus:outline-none focus:ring-2 focus:ring-indigo-500 text-gray-700 dark:text-zinc-300 cursor-pointer truncate">
+                <select id="filter-status" onchange="filterAndRenderUsers()" class="flex-1 min-w-0 px-2 py-1.5 bg-gray-50 dark:bg-amoled-input border border-gray-300 dark:border-amoled-border rounded-lg text-xs focus:outline-none focus:ring-2 focus:ring-indigo-500 text-gray-700 dark:text-zinc-300 cursor-pointer truncate">
                     <option value="all">🔍 همه</option>
 					<option value="active">✅ فعال</option>
                     <option value="inactive">❌ غیرفعال</option>
@@ -3440,7 +2967,7 @@ const HTML_TEMPLATES = {
                     <option value="offline">💤 آفلاین</option>
                     <option value="expired">⏳ منقضی</option>
                 </select>
-                <select id="sort-users" onchange="filterAndRenderUsers()" class="flex-1 min-w-0 px-2 py-1.5 bg-gray-50 dark:bg-amoled-input border border-gray-300 dark:border-amoled-border rounded-xl text-xs focus:outline-none focus:ring-2 focus:ring-indigo-500 text-gray-700 dark:text-zinc-300 cursor-pointer truncate">
+                <select id="sort-users" onchange="filterAndRenderUsers()" class="flex-1 min-w-0 px-2 py-1.5 bg-gray-50 dark:bg-amoled-input border border-gray-300 dark:border-amoled-border rounded-lg text-xs focus:outline-none focus:ring-2 focus:ring-indigo-500 text-gray-700 dark:text-zinc-300 cursor-pointer truncate">
                     <option value="newest">📅 جدیدترین</option>
                     <option value="name">🔤 نام کاربری (الفبا)</option>
                     <option value="usage-desc">📊 بیشترین مصرف</option>
@@ -3451,21 +2978,21 @@ const HTML_TEMPLATES = {
         </div>
 		<div class="flex items-center justify-between mb-4">
 			<h2 class="text-lg font-bold text-gray-800 dark:text-zinc-200 flex items-center gap-2">
-                <span class="w-1.5 h-5 rounded-full bg-gradient-to-b from-indigo-600 to-green-500"></span>
+                <span class="w-1.5 h-5 rounded-full bg-gradient-to-b from-indigo-600 to-teal-500"></span>
                 لیست کاربران
             </h2>
-			<button onclick="openCreateModal()" class="btn-shine flex items-center gap-1.5 pl-4 pr-3 py-2 rounded-full bg-gradient-to-r from-indigo-600 to-violet-600 hover:shadow-xl hover:shadow-indigo-500/30 transition-all duration-500 text-white shadow-md hover:scale-105 text-sm font-bold">
+			<button onclick="openCreateModal()" class="btn-shine flex items-center gap-1.5 pl-4 pr-3 py-2 rounded-full bg-gradient-to-r from-indigo-600 via-purple-600 to-teal-500 hover:shadow-lg hover:shadow-indigo-500/30 transition-all duration-300 text-white shadow-sm hover:scale-105 text-sm font-bold">
     			<svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2.5" d="M12 4v16m8-8H4"></path></svg>
                 کاربر جدید
 			</button>
 		</div>
-        <div id="users-table-container" class="hidden overflow-hidden border border-gray-200 dark:border-amoled-border rounded-2xl bg-white/80 dark:bg-amoled-card/80 backdrop-blur-sm shadow-md">
-            <div class="h-1 w-full bg-gradient-to-r from-indigo-600 to-violet-600"></div>
+        <div id="users-table-container" class="hidden overflow-hidden border border-gray-200 dark:border-amoled-border rounded-2xl bg-white/80 dark:bg-amoled-card/80 backdrop-blur-sm shadow-sm">
+            <div class="h-1 w-full bg-gradient-to-r from-indigo-600 via-purple-600 to-teal-500"></div>
             <div class="overflow-x-auto">
             <table class="w-full text-right border-collapse">
                 <thead>
-                    <tr class="bg-gradient-to-l from-indigo-50 via-indigo-50/60 to-green-50/40 dark:from-indigo-950/30 dark:via-indigo-950/20 dark:to-green-950/20 border-b-2 border-indigo-100 dark:border-indigo-900/40 text-[11px] font-bold uppercase tracking-wide text-gray-500 dark:text-gray-400 text-center">
-                        <th class="p-2.5 w-10 text-center"><input type="checkbox" id="select-all-users" onchange="toggleSelectAllUsers(this)" class="w-5 h-5 rounded-lg border-2 border-gray-300 dark:border-zinc-700 text-indigo-600 bg-white dark:bg-zinc-800 checked:bg-indigo-600 checked:border-indigo-600 focus:ring-indigo-500/50 focus:ring-offset-0 transition-all duration-300 cursor-pointer hover:scale-105 active:scale-95"></th>
+                    <tr class="bg-gradient-to-l from-indigo-50 via-purple-50/60 to-teal-50/40 dark:from-indigo-950/30 dark:via-purple-950/20 dark:to-teal-950/20 border-b-2 border-indigo-100 dark:border-indigo-900/40 text-[11px] font-bold uppercase tracking-wide text-gray-500 dark:text-gray-400 text-center">
+                        <th class="p-2.5 w-10 text-center"><input type="checkbox" id="select-all-users" onchange="toggleSelectAllUsers(this)" class="w-5 h-5 rounded-md border-2 border-gray-300 dark:border-zinc-700 text-indigo-600 bg-white dark:bg-zinc-800 checked:bg-indigo-600 checked:border-indigo-600 focus:ring-indigo-500/50 focus:ring-offset-0 transition-all duration-200 cursor-pointer hover:scale-105 active:scale-95"></th>
                         <th class="p-2.5 border-r border-gray-200 dark:border-zinc-800">وضعیت</th>
                         <th class="p-2.5 border-r border-gray-200 dark:border-zinc-800">عملیات</th>
                         <th class="p-2.5 border-r border-gray-200 dark:border-zinc-800">لینک ساب</th>
@@ -3480,12 +3007,12 @@ const HTML_TEMPLATES = {
             </table>
             </div>
         </div>
-        <div id="empty-state" class="hidden p-8 border-2 border-dashed border-red-500/60 dark:border-red-500/50 bg-red-50 dark:bg-red-900/10 rounded-2xl text-center animate-pulse shadow-md">
+        <div id="empty-state" class="hidden p-8 border-2 border-dashed border-red-500/60 dark:border-red-500/50 bg-red-50 dark:bg-red-900/10 rounded-2xl text-center animate-pulse shadow-sm">
             <p class="text-red-600 dark:text-red-400 font-bold text-lg">کاربری وجود ندارد. برای ساخت اولین کاربر روی دکمه « + » کلیک کنید.</p>
         </div>
     </main>
-<div id="path-warning-modal" class="fixed inset-0 z-[70] flex items-center justify-center p-4 bg-black/60 backdrop-blur-sm opacity-0 pointer-events-none transition-all duration-500 ease-out">
-    <div class="w-full max-w-md bg-white dark:bg-amoled-card border border-red-500/50 rounded-3xl shadow-2xl overflow-hidden p-6 text-center transition-all transform duration-500 opacity-0 scale-95 ease-out">
+<div id="path-warning-modal" class="fixed inset-0 z-[70] flex items-center justify-center p-4 bg-black/60 backdrop-blur-sm opacity-0 pointer-events-none transition-all duration-300 ease-out">
+    <div class="w-full max-w-md bg-white dark:bg-amoled-card border border-red-500/50 rounded-3xl shadow-2xl overflow-hidden p-6 text-center transition-all transform duration-300 opacity-0 scale-95 ease-out">
         <div class="inline-flex items-center justify-center w-16 h-16 rounded-full bg-red-100 dark:bg-red-900/30 text-red-500 mb-4 shadow-inner">
             <svg class="w-8 h-8" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2.5" d="M12 9v2m0 4h.01m-6.938 4h13.856c1.54 0 2.502-1.667 1.732-3L13.732 4c-.77-1.333-2.694-1.333-3.464 0L3.34 16c-.77 1.333.192 3 1.732 3z"></path></svg>
         </div>
@@ -3493,63 +3020,63 @@ const HTML_TEMPLATES = {
         <p class="text-sm text-gray-600 dark:text-gray-400 mb-6 leading-relaxed font-medium">
             به دلیل شناسایی پروژه توسط کلودفلر و مسدود شدن نسخه های قبلی، کانفیگ‌های قبل از نسخه 1.7.6 غیرفعال شده‌اند. درصورت عدم اتصال لطفاً ساب خود را بروزرسانی کنید .
         </p>
-        <button onclick="closePathWarning()" class="w-full py-3.5 bg-gradient-to-r from-indigo-600 to-violet-600 border-0 text-white hover:from-indigo-500 hover:to-violet-500 hover:shadow-xl hover:shadow-indigo-500/30 font-black rounded-2xl text-sm transition duration-500 shadow-xl">
+        <button onclick="closePathWarning()" class="w-full py-3.5 bg-indigo-600 border-0 text-white hover:bg-indigo-500 hover:shadow-md font-black rounded-xl text-sm transition duration-300 shadow-lg">
             متوجه شدم، کانفیگ‌های جدید را می‌گیرم 
         </button>
     </div>
 </div>
-<div id="usage-warning-modal" class="fixed inset-0 z-[80] flex items-center justify-center p-4 bg-black/60 backdrop-blur-sm opacity-0 pointer-events-none transition-all duration-500 ease-out">
-    <div class="w-full max-w-md bg-white dark:bg-amoled-card border border-green-500/50 rounded-3xl shadow-2xl overflow-hidden p-6 text-center transition-all transform duration-500 opacity-0 scale-95 ease-out">
-        <div class="inline-flex items-center justify-center w-16 h-16 rounded-full bg-green-100 dark:bg-green-900/30 text-green-500 mb-4 shadow-inner">
+<div id="usage-warning-modal" class="fixed inset-0 z-[80] flex items-center justify-center p-4 bg-black/60 backdrop-blur-sm opacity-0 pointer-events-none transition-all duration-300 ease-out">
+    <div class="w-full max-w-md bg-white dark:bg-amoled-card border border-teal-500/50 rounded-3xl shadow-2xl overflow-hidden p-6 text-center transition-all transform duration-300 opacity-0 scale-95 ease-out">
+        <div class="inline-flex items-center justify-center w-16 h-16 rounded-full bg-teal-100 dark:bg-teal-900/30 text-teal-500 mb-4 shadow-inner">
             <svg class="w-8 h-8" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2.5" d="M12 9v2m0 4h.01m-6.938 4h13.856c1.54 0 2.502-1.667 1.732-3L13.732 4c-.77-1.333-2.694-1.333-3.464 0L3.34 16c-.77 1.333.192 3 1.732 3z"></path></svg>
         </div>
         <h3 class="font-black text-xl text-gray-900 dark:text-white mb-2">هشدار محدودیت درخواست روزانه</h3>
         <p class="text-sm text-gray-600 dark:text-gray-400 mb-6 leading-relaxed font-medium">
             درخواست‌های روزانه کلودفلر شما از ۹۰,۰۰۰ عبور کرده است. در صورت عبور از محدودیت رایگان ۱۰۰,۰۰۰ درخواست، دسترسی به پنل و اتصالات تا ساعت ۳:۳۰ بامداد (به وقت ایران) قطع خواهد شد.
         </p>
-        <button onclick="closeUsageWarning()" class="w-full py-3.5 bg-gradient-to-r from-indigo-600 to-violet-600 border-0 text-white hover:from-indigo-500 hover:to-violet-500 hover:shadow-xl hover:shadow-indigo-500/30 font-black rounded-2xl text-sm transition duration-500 shadow-xl">
+        <button onclick="closeUsageWarning()" class="w-full py-3.5 bg-indigo-600 border-0 text-white hover:bg-indigo-500 hover:shadow-md font-black rounded-xl text-sm transition duration-300 shadow-lg">
             متوجه شدم
         </button>
     </div>
 </div>
-<div id="free-panel-warning-modal" class="fixed inset-0 z-[85] flex items-center justify-center p-4 bg-black/60 backdrop-blur-sm opacity-0 pointer-events-none transition-all duration-500 ease-out">
-    <div class="w-full max-w-md bg-white dark:bg-amoled-card border border-red-500/50 rounded-3xl shadow-2xl overflow-hidden p-6 text-center transition-all transform duration-500 opacity-0 scale-95 ease-out">
-        <div class="inline-flex items-center justify-center w-16 h-16 rounded-full bg-red-100 dark:bg-red-900/30 text-red-500 mb-4 shadow-inner">
+<div id="free-panel-warning-modal" class="fixed inset-0 z-[85] flex items-center justify-center p-4 bg-black/60 backdrop-blur-sm opacity-0 pointer-events-none transition-all duration-300 ease-out">
+    <div class="w-full max-w-md bg-white dark:bg-amoled-card border border-rose-500/50 rounded-3xl shadow-2xl overflow-hidden p-6 text-center transition-all transform duration-300 opacity-0 scale-95 ease-out">
+        <div class="inline-flex items-center justify-center w-16 h-16 rounded-full bg-rose-100 dark:bg-rose-900/30 text-rose-500 mb-4 shadow-inner">
             <svg class="w-8 h-8" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2.5" d="M12 9v2m0 4h.01m-6.938 4h13.856c1.54 0 2.502-1.667 1.732-3L13.732 4c-.77-1.333-2.694-1.333-3.464 0L3.34 16c-.77 1.333.192 3 1.732 3z"></path></svg>
         </div>
         <h3 class="font-black text-xl text-gray-900 dark:text-white mb-2">پیام همگانی</h3>
         <p class="text-sm text-gray-600 dark:text-gray-400 mb-6 leading-relaxed font-medium">
-            این پنل کاملاً <span class="text-red-500 font-bold">رایگان</span> است. هرگونه فروش پنل یا کانفیگ‌های آن مصداق کلاه‌برداری و رفتاری دور از انسانیت و شرافت است. لطفاً از این ابزار فقط به صورت شخصی و رایگان استفاده کنید.
+            این پنل کاملاً <span class="text-rose-500 font-bold">رایگان</span> است. هرگونه فروش پنل یا کانفیگ‌های آن مصداق کلاه‌برداری و رفتاری دور از انسانیت و شرافت است. لطفاً از این ابزار فقط به صورت شخصی و رایگان استفاده کنید.
         </p>
-        <button onclick="closeFreePanelWarning()" class="w-full py-3.5 bg-transparent border-2 border-green-800 text-green-900 hover:bg-green-800 hover:text-white dark:border-green-800 dark:text-green-700 dark:hover:bg-green-900 dark:hover:text-white font-black rounded-2xl text-sm transition duration-500 shadow-xl">
+        <button onclick="closeFreePanelWarning()" class="w-full py-3.5 bg-transparent border-2 border-green-800 text-green-900 hover:bg-green-800 hover:text-white dark:border-green-800 dark:text-green-700 dark:hover:bg-green-900 dark:hover:text-white font-black rounded-xl text-sm transition duration-300 shadow-lg">
             تأیید و موافقت
         </button>
     </div>
 </div>
-<div id="global-message-modal" class="fixed inset-0 z-[86] flex items-center justify-center p-4 bg-black/60 backdrop-blur-sm opacity-0 pointer-events-none transition-all duration-500 ease-out">
-    <div class="w-full max-w-md bg-white dark:bg-amoled-card border border-indigo-500/50 rounded-3xl shadow-2xl overflow-hidden p-6 text-center transition-all transform duration-500 opacity-0 scale-95 ease-out">
+<div id="global-message-modal" class="fixed inset-0 z-[86] flex items-center justify-center p-4 bg-black/60 backdrop-blur-sm opacity-0 pointer-events-none transition-all duration-300 ease-out">
+    <div class="w-full max-w-md bg-white dark:bg-amoled-card border border-indigo-500/50 rounded-3xl shadow-2xl overflow-hidden p-6 text-center transition-all transform duration-300 opacity-0 scale-95 ease-out">
         <div class="inline-flex items-center justify-center w-16 h-16 rounded-full bg-indigo-100 dark:bg-indigo-900/30 text-indigo-500 mb-4 shadow-inner">
             <svg class="w-8 h-8" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2.5" d="M13 16h-1v-4h-1m1-4h.01M21 12a9 9 0 11-18 0 9 9 0 0118 0z"></path></svg>
         </div>
         <h3 class="font-black text-xl text-gray-900 dark:text-white mb-4">پیام سیستم</h3>
         <div id="global-message-content" class="mb-6 w-full text-center">
         </div>
-        <button id="global-message-close-btn" class="w-full py-3.5 bg-transparent border-2 border-indigo-600 text-indigo-700 hover:bg-indigo-900/20 hover:text-indigo-800 dark:border-indigo-500 dark:text-indigo-500 dark:hover:bg-indigo-900/40 dark:hover:text-indigo-400 font-black rounded-2xl text-sm transition duration-500 shadow-xl">
+        <button id="global-message-close-btn" class="w-full py-3.5 bg-transparent border-2 border-indigo-600 text-indigo-700 hover:bg-indigo-900/20 hover:text-indigo-800 dark:border-indigo-500 dark:text-indigo-500 dark:hover:bg-indigo-900/40 dark:hover:text-indigo-400 font-black rounded-xl text-sm transition duration-300 shadow-lg">
             متوجه شدم
         </button>
     </div>
 </div>
-    <div id="user-modal" class="fixed inset-0 z-50 flex items-center justify-center p-4 bg-black/70 opacity-0 pointer-events-none transition-opacity duration-300 ease-out">
-        <div id="user-modal-card" class="w-full max-w-xl bg-white dark:bg-zinc-950 border border-gray-200 dark:border-zinc-800 rounded-2xl shadow-xl overflow-hidden transition-[opacity,transform] duration-300 opacity-0 scale-95 ease-out flex flex-col max-h-[90vh] transform-gpu" style="will-change: transform, opacity;">
-            <div class="h-1 w-full bg-gradient-to-r from-indigo-600 to-violet-600"></div>
+    <div id="user-modal" class="fixed inset-0 z-50 flex items-center justify-center p-4 bg-black/70 opacity-0 pointer-events-none transition-opacity duration-200 ease-out">
+        <div id="user-modal-card" class="w-full max-w-xl bg-white dark:bg-zinc-950 border border-gray-200 dark:border-zinc-800 rounded-2xl shadow-xl overflow-hidden transition-[opacity,transform] duration-200 opacity-0 scale-95 ease-out flex flex-col max-h-[90vh] transform-gpu" style="will-change: transform, opacity;">
+            <div class="h-1 w-full bg-gradient-to-r from-indigo-600 via-purple-600 to-teal-500"></div>
             <div class="px-6 py-4 border-b border-gray-150 dark:border-zinc-800/80 flex justify-between items-center bg-gray-50/50 dark:bg-zinc-900/30">
                 <div class="flex items-center gap-3">
-                    <div class="w-9 h-9 rounded-2xl bg-gradient-to-br from-indigo-600 to-green-500 flex items-center justify-center text-white shadow-md shrink-0">
+                    <div class="w-9 h-9 rounded-xl bg-gradient-to-br from-indigo-600 to-teal-500 flex items-center justify-center text-white shadow-sm shrink-0">
                         <svg class="w-4.5 h-4.5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 4.5v15m7.5-7.5h-15"></path></svg>
                     </div>
                     <h3 id="modal-title" class="font-bold text-gray-900 dark:text-zinc-100 text-base">ایجاد کاربر جدید</h3>
                 </div>
-                <button onclick="toggleModal(false)" class="p-1.5 rounded-xl bg-red-50 dark:bg-red-950/30 border border-red-200 dark:border-red-900/50 text-red-600 dark:text-red-500 hover:bg-red-100 dark:hover:bg-red-900/50 transition-all duration-300 shadow-md">
+                <button onclick="toggleModal(false)" class="p-1.5 rounded-lg bg-red-50 dark:bg-red-950/30 border border-red-200 dark:border-red-900/50 text-red-600 dark:text-red-500 hover:bg-red-100 dark:hover:bg-red-900/50 transition-all duration-200 shadow-sm">
                     <svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M6 18L18 6M6 6l12 12"></path></svg>
                 </button>
             </div>
@@ -3561,7 +3088,7 @@ const HTML_TEMPLATES = {
                             <span class="absolute inset-y-0 right-0 flex items-center pr-3 pointer-events-none text-gray-400">
                                 <svg class="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M16 7a4 4 0 11-8 0 4 4 0 018 0zM12 14a7 7 0 00-7 7h14a7 7 0 00-7-7z"></path></svg>
                             </span>
-                            <input type="text" id="input-name" placeholder="PANEL_LOWKEY" maxlength="32" class="w-full pl-3 pr-9 py-1.5 bg-gray-50 dark:bg-zinc-900 border border-gray-200 dark:border-zinc-800 rounded-2xl focus:outline-none focus:ring-2 focus:ring-indigo-500/50 text-xs font-semibold text-gray-800 dark:text-zinc-100 placeholder-gray-400/80 transition" required>
+                            <input type="text" id="input-name" placeholder="PANEL_LOWKEY" maxlength="32" class="w-full pl-3 pr-9 py-1.5 bg-gray-50 dark:bg-zinc-900 border border-gray-200 dark:border-zinc-800 rounded-xl focus:outline-none focus:ring-2 focus:ring-indigo-500/50 text-xs font-semibold text-gray-800 dark:text-zinc-100 placeholder-gray-400/80 transition" required>
                         </div>
                     </div>
                     <div class="grid grid-cols-2 sm:grid-cols-4 gap-2.5">
@@ -3571,7 +3098,7 @@ const HTML_TEMPLATES = {
                                 <span class="absolute inset-y-0 right-0 flex items-center pr-3 pointer-events-none text-gray-400">
                                     <svg class="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M19 11H5m14 0a2 2 0 012 2v6a2 2 0 01-2 2H5a2 2 0 01-2-2v-6a2 2 0 012-2m14 0V9a2 2 0 00-2-2M5 11V9a2 2 0 012-2m0 0V5a2 2 0 012-2h6a2 2 0 012 2v2M7 7h10"></path></svg>
                                 </span>
-                                <input type="number" id="input-limit" min="0" step="any" placeholder="نامحدود" class="w-full pl-3 pr-9 py-1.5 bg-gray-50 dark:bg-zinc-900 border border-gray-200 dark:border-zinc-800 rounded-2xl focus:outline-none focus:ring-2 focus:ring-indigo-500/50 text-xs font-semibold text-gray-800 dark:text-zinc-100 placeholder-gray-400/80 transition">
+                                <input type="number" id="input-limit" min="0" step="any" placeholder="نامحدود" class="w-full pl-3 pr-9 py-1.5 bg-gray-50 dark:bg-zinc-900 border border-gray-200 dark:border-zinc-800 rounded-xl focus:outline-none focus:ring-2 focus:ring-indigo-500/50 text-xs font-semibold text-gray-800 dark:text-zinc-100 placeholder-gray-400/80 transition">
                             </div>
                         </div>
                         <div>
@@ -3580,7 +3107,7 @@ const HTML_TEMPLATES = {
                                 <span class="absolute inset-y-0 right-0 flex items-center pr-3 pointer-events-none text-gray-400">
                                     <svg class="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 8v4l3 3m6-3a9 9 0 11-18 0 9 9 0 0118 0z"></path></svg>
                                 </span>
-                                <input type="number" id="input-expiry" min="0" placeholder="نامحدود" class="w-full pl-3 pr-9 py-1.5 bg-gray-50 dark:bg-zinc-900 border border-gray-200 dark:border-zinc-800 rounded-2xl focus:outline-none focus:ring-2 focus:ring-indigo-500/50 text-xs font-semibold text-gray-800 dark:text-zinc-100 placeholder-gray-400/80 transition">
+                                <input type="number" id="input-expiry" min="0" placeholder="نامحدود" class="w-full pl-3 pr-9 py-1.5 bg-gray-50 dark:bg-zinc-900 border border-gray-200 dark:border-zinc-800 rounded-xl focus:outline-none focus:ring-2 focus:ring-indigo-500/50 text-xs font-semibold text-gray-800 dark:text-zinc-100 placeholder-gray-400/80 transition">
                             </div>
                         </div>
                         <div>
@@ -3589,7 +3116,7 @@ const HTML_TEMPLATES = {
                                 <span class="absolute inset-y-0 right-0 flex items-center pr-3 pointer-events-none text-gray-400">
                                     <svg class="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M13 10V3L4 14h7v7l9-11h-7z"></path></svg>
                                 </span>
-                                <input type="number" id="input-req-limit" min="0" placeholder="نامحدود" class="w-full pl-3 pr-9 py-1.5 bg-gray-50 dark:bg-zinc-900 border border-gray-200 dark:border-zinc-800 rounded-2xl focus:outline-none focus:ring-2 focus:ring-indigo-500/50 text-xs font-semibold text-gray-800 dark:text-zinc-100 placeholder-gray-400/80 transition">
+                                <input type="number" id="input-req-limit" min="0" placeholder="نامحدود" class="w-full pl-3 pr-9 py-1.5 bg-gray-50 dark:bg-zinc-900 border border-gray-200 dark:border-zinc-800 rounded-xl focus:outline-none focus:ring-2 focus:ring-indigo-500/50 text-xs font-semibold text-gray-800 dark:text-zinc-100 placeholder-gray-400/80 transition">
                             </div>
                         </div>
                         <div>
@@ -3598,13 +3125,13 @@ const HTML_TEMPLATES = {
                                 <span class="absolute inset-y-0 right-0 flex items-center pr-3 pointer-events-none text-gray-400">
                                     <svg class="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M17 20h5v-2a3 3 0 00-5.356-1.857M17 20H7m10 0v-2c0-.656-.126-1.283-.356-1.857M7 20H2v-2a3 3 0 015.356-1.857M7 20v-2c0-.656.126-1.283.356-1.857m0 0a5.002 5.002 0 019.288 0M15 7a3 3 0 11-6 0 3 3 0 016 0zm6 3a2 2 0 11-4 0 2 2 0 014 0zM7 10a2 2 0 11-4 0 2 2 0 014 0z"></path></svg>
                                 </span>
-                                <input type="number" id="input-ip-limit" min="0" placeholder="نامحدود" class="w-full pl-3 pr-9 py-1.5 bg-gray-50 dark:bg-zinc-900 border border-gray-200 dark:border-zinc-800 rounded-2xl focus:outline-none focus:ring-2 focus:ring-indigo-500/50 text-xs font-semibold text-gray-800 dark:text-zinc-100 placeholder-gray-400/80 transition">
+                                <input type="number" id="input-ip-limit" min="0" placeholder="نامحدود" class="w-full pl-3 pr-9 py-1.5 bg-gray-50 dark:bg-zinc-900 border border-gray-200 dark:border-zinc-800 rounded-xl focus:outline-none focus:ring-2 focus:ring-indigo-500/50 text-xs font-semibold text-gray-800 dark:text-zinc-100 placeholder-gray-400/80 transition">
                             </div>
                         </div>
                     </div>
                 </div>
 <div class="grid grid-cols-2 gap-3 mt-4">
-    <div class="p-3 bg-gray-50/50 dark:bg-zinc-900/20 border border-gray-200/60 dark:border-zinc-800 rounded-2xl shadow-md">
+    <div class="p-3 bg-gray-50/50 dark:bg-zinc-900/20 border border-gray-200/60 dark:border-zinc-800 rounded-2xl shadow-sm">
         <div class="flex items-center justify-between mb-2">
             <span class="text-[10px] font-bold text-gray-500 dark:text-zinc-400 uppercase tracking-wider">Fragment</span>
             <label class="relative inline-flex items-center cursor-pointer select-none">
@@ -3612,16 +3139,16 @@ const HTML_TEMPLATES = {
                 <div class="w-9 h-5 bg-gray-200 rounded-full peer dark:bg-zinc-700 peer-checked:bg-green-600 transition-colors after:content-[''] after:absolute after:top-[2px] after:right-[2px] after:bg-white after:rounded-full after:h-4 after:w-4 after:transition-transform peer-checked:after:-translate-x-[18px]"></div>
             </label>
         </div>
-        <div id="frag-inputs-container" class="grid grid-cols-2 gap-1.5 transition-all duration-500">
-            <input type="text" id="input-frag-len" placeholder="Len" value="200-3000" dir="ltr" class="w-full px-1.5 py-1 bg-white dark:bg-zinc-950 border border-gray-200 dark:border-zinc-800 rounded-xl focus:outline-none focus:ring-1 focus:ring-indigo-500 text-[10px] font-mono text-center text-gray-800 dark:text-zinc-100">
-            <input type="text" id="input-frag-int" placeholder="Int" value="1-2" dir="ltr" class="w-full px-1.5 py-1 bg-white dark:bg-zinc-950 border border-gray-200 dark:border-zinc-800 rounded-xl focus:outline-none focus:ring-1 focus:ring-indigo-500 text-[10px] font-mono text-center text-gray-800 dark:text-zinc-100">
+        <div id="frag-inputs-container" class="grid grid-cols-2 gap-1.5 transition-all duration-300">
+            <input type="text" id="input-frag-len" placeholder="Len" value="200-3000" dir="ltr" class="w-full px-1.5 py-1 bg-white dark:bg-zinc-950 border border-gray-200 dark:border-zinc-800 rounded-lg focus:outline-none focus:ring-1 focus:ring-indigo-500 text-[10px] font-mono text-center text-gray-800 dark:text-zinc-100">
+            <input type="text" id="input-frag-int" placeholder="Int" value="1-2" dir="ltr" class="w-full px-1.5 py-1 bg-white dark:bg-zinc-950 border border-gray-200 dark:border-zinc-800 rounded-lg focus:outline-none focus:ring-1 focus:ring-indigo-500 text-[10px] font-mono text-center text-gray-800 dark:text-zinc-100">
         </div>
     </div>
 
-    <div class="p-3 bg-gray-50/50 dark:bg-zinc-900/20 border border-gray-200/60 dark:border-zinc-800 rounded-2xl shadow-md">
+    <div class="p-3 bg-gray-50/50 dark:bg-zinc-900/20 border border-gray-200/60 dark:border-zinc-800 rounded-2xl shadow-sm">
         <label class="block text-[10px] font-bold text-gray-500 dark:text-zinc-400 mb-1.5 uppercase tracking-wider">Fingerprint</label>
         <div class="relative">
-            <select id="fingerprint-select" class="w-full px-2 py-1.5 bg-white dark:bg-zinc-950 border border-gray-200 dark:border-zinc-800 rounded-2xl focus:outline-none focus:ring-1 focus:ring-indigo-500 text-[10px] font-semibold text-gray-700 dark:text-zinc-300 cursor-pointer appearance-none">
+            <select id="fingerprint-select" class="w-full px-2 py-1.5 bg-white dark:bg-zinc-950 border border-gray-200 dark:border-zinc-800 rounded-xl focus:outline-none focus:ring-1 focus:ring-indigo-500 text-[10px] font-semibold text-gray-700 dark:text-zinc-300 cursor-pointer appearance-none">
                 <option value="chrome">🌐 Chrome</option>
 				<option value="firefox">🦊 Firefox</option>
 				<option value="safari">🧭 Safari</option>
@@ -3640,14 +3167,14 @@ const HTML_TEMPLATES = {
     </div>
 </div>
 						<div class="grid grid-cols-2 gap-2 mt-2">
-    						<div class="flex items-center justify-between bg-gray-50 dark:bg-zinc-900 border border-gray-200 dark:border-zinc-800 rounded-2xl p-1.5 shadow-md">
+    						<div class="flex items-center justify-between bg-gray-50 dark:bg-zinc-900 border border-gray-200 dark:border-zinc-800 rounded-xl p-1.5 shadow-sm">
     						    <span class="text-[10px] sm:text-xs font-semibold text-gray-700 dark:text-zinc-300 whitespace-nowrap pl-1">NSFW Blacker</span>
     						    <label class="relative inline-flex items-center cursor-pointer scale-[0.65] sm:scale-75 origin-left">
     						        <input type="checkbox" id="input-block-porn" class="sr-only peer">
     						        <div class="w-11 h-6 bg-gray-300 peer-focus:outline-none rounded-full peer dark:bg-zinc-700 peer-checked:after:-translate-x-full peer-checked:after:border-white after:content-[''] after:absolute after:top-[2px] after:right-[2px] after:bg-white after:border-gray-300 after:border after:rounded-full after:h-5 after:w-5 after:transition-all dark:border-gray-600 peer-checked:bg-green-700"></div>
     						    </label>
     						</div>
-    						<div class="flex items-center justify-between bg-gray-50 dark:bg-zinc-900 border border-gray-200 dark:border-zinc-800 rounded-2xl p-1.5 shadow-md">
+    						<div class="flex items-center justify-between bg-gray-50 dark:bg-zinc-900 border border-gray-200 dark:border-zinc-800 rounded-xl p-1.5 shadow-sm">
     						    <span class="text-[10px] sm:text-xs font-semibold text-gray-700 dark:text-zinc-300 whitespace-nowrap pl-1">ADS blocker</span>
     						    <label class="relative inline-flex items-center cursor-pointer scale-[0.65] sm:scale-75 origin-left">
     						        <input type="checkbox" id="input-block-ads" class="sr-only peer">
@@ -3658,29 +3185,29 @@ const HTML_TEMPLATES = {
 <div class="pt-2 border-t border-gray-100 dark:border-zinc-900">
     <label class="block text-xs font-bold text-gray-500 dark:text-zinc-400 mb-3 uppercase tracking-wider">پورت‌های اتصال</label>
     <div class="grid grid-cols-2 gap-2 md:gap-4">
-        <div class="p-3 bg-gray-50/50 dark:bg-zinc-900/20 border border-gray-200/60 dark:border-zinc-800 rounded-2xl shadow-md">
+        <div class="p-3 bg-gray-50/50 dark:bg-zinc-900/20 border border-gray-200/60 dark:border-zinc-800 rounded-2xl shadow-sm">
             <div class="flex items-center gap-1.5 mb-2">
-                <span class="flex h-2 w-2 rounded-full bg-indigo-500 shadow-md"></span>
+                <span class="flex h-2 w-2 rounded-full bg-indigo-500 shadow-sm"></span>
                 <span class="text-[11px] font-bold text-indigo-600 dark:text-indigo-400">🔒TLS PORT</span>
             </div>
             <div class="grid grid-cols-3 gap-1.5" id="tls-ports-list">
             </div>
         </div>
-        <div class="p-3 bg-gray-50/50 dark:bg-zinc-900/20 border border-gray-200/60 dark:border-zinc-800 rounded-2xl shadow-md">
+        <div class="p-3 bg-gray-50/50 dark:bg-zinc-900/20 border border-gray-200/60 dark:border-zinc-800 rounded-2xl shadow-sm">
             <div class="flex items-center gap-1.5 mb-2">
-                <span class="flex h-2 w-2 rounded-full bg-amber-500 shadow-md"></span>
+                <span class="flex h-2 w-2 rounded-full bg-amber-500 shadow-sm"></span>
                 <span class="text-[11px] font-bold text-amber-600 dark:text-amber-400">🔓Non-TLS PORT</span>
             </div>
             <div class="grid grid-cols-3 gap-1.5" id="nontls-ports-list">
             </div>
         </div>
     </div>
-    <div class="mt-4 p-3 bg-gray-50/50 dark:bg-zinc-900/20 border border-gray-200/60 dark:border-zinc-800 rounded-2xl shadow-md">
+    <div class="mt-4 p-3 bg-gray-50/50 dark:bg-zinc-900/20 border border-gray-200/60 dark:border-zinc-800 rounded-2xl shadow-sm">
         <div class="flex items-center gap-1.5 mb-2">
-            <span class="flex h-2 w-2 rounded-full bg-green-600 shadow-md"></span>
+            <span class="flex h-2 w-2 rounded-full bg-green-600 shadow-sm"></span>
             <span class="text-[11px] font-bold text-green-700 dark:text-green-500">⚙️ پورت‌های دلخواه (با فاصله جدا کنید)</span>
         </div>
-        <input type="text" id="input-custom-ports" placeholder="8080 2096 5000" dir="ltr" class="w-full px-2 py-2 bg-white dark:bg-zinc-900 border border-gray-200 dark:border-zinc-800 rounded-2xl focus:outline-none focus:ring-2 focus:ring-indigo-500/50 text-xs font-mono text-left text-gray-800 dark:text-zinc-100 transition">
+        <input type="text" id="input-custom-ports" placeholder="8080 2096 5000" dir="ltr" class="w-full px-2 py-2 bg-white dark:bg-zinc-900 border border-gray-200 dark:border-zinc-800 rounded-xl focus:outline-none focus:ring-2 focus:ring-indigo-500/50 text-xs font-mono text-left text-gray-800 dark:text-zinc-100 transition">
     </div>
 </div>
                 <div class="pt-4 border-t border-gray-100 dark:border-zinc-900 space-y-4">
@@ -3690,11 +3217,11 @@ const HTML_TEMPLATES = {
         					<button 
 								type="button" 
   								onclick="openIpSelectorModal()" 
-  								class="px-2.5 py-1 bg-amber-50 dark:bg-amber-950/60 text-amber-600 dark:text-amber-400 hover:bg-amber-100 dark:hover:bg-amber-900/70 border border-amber-400 dark:border-amber-600 rounded-xl text-xs font-bold transition-all">
+  								class="px-2.5 py-1 bg-amber-50 dark:bg-amber-950/60 text-amber-600 dark:text-amber-400 hover:bg-amber-100 dark:hover:bg-amber-900/70 border border-amber-400 dark:border-amber-600 rounded-lg text-xs font-bold transition-all">
   								مخزن آیپی تمیز
 							</button>
     					</div>
-    					<textarea id="input-ips" rows="2" placeholder="104.16.0.1" class="w-full px-3 py-2.5 bg-gray-50 dark:bg-zinc-900 border border-gray-200 dark:border-zinc-800 rounded-2xl focus:outline-none focus:ring-2 focus:ring-indigo-500/50 text-xs font-mono text-gray-800 dark:text-zinc-100 placeholder-gray-400/80 transition resize-none"></textarea>
+    					<textarea id="input-ips" rows="2" placeholder="104.16.0.1" class="w-full px-3 py-2.5 bg-gray-50 dark:bg-zinc-900 border border-gray-200 dark:border-zinc-800 rounded-xl focus:outline-none focus:ring-2 focus:ring-indigo-500/50 text-xs font-mono text-gray-800 dark:text-zinc-100 placeholder-gray-400/80 transition resize-none"></textarea>
 					</div>
                     <div class="mt-4 pt-4 border-t border-gray-150 dark:border-zinc-900 space-y-4">
                         
@@ -3710,28 +3237,28 @@ const HTML_TEMPLATES = {
 	
 	                            <div class="grid grid-cols-2 sm:flex items-center gap-2 w-full sm:w-auto"></div>
                             </div>
-                            <div class="relative transition-opacity duration-500 opacity-50 pointer-events-none" id="user-socks5-container">
-                                <input type="text" id="user-socks5-input" placeholder="socks5:// یا http:// یا (user:pass@ip:port)" dir="ltr" class="w-full px-3 py-2.5 bg-gray-50 dark:bg-zinc-900 border border-gray-200 dark:border-zinc-800 rounded-xl text-sm font-mono focus:outline-none focus:ring-2 focus:ring-indigo-500 text-gray-800 dark:text-zinc-100 transition" disabled>
+                            <div class="relative transition-opacity duration-300 opacity-50 pointer-events-none" id="user-socks5-container">
+                                <input type="text" id="user-socks5-input" placeholder="socks5:// یا http:// یا (user:pass@ip:port)" dir="ltr" class="w-full px-3 py-2.5 bg-gray-50 dark:bg-zinc-900 border border-gray-200 dark:border-zinc-800 rounded-lg text-sm font-mono focus:outline-none focus:ring-2 focus:ring-indigo-500 text-gray-800 dark:text-zinc-100 transition" disabled>
                                 <div class="w-full text-center">
                                     <span id="test-user-proxy-result" class="inline-block mt-2 text-[11px] font-bold transition-colors break-words leading-relaxed empty:hidden"></span>
                                 </div>
                                 <div class="mt-2 flex items-center justify-between w-full gap-2">
-                                    <button type="button" onclick="testUserSocksProxy()" id="test-user-proxy-btn" class="flex-1 text-center text-[11px] bg-indigo-50 dark:bg-indigo-900/30 text-indigo-600 dark:text-indigo-400 py-1.5 rounded border border-indigo-200 dark:border-indigo-800 hover:bg-indigo-100 dark:hover:bg-indigo-900/50 transition font-bold shadow-md">تست پروکسی</button>
-                                    <button type="button" onclick="openProxySelectorModal()" class="flex-1 text-center text-[11px] bg-amber-50 dark:bg-amber-900/30 text-amber-600 dark:text-amber-400 py-1.5 rounded border border-amber-200 dark:border-amber-800 hover:bg-amber-100 dark:hover:bg-amber-900/50 transition font-bold shadow-md">مخزن پروکسی</button>
+                                    <button type="button" onclick="testUserSocksProxy()" id="test-user-proxy-btn" class="flex-1 text-center text-[11px] bg-cyan-50 dark:bg-cyan-900/30 text-cyan-600 dark:text-cyan-400 py-1.5 rounded border border-cyan-200 dark:border-cyan-800 hover:bg-cyan-100 dark:hover:bg-cyan-900/50 transition font-bold shadow-sm">تست پروکسی</button>
+                                    <button type="button" onclick="openProxySelectorModal()" class="flex-1 text-center text-[11px] bg-amber-50 dark:bg-amber-900/30 text-amber-600 dark:text-amber-400 py-1.5 rounded border border-amber-200 dark:border-amber-800 hover:bg-amber-100 dark:hover:bg-amber-900/50 transition font-bold shadow-sm">مخزن پروکسی</button>
                                 </div>
-                                <div class="mt-3 p-3 border-2 border-dashed border-red-400 dark:border-red-500/70 bg-red-50 dark:bg-red-900/20 text-red-700 dark:text-red-300 rounded-2xl text-[11px] font-bold leading-relaxed text-center w-full">
+                                <div class="mt-3 p-3 border-2 border-dashed border-red-400 dark:border-red-500/70 bg-red-50 dark:bg-red-900/20 text-red-700 dark:text-red-300 rounded-xl text-[11px] font-bold leading-relaxed text-center w-full">
 									پروکسی‌های عمومی ناپایدارند. برای کیفیت بالاتر، از یک پروکسی اختصاصی استفاده کنید.
 								</div>
                             </div>
                         </div>
 
-                        <div id="user-cf-proxy-section" class="transition-opacity duration-500 pt-4 border-t-2 border-gray-200 dark:border-zinc-800">
+                        <div id="user-cf-proxy-section" class="transition-opacity duration-300 pt-4 border-t-2 border-gray-200 dark:border-zinc-800">
                             <label class="block text-sm font-medium mb-1.5 text-gray-700 dark:text-zinc-300">ثابت کردن کشور (Cloudflare)</label>
                             <div class="mb-2">
-                                <input type="text" id="user-location-search" oninput="filterUserLocations()" placeholder="جستجوی شهر، کشور یا IATA" class="w-full px-3 py-2 bg-gray-50 dark:bg-zinc-900 border border-gray-200 dark:border-zinc-800 rounded-xl shadow-lg text-sm focus:outline-none focus:ring-2 focus:ring-indigo-500 text-gray-700 dark:text-zinc-200 transition">
+                                <input type="text" id="user-location-search" oninput="filterUserLocations()" placeholder="جستجوی شهر، کشور یا IATA" class="w-full px-3 py-2 bg-gray-50 dark:bg-zinc-900 border border-gray-200 dark:border-zinc-800 rounded-lg shadow-md text-sm focus:outline-none focus:ring-2 focus:ring-indigo-500 text-gray-700 dark:text-zinc-200 transition">
                             </div>
                             <div class="relative">
-                                <select id="user-location-select" class="w-full pl-8 pr-3 py-2.5 bg-gray-50 dark:bg-zinc-900 border border-gray-200 dark:border-zinc-800 rounded-xl shadow-lg text-sm focus:outline-none focus:ring-2 focus:ring-indigo-500 text-gray-700 dark:text-zinc-200 cursor-pointer appearance-none">
+                                <select id="user-location-select" class="w-full pl-8 pr-3 py-2.5 bg-gray-50 dark:bg-zinc-900 border border-gray-200 dark:border-zinc-800 rounded-lg shadow-md text-sm focus:outline-none focus:ring-2 focus:ring-indigo-500 text-gray-700 dark:text-zinc-200 cursor-pointer appearance-none">
                                     <option value="">بدون لوکیشن (پیش‌فرض)</option>
                                 </select>
                                 <div class="pointer-events-none absolute inset-y-0 left-0 flex items-center pl-3 text-gray-500 dark:text-zinc-400">
@@ -3742,17 +3269,17 @@ const HTML_TEMPLATES = {
 					</div>
                 </div>
                 <div class="pt-4 flex gap-3">
-                    <button type="button" onclick="toggleModal(false)" class="flex-1 py-3 bg-transparent border-2 border-red-700 text-red-700 hover:bg-red-900/20 hover:text-red-800 dark:border-red-700 dark:text-red-500 dark:hover:bg-red-900/40 dark:hover:text-red-400 font-bold rounded-2xl text-sm transition duration-300 shadow-md">انصراف</button>
-                    <button type="submit" id="submit-btn" class="btn-shine flex-1 py-3 bg-gradient-to-r from-indigo-600 to-violet-600 border-0 text-white hover:from-indigo-500 hover:to-violet-500 hover:shadow-xl hover:shadow-indigo-500/30 font-bold rounded-2xl text-sm transition duration-300 shadow-lg hover:shadow-xl">ایجاد کاربر</button>
+                    <button type="button" onclick="toggleModal(false)" class="flex-1 py-3 bg-transparent border-2 border-rose-700 text-rose-700 hover:bg-rose-900/20 hover:text-rose-800 dark:border-rose-700 dark:text-rose-500 dark:hover:bg-rose-900/40 dark:hover:text-rose-400 font-bold rounded-xl text-sm transition duration-200 shadow-sm">انصراف</button>
+                    <button type="submit" id="submit-btn" class="btn-shine flex-1 py-3 bg-indigo-600 border-0 text-white hover:bg-indigo-500 hover:shadow-md font-bold rounded-xl text-sm transition duration-200 shadow-md hover:shadow-lg">ایجاد کاربر</button>
                 </div>
             </form>
         </div>
     </div>
-<div id="ip-selector-modal" class="fixed inset-0 z-[60] flex items-center justify-center p-4 bg-black/60 backdrop-blur-sm opacity-0 pointer-events-none transition-all duration-500 ease-out">
-    <div class="w-full max-w-sm bg-white dark:bg-amoled-card border border-gray-200 dark:border-amoled-border rounded-2xl shadow-xl overflow-hidden transition-all transform duration-500 opacity-0 scale-95 ease-out">
+<div id="ip-selector-modal" class="fixed inset-0 z-[60] flex items-center justify-center p-4 bg-black/60 backdrop-blur-sm opacity-0 pointer-events-none transition-all duration-300 ease-out">
+    <div class="w-full max-w-sm bg-white dark:bg-amoled-card border border-gray-200 dark:border-amoled-border rounded-2xl shadow-xl overflow-hidden transition-all transform duration-300 opacity-0 scale-95 ease-out">
         <div class="px-6 py-4 border-b border-gray-150 dark:border-amoled-border flex justify-between items-center bg-gray-50 dark:bg-zinc-900/50">
             <h3 class="font-bold text-gray-900 dark:text-zinc-100 text-sm">مخزن آیپی تمیز</h3>
-            <button type="button" onclick="toggleIpSelectorModal(false)" class="p-1.5 rounded-xl bg-red-50 dark:bg-red-950/30 border border-red-200 dark:border-red-900/50 text-red-600 dark:text-red-500 hover:bg-red-100 dark:hover:bg-red-900/50 transition-all duration-300 shadow-md">
+            <button type="button" onclick="toggleIpSelectorModal(false)" class="p-1.5 rounded-lg bg-red-50 dark:bg-red-950/30 border border-red-200 dark:border-red-900/50 text-red-600 dark:text-red-500 hover:bg-red-100 dark:hover:bg-red-900/50 transition-all duration-200 shadow-sm">
                 <svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M6 18L18 6M6 6l12 12"></path></svg>
             </button>
         </div>
@@ -3763,45 +3290,45 @@ const HTML_TEMPLATES = {
             <div id="ip-selection-form" class="space-y-4">
                 <div>
                     <label class="block text-xs font-medium mb-1.5 text-gray-700 dark:text-zinc-300">اوپراتور</label>
-                    <select id="ip-operator-select" class="w-full px-3 py-2.5 bg-gray-50 dark:bg-amoled-input border border-gray-300 dark:border-amoled-border rounded-2xl text-xs focus:outline-none focus:ring-2 focus:ring-indigo-500 text-gray-700 dark:text-zinc-300 cursor-pointer">
+                    <select id="ip-operator-select" class="w-full px-3 py-2.5 bg-gray-50 dark:bg-amoled-input border border-gray-300 dark:border-amoled-border rounded-xl text-xs focus:outline-none focus:ring-2 focus:ring-indigo-500 text-gray-700 dark:text-zinc-300 cursor-pointer">
                         <option value="all">همه (توصیه شده)</option>
                     </select>
                 </div>
                 <div>
                     <label class="block text-xs font-medium mb-1.5 text-gray-700 dark:text-zinc-300">تعداد</label>
-                    <input type="number" id="ip-count-input" min="1" value="20" dir="ltr" class="w-full px-3 py-2.5 bg-gray-50 dark:bg-amoled-input border border-gray-300 dark:border-amoled-border rounded-2xl focus:outline-none focus:ring-2 focus:ring-indigo-500 text-xs font-mono text-center">
+                    <input type="number" id="ip-count-input" min="1" value="20" dir="ltr" class="w-full px-3 py-2.5 bg-gray-50 dark:bg-amoled-input border border-gray-300 dark:border-amoled-border rounded-xl focus:outline-none focus:ring-2 focus:ring-indigo-500 text-xs font-mono text-center">
                 </div>
             </div>
             <div class="pt-4 flex gap-3">
-                <button type="button" onclick="toggleIpSelectorModal(false)" class="flex-1 py-2 bg-transparent border-2 border-red-700 text-red-700 hover:bg-red-900/20 hover:text-red-800 dark:border-red-700 dark:text-red-500 dark:hover:bg-red-900/40 dark:hover:text-red-400 font-bold rounded-2xl text-xs transition shadow-md">لغو</button>
-                <button type="button" onclick="applySelectedIps()" class="flex-1 py-2 bg-gradient-to-r from-indigo-600 to-violet-600 border-0 text-white hover:from-indigo-500 hover:to-violet-500 hover:shadow-xl hover:shadow-indigo-500/30 font-medium rounded-2xl text-xs transition">دریافت</button>
+                <button type="button" onclick="toggleIpSelectorModal(false)" class="flex-1 py-2 bg-transparent border-2 border-rose-700 text-rose-700 hover:bg-rose-900/20 hover:text-rose-800 dark:border-rose-700 dark:text-rose-500 dark:hover:bg-rose-900/40 dark:hover:text-rose-400 font-bold rounded-xl text-xs transition shadow-sm">لغو</button>
+                <button type="button" onclick="applySelectedIps()" class="flex-1 py-2 bg-indigo-600 border-0 text-white hover:bg-indigo-500 hover:shadow-md font-medium rounded-xl text-xs transition">دریافت</button>
             </div>
         </div>
     </div>
 </div>
-<div id="proxy-selector-modal" class="fixed inset-0 z-[60] flex items-center justify-center p-4 bg-black/60 backdrop-blur-sm opacity-0 pointer-events-none transition-all duration-500 ease-out">
-    <div class="w-full max-w-md bg-white dark:bg-amoled-card border border-gray-200 dark:border-amoled-border rounded-3xl shadow-xl overflow-hidden transition-all transform duration-500 opacity-0 scale-95 ease-out">
+<div id="proxy-selector-modal" class="fixed inset-0 z-[60] flex items-center justify-center p-4 bg-black/60 backdrop-blur-sm opacity-0 pointer-events-none transition-all duration-300 ease-out">
+    <div class="w-full max-w-md bg-white dark:bg-amoled-card border border-gray-200 dark:border-amoled-border rounded-3xl shadow-xl overflow-hidden transition-all transform duration-300 opacity-0 scale-95 ease-out">
         <div class="px-6 py-4 border-b border-gray-150 dark:border-amoled-border flex justify-between items-center bg-gray-50 dark:bg-zinc-900/50">
             <h3 class="font-bold text-gray-900 dark:text-zinc-100 text-sm">مخزن پروکسی‌های آی‌پی ثابت</h3>
-            <button type="button" onclick="toggleProxySelectorModal(false)" class="p-1.5 rounded-xl bg-red-50 dark:bg-red-950/30 border border-red-200 dark:border-red-900/50 text-red-600 dark:text-red-500 hover:bg-red-100 dark:hover:bg-red-900/50 transition-all duration-300 shadow-md">
+            <button type="button" onclick="toggleProxySelectorModal(false)" class="p-1.5 rounded-lg bg-red-50 dark:bg-red-950/30 border border-red-200 dark:border-red-900/50 text-red-600 dark:text-red-500 hover:bg-red-100 dark:hover:bg-red-900/50 transition-all duration-200 shadow-sm">
                 <svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M6 18L18 6M6 6l12 12"></path></svg>
             </button>
         </div>
         <div class="p-5 space-y-4">
             
-            <div class="p-4 bg-green-50 dark:bg-green-900/10 border border-green-200 dark:border-green-500/30 rounded-2xl relative">
-                <h4 class="text-[13px] font-black text-green-700 dark:text-green-400 mb-2 flex items-center gap-1.5">
+            <div class="p-4 bg-emerald-50 dark:bg-emerald-900/10 border border-emerald-200 dark:border-emerald-500/30 rounded-2xl relative">
+                <h4 class="text-[13px] font-black text-emerald-700 dark:text-emerald-400 mb-2 flex items-center gap-1.5">
                     <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 12l2 2 4-4m5.618-4.016A11.955 11.955 0 0112 2.944a11.955 11.955 0 01-8.618 3.04A12.02 12.02 0 003 9c0 5.591 3.824 10.29 9 11.622 5.176-1.332 9-6.03 9-11.622 0-1.042-.133-2.052-.382-3.016z"></path></svg>
                     پروکسی‌های اختصاصی (VIP)
                 </h4>
-                <p class="text-[10px] text-green-600/80 dark:text-green-500/70 mb-3 leading-relaxed font-medium">
+                <p class="text-[10px] text-emerald-600/80 dark:text-emerald-500/70 mb-3 leading-relaxed font-medium">
                     پروکسی‌های اهدایی از طرف کاربران. کیفیت بالا و بدون نیاز به اسکن.
                 </p>
                 <div class="flex flex-col sm:flex-row gap-2">
-                    <select id="vip-country-select" class="flex-1 px-3 py-2 bg-white dark:bg-amoled-input border border-green-200 dark:border-green-800/50 rounded-2xl text-xs focus:outline-none focus:ring-2 focus:ring-green-500 text-gray-700 dark:text-zinc-300 cursor-pointer">
+                    <select id="vip-country-select" class="flex-1 px-3 py-2 bg-white dark:bg-amoled-input border border-emerald-200 dark:border-emerald-800/50 rounded-xl text-xs focus:outline-none focus:ring-2 focus:ring-emerald-500 text-gray-700 dark:text-zinc-300 cursor-pointer">
                         <option value="">در حال بررسی مخزن...</option>
                     </select>
-                    <button type="button" onclick="loadVipProxy()" id="vip-fetch-btn" class="sm:w-auto w-full px-4 py-2 bg-green-600 hover:bg-green-500 text-white font-bold rounded-2xl text-xs transition shadow-md disabled:opacity-50 disabled:cursor-not-allowed whitespace-nowrap" disabled>
+                    <button type="button" onclick="loadVipProxy()" id="vip-fetch-btn" class="sm:w-auto w-full px-4 py-2 bg-emerald-600 hover:bg-emerald-500 text-white font-bold rounded-xl text-xs transition shadow-sm disabled:opacity-50 disabled:cursor-not-allowed whitespace-nowrap" disabled>
                         دریافت
                     </button>
                 </div>
@@ -3826,64 +3353,32 @@ const HTML_TEMPLATES = {
                 </div>
 
                 <div id="proxy-selection-form" class="flex flex-col gap-2">
-                    <select id="proxy-country-select" class="w-full px-3 py-2 bg-white dark:bg-amoled-input border border-gray-300 dark:border-zinc-700 rounded-2xl text-xs focus:outline-none focus:ring-2 focus:ring-indigo-500 text-gray-700 dark:text-zinc-300 cursor-pointer">
+                    <select id="proxy-country-select" class="w-full px-3 py-2 bg-white dark:bg-amoled-input border border-gray-300 dark:border-zinc-700 rounded-xl text-xs focus:outline-none focus:ring-2 focus:ring-indigo-500 text-gray-700 dark:text-zinc-300 cursor-pointer">
                         <option value="">در حال آماده‌سازی...</option>
                     </select>
-                    <button type="button" onclick="fetchAndLoadProxy()" id="proxy-fetch-btn" class="w-full py-2.5 bg-indigo-600 hover:bg-indigo-500 text-white font-bold rounded-2xl text-xs transition shadow-md disabled:opacity-50 disabled:cursor-not-allowed" disabled>
+                    <button type="button" onclick="fetchAndLoadProxy()" id="proxy-fetch-btn" class="w-full py-2.5 bg-indigo-600 hover:bg-indigo-500 text-white font-bold rounded-xl text-xs transition shadow-sm disabled:opacity-50 disabled:cursor-not-allowed" disabled>
                         شروع اسکن و یافتن پروکسی
                     </button>
                 </div>
             </div>
             
             <div class="pt-1">
-                <button type="button" onclick="toggleProxySelectorModal(false)" class="w-full py-2.5 bg-transparent border-2 border-gray-300 text-gray-600 hover:bg-gray-100 dark:border-zinc-700 dark:text-zinc-400 dark:hover:bg-zinc-800 dark:hover:text-zinc-300 font-bold rounded-2xl text-xs transition shadow-md">انصراف و بستن</button>
+                <button type="button" onclick="toggleProxySelectorModal(false)" class="w-full py-2.5 bg-transparent border-2 border-gray-300 text-gray-600 hover:bg-gray-100 dark:border-zinc-700 dark:text-zinc-400 dark:hover:bg-zinc-800 dark:hover:text-zinc-300 font-bold rounded-xl text-xs transition shadow-sm">انصراف و بستن</button>
             </div>
         </div>
     </div>
 </div>
-    <div id="resources-modal" class="fixed inset-0 z-50 flex items-center justify-center p-4 bg-black/60 backdrop-blur-sm opacity-0 pointer-events-none transition-all duration-500 ease-out">
-        <div class="w-full max-w-lg bg-white dark:bg-amoled-card border border-gray-200 dark:border-amoled-border rounded-2xl shadow-xl overflow-hidden transition-all transform duration-500 opacity-0 scale-95 ease-out flex flex-col max-h-[90vh]">
-            <div class="h-1 w-full bg-gradient-to-r from-emerald-500 via-indigo-600 to-indigo-600"></div>
+    <div id="settings-modal" class="fixed inset-0 z-50 flex items-center justify-center p-4 bg-black/60 backdrop-blur-sm opacity-0 pointer-events-none transition-all duration-300 ease-out">
+        <div class="w-full max-w-md bg-white dark:bg-amoled-card border border-gray-200 dark:border-amoled-border rounded-2xl shadow-xl overflow-hidden transition-all transform duration-300 opacity-0 scale-95 ease-out flex flex-col max-h-[90vh]">
+            <div class="h-1 w-full bg-gradient-to-r from-teal-500 via-indigo-600 to-purple-600"></div>
             <div class="px-6 py-4 border-b border-gray-150 dark:border-amoled-border flex justify-between items-center bg-gray-50 dark:bg-zinc-900/50">
                 <div class="flex items-center gap-3">
-                    <div class="w-9 h-9 rounded-2xl bg-gradient-to-br from-emerald-500 to-indigo-600 flex items-center justify-center text-white shadow-md shrink-0">
-                        <svg class="w-4.5 h-4.5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M13.828 10.172a4 4 0 010 5.656l-4 4a4 4 0 01-5.656-5.656l1.5-1.5M10.172 13.828a4 4 0 010-5.656l4-4a4 4 0 015.656 5.656l-1.5 1.5"></path></svg>
-                    </div>
-                    <h3 class="font-bold text-gray-900 dark:text-zinc-100">لینک‌های سایر پروتکل‌ها</h3>
-                </div>
-                <button onclick="toggleResourcesModal(false)" class="p-1.5 rounded-xl bg-red-50 dark:bg-red-950/30 border border-red-200 dark:border-red-900/50 text-red-600 dark:text-red-500 hover:bg-red-100 dark:hover:bg-red-900/50 transition-all duration-300 shadow-md">
-                    <svg class="w-6 h-6" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M6 18L18 6M6 6l12 12"></path></svg>
-                </button>
-            </div>
-            <div class="p-6 space-y-4 overflow-y-auto flex-1 overscroll-contain">
-                <div class="flex gap-2">
-                    <input type="text" id="res-new-input" placeholder="لینک کانفیگ (vmess://, trojan://, ss://, wg://, hy2://, tuic://, یا JSON کاستوم) را بچسبانید" class="flex-1 px-3 py-2.5 bg-gray-50 dark:bg-amoled-input border border-gray-300 dark:border-amoled-border rounded-2xl text-xs focus:outline-none focus:ring-2 focus:ring-indigo-500 text-gray-700 dark:text-zinc-300" dir="ltr">
-                    <button onclick="addResourceLink()" class="px-4 py-2 bg-emerald-600 hover:bg-emerald-500 text-white font-bold rounded-2xl text-xs transition shadow-md whitespace-nowrap">افزودن</button>
-                </div>
-                <div id="res-list" class="flex flex-col gap-2"></div>
-                <div class="pt-2 border-t border-gray-150 dark:border-amoled-border">
-                    <div class="flex items-center justify-between gap-3 p-3 bg-amber-50 dark:bg-amber-900/10 border border-amber-200 dark:border-amber-800/40 rounded-2xl">
-                        <div>
-                            <div class="text-xs font-bold text-amber-700 dark:text-amber-400">اشتراک یکپارچه (همه پروتکل‌ها)</div>
-                            <div class="text-[10px] text-amber-600/80 dark:text-amber-500/70">تمام لینک‌های فعال، در یک ساب‌لینک واحد</div>
-                        </div>
-                        <button onclick="copyResourceLink('mix')" class="px-3 py-2 bg-amber-500 hover:bg-amber-400 text-white font-bold rounded-2xl text-[11px] transition shadow-md whitespace-nowrap">کپی لینک</button>
-                    </div>
-                </div>
-            </div>
-        </div>
-    </div>
-    <div id="settings-modal" class="fixed inset-0 z-50 flex items-center justify-center p-4 bg-black/60 backdrop-blur-sm opacity-0 pointer-events-none transition-all duration-500 ease-out">
-        <div class="w-full max-w-md bg-white dark:bg-amoled-card border border-gray-200 dark:border-amoled-border rounded-2xl shadow-xl overflow-hidden transition-all transform duration-500 opacity-0 scale-95 ease-out flex flex-col max-h-[90vh]">
-            <div class="h-1 w-full bg-gradient-to-r from-green-500 via-indigo-600 to-indigo-600"></div>
-            <div class="px-6 py-4 border-b border-gray-150 dark:border-amoled-border flex justify-between items-center bg-gray-50 dark:bg-zinc-900/50">
-                <div class="flex items-center gap-3">
-                    <div class="w-9 h-9 rounded-2xl bg-gradient-to-br from-green-500 to-indigo-600 flex items-center justify-center text-white shadow-md shrink-0">
+                    <div class="w-9 h-9 rounded-xl bg-gradient-to-br from-teal-500 to-indigo-600 flex items-center justify-center text-white shadow-sm shrink-0">
                         <svg class="w-4.5 h-4.5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M10.325 4.317c.426-1.756 2.924-1.756 3.35 0a1.724 1.724 0 002.573 1.066c1.543-.94 3.31.826 2.37 2.37a1.724 1.724 0 001.065 2.572c1.756.426 1.756 2.924 0 3.35a1.724 1.724 0 00-1.066 2.573c.94 1.543-.826 3.31-2.37 2.37a1.724 1.724 0 00-2.572 1.065c-.426 1.756-2.924 1.756-3.35 0a1.724 1.724 0 00-2.573-1.066c-1.543.94-3.31-.826-2.37-2.37a1.724 1.724 0 00-1.065-2.572c-1.756-.426-1.756-2.924 0-3.35a1.724 1.724 0 001.066-2.573c-.94-1.543.826-3.31 2.37-2.37.996.608 2.296.07 2.572-1.065z"></path><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M15 12a3 3 0 11-6 0 3 3 0 016 0z"></path></svg>
                     </div>
                     <h3 class="font-bold text-gray-900 dark:text-zinc-100">تنظیمات پنل</h3>
                 </div>
-                <button onclick="toggleSettingsModal(false)" class="p-1.5 rounded-xl bg-red-50 dark:bg-red-950/30 border border-red-200 dark:border-red-900/50 text-red-600 dark:text-red-500 hover:bg-red-100 dark:hover:bg-red-900/50 transition-all duration-300 shadow-md">
+                <button onclick="toggleSettingsModal(false)" class="p-1.5 rounded-lg bg-red-50 dark:bg-red-950/30 border border-red-200 dark:border-red-900/50 text-red-600 dark:text-red-500 hover:bg-red-100 dark:hover:bg-red-900/50 transition-all duration-200 shadow-sm">
                     <svg class="w-6 h-6" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M6 18L18 6M6 6l12 12"></path></svg>
                 </button>
             </div>
@@ -3891,7 +3386,7 @@ const HTML_TEMPLATES = {
                 <div class="pt-2">
 					<label class="block text-sm font-medium mb-1.5 text-gray-700 dark:text-zinc-300">نرخ رفرش خودکار پنل</label>
                     <div class="relative">
-                        <select id="refresh-rate-select" onchange="changeRefreshRate(this.value)" class="w-full pl-8 pr-3 py-2.5 bg-white dark:bg-amoled-input border border-gray-300 dark:border-amoled-border rounded-xl text-sm focus:outline-none focus:ring-2 focus:ring-indigo-500 text-gray-700 dark:text-zinc-200 cursor-pointer appearance-none">
+                        <select id="refresh-rate-select" onchange="changeRefreshRate(this.value)" class="w-full pl-8 pr-3 py-2.5 bg-white dark:bg-amoled-input border border-gray-300 dark:border-amoled-border rounded-lg text-sm focus:outline-none focus:ring-2 focus:ring-indigo-500 text-gray-700 dark:text-zinc-200 cursor-pointer appearance-none">
                             <option value="1000">۱ ثانیه</option>
                             <option value="2000" selected>۲ ثانیه (پیش‌فرض)</option>
                             <option value="5000">۵ ثانیه</option>
@@ -3912,36 +3407,36 @@ const HTML_TEMPLATES = {
                     <div class="space-y-3">
                         <div>
                             <label class="block text-[11px] text-gray-500 dark:text-gray-400 font-medium mb-1">رمز عبور فعلی</label>
-                            <input type="password" id="change-pwd-current" class="w-full px-3 py-2 bg-white dark:bg-amoled-input border border-gray-300 dark:border-amoled-border rounded-xl focus:outline-none focus:ring-2 focus:ring-indigo-500 text-xs font-mono text-center">
+                            <input type="password" id="change-pwd-current" class="w-full px-3 py-2 bg-white dark:bg-amoled-input border border-gray-300 dark:border-amoled-border rounded-lg focus:outline-none focus:ring-2 focus:ring-indigo-500 text-xs font-mono text-center">
                         </div>
                         <div>
                             <label class="block text-[11px] text-gray-500 dark:text-gray-400 font-medium mb-1">رمز عبور جدید</label>
-                            <input type="password" id="change-pwd-new" class="w-full px-3 py-2 bg-white dark:bg-amoled-input border border-gray-300 dark:border-amoled-border rounded-xl focus:outline-none focus:ring-2 focus:ring-indigo-500 text-xs font-mono text-center">
+                            <input type="password" id="change-pwd-new" class="w-full px-3 py-2 bg-white dark:bg-amoled-input border border-gray-300 dark:border-amoled-border rounded-lg focus:outline-none focus:ring-2 focus:ring-indigo-500 text-xs font-mono text-center">
                         </div>
-                        <button type="button" onclick="changeAdminPassword()" id="change-pwd-btn" class="w-full py-2 bg-gradient-to-r from-indigo-600 to-violet-600 border-0 text-white hover:from-indigo-500 hover:to-violet-500 hover:shadow-xl hover:shadow-indigo-500/30 font-semibold rounded-xl text-xs transition-all shadow-md">تغییر رمز عبور</button>
+                        <button type="button" onclick="changeAdminPassword()" id="change-pwd-btn" class="w-full py-2 bg-indigo-600 border-0 text-white hover:bg-indigo-500 hover:shadow-md font-semibold rounded-lg text-xs transition-all shadow-sm">تغییر رمز عبور</button>
                     </div>
                 </div>
                 <div class="pt-4 border-t-2 border-gray-300 dark:border-zinc-700">
                     <h4 class="text-sm font-bold mb-3 text-gray-800 dark:text-zinc-200">💾 پشتیبان‌گیری و بازیابی</h4>
                     <div class="grid grid-cols-2 gap-3">
-                        <button type="button" onclick="exportUsersBackup()" class="py-2.5 bg-indigo-50 dark:bg-indigo-950/20 text-indigo-600 dark:text-indigo-400 hover:bg-indigo-100 dark:hover:bg-indigo-900/30 border border-indigo-200 dark:border-indigo-900/50 rounded-2xl text-xs font-bold transition flex items-center justify-center gap-1.5 shadow-md">
+                        <button type="button" onclick="exportUsersBackup()" class="py-2.5 bg-purple-50 dark:bg-purple-950/20 text-purple-600 dark:text-purple-400 hover:bg-purple-100 dark:hover:bg-purple-900/30 border border-purple-200 dark:border-purple-900/50 rounded-xl text-xs font-bold transition flex items-center justify-center gap-1.5 shadow-sm">
                             📤 پشتیبان گیری
                         </button>
-                        <button type="button" onclick="triggerImportBackup()" class="py-2.5 bg-green-50 dark:bg-green-950/20 text-green-700 dark:text-green-500 hover:bg-green-100 dark:hover:bg-green-900/30 border border-green-200 dark:border-green-900/50 rounded-2xl text-xs font-bold transition flex items-center justify-center gap-1.5 shadow-md">
+                        <button type="button" onclick="triggerImportBackup()" class="py-2.5 bg-green-50 dark:bg-green-950/20 text-green-700 dark:text-green-500 hover:bg-green-100 dark:hover:bg-green-900/30 border border-green-200 dark:border-green-900/50 rounded-xl text-xs font-bold transition flex items-center justify-center gap-1.5 shadow-sm">
                             📥 بازیابی
                         </button>
                     </div>
                     <input type="file" id="backup-file-input" onchange="importUsersBackup(event)" accept=".json" class="hidden">
                 </div>
                 <div class="pt-4 flex gap-3">
-                    <button type="button" onclick="toggleSettingsModal(false)" class="flex-1 py-2 bg-transparent border-2 border-red-700 text-red-700 hover:bg-red-900/20 hover:text-red-800 dark:border-red-700 dark:text-red-500 dark:hover:bg-red-900/40 dark:hover:text-red-400 font-bold rounded-xl text-sm transition shadow-md">انصراف</button>
-                    <button type="button" onclick="saveSettings()" id="save-settings-btn" class="btn-shine flex-1 py-2 bg-gradient-to-r from-indigo-600 to-violet-600 border-0 text-white hover:from-indigo-500 hover:to-violet-500 hover:shadow-xl hover:shadow-indigo-500/30 font-medium rounded-xl text-sm transition">ذخیره تنظیمات</button>
+                    <button type="button" onclick="toggleSettingsModal(false)" class="flex-1 py-2 bg-transparent border-2 border-rose-700 text-rose-700 hover:bg-rose-900/20 hover:text-rose-800 dark:border-rose-700 dark:text-rose-500 dark:hover:bg-rose-900/40 dark:hover:text-rose-400 font-bold rounded-lg text-sm transition shadow-sm">انصراف</button>
+                    <button type="button" onclick="saveSettings()" id="save-settings-btn" class="btn-shine flex-1 py-2 bg-indigo-600 border-0 text-white hover:bg-indigo-500 hover:shadow-md font-medium rounded-lg text-sm transition">ذخیره تنظیمات</button>
                 </div>
             </div>
         </div>
     </div>
-<div id="update-modal" class="fixed inset-0 z-[90] flex items-center justify-center p-4 bg-black/60 backdrop-blur-sm opacity-0 pointer-events-none transition-all duration-500 ease-out">
-    <div class="w-full max-w-md bg-white dark:bg-amoled-card border border-gray-200 dark:border-amoled-border rounded-3xl shadow-2xl overflow-hidden p-6 text-center transition-all transform duration-500 opacity-0 scale-95 ease-out">
+<div id="update-modal" class="fixed inset-0 z-[90] flex items-center justify-center p-4 bg-black/60 backdrop-blur-sm opacity-0 pointer-events-none transition-all duration-300 ease-out">
+    <div class="w-full max-w-md bg-white dark:bg-amoled-card border border-gray-200 dark:border-amoled-border rounded-3xl shadow-2xl overflow-hidden p-6 text-center transition-all transform duration-300 opacity-0 scale-95 ease-out">
         <div class="inline-flex items-center justify-center w-16 h-16 rounded-full bg-indigo-100 dark:bg-indigo-900/30 text-indigo-500 mb-4 shadow-inner">
             <svg class="w-8 h-8" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2.5" d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15"></path></svg>
         </div>
@@ -3950,7 +3445,7 @@ const HTML_TEMPLATES = {
             نسخه جدید در دسترس است. اگر آپدیت خودکار جواب نداد، حتماً از طریق لینک زیر آپدیت دستی را انجام دهید.
         </p>
         <div class="space-y-3">
-            <button onclick="applyUpdate()" class="w-full py-3.5 bg-gradient-to-r from-indigo-600 to-violet-600 border-0 text-white hover:from-indigo-500 hover:to-violet-500 hover:shadow-xl hover:shadow-indigo-500/30 font-black rounded-2xl text-sm transition duration-500 shadow-md flex items-center justify-center gap-2">
+            <button onclick="applyUpdate()" class="w-full py-3.5 bg-indigo-600 border-0 text-white hover:bg-indigo-500 hover:shadow-md font-black rounded-xl text-sm transition duration-300 shadow-sm flex items-center justify-center gap-2">
                 <svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 16v1a3 3 0 003 3h10a3 3 0 003-3v-1m-4-8l-4-4m0 0L8 8m4-4v12"></path></svg>
                 آپدیت خودکار (توصیه شده)
             </button>
@@ -3962,145 +3457,145 @@ const HTML_TEMPLATES = {
                     <span class="bg-white dark:bg-amoled-card px-2 text-gray-400">یا</span>
                 </div>
             </div>
-            <a href="https://zeus-panel.ir-netlify.workers.dev/" target="_blank" class="w-full py-3.5 bg-green-50 dark:bg-green-950/30 hover:bg-green-100 dark:hover:bg-green-900/50 text-green-600 dark:text-green-500 border border-green-300 dark:border-green-500 font-bold rounded-2xl text-sm transition duration-500 shadow-md flex items-center justify-center gap-2">
+            <a href="https://zeus-panel.ir-netlify.workers.dev/" target="_blank" class="w-full py-3.5 bg-teal-50 dark:bg-teal-950/30 hover:bg-teal-100 dark:hover:bg-teal-900/50 text-teal-600 dark:text-teal-500 border border-teal-300 dark:border-teal-500 font-bold rounded-xl text-sm transition duration-300 shadow-sm flex items-center justify-center gap-2">
                 <svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
                     <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M10 6H6a2 2 0 00-2 2v10a2 2 0 002 2h10a2 2 0 002-2v-4M14 4h6m0 0v6m0-6L10 14"></path>
                 </svg>
                 آپدیت دستی (رفتن به سایت)
             </a>
         </div>
-        <button onclick="toggleUpdateModal(false)" class="mt-5 w-full py-3.5 bg-transparent border-2 border-red-700 text-red-700 hover:bg-red-900/20 hover:text-red-800 dark:border-red-700 dark:text-red-500 dark:hover:bg-red-900/40 dark:hover:text-red-400 font-bold rounded-2xl text-sm transition duration-500 shadow-md flex items-center justify-center">
+        <button onclick="toggleUpdateModal(false)" class="mt-5 w-full py-3.5 bg-transparent border-2 border-rose-700 text-rose-700 hover:bg-rose-900/20 hover:text-rose-800 dark:border-rose-700 dark:text-rose-500 dark:hover:bg-rose-900/40 dark:hover:text-rose-400 font-bold rounded-xl text-sm transition duration-300 shadow-sm flex items-center justify-center">
             انصراف
         </button>
     </div>
 </div>
-	<div id="token-modal" class="fixed inset-0 z-[100] flex items-center justify-center p-4 bg-black/70 opacity-0 pointer-events-none transition-opacity duration-300 ease-out">
-        <div id="token-modal-card" class="w-full max-w-md bg-white dark:bg-amoled-card border border-gray-200 dark:border-amoled-border rounded-3xl shadow-2xl p-6 transform transition-all scale-95 opacity-0 duration-300">
+	<div id="token-modal" class="fixed inset-0 z-[100] flex items-center justify-center p-4 bg-black/70 opacity-0 pointer-events-none transition-opacity duration-200 ease-out">
+        <div id="token-modal-card" class="w-full max-w-md bg-white dark:bg-amoled-card border border-gray-200 dark:border-amoled-border rounded-3xl shadow-2xl p-6 transform transition-all scale-95 opacity-0 duration-200">
             <div class="flex justify-between items-center mb-6">
                 <div class="flex items-center gap-2">
-                    <div class="w-2.5 h-2.5 rounded-full bg-green-500"></div>
+                    <div class="w-2.5 h-2.5 rounded-full bg-teal-500"></div>
                     <h3 class="text-lg font-bold text-gray-900 dark:text-white">تنظیم توکن کلودفلر</h3>
                 </div>
-                <button onclick="toggleTokenModal(false)" class="p-1.5 rounded-xl bg-red-50 dark:bg-red-950/30 border border-red-200 dark:border-red-900/50 text-red-600 dark:text-red-500 hover:bg-red-100 dark:hover:bg-red-900/50 transition-all duration-300 shadow-md">
+                <button onclick="toggleTokenModal(false)" class="p-1.5 rounded-lg bg-red-50 dark:bg-red-950/30 border border-red-200 dark:border-red-900/50 text-red-600 dark:text-red-500 hover:bg-red-100 dark:hover:bg-red-900/50 transition-all duration-200 shadow-sm">
                     <svg class="w-6 h-6" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M6 18L18 6M6 6l12 12"></path></svg>
                 </button>
             </div>
             
-            <div class="mb-5 p-3 bg-green-50 dark:bg-green-900/20 border border-green-200 dark:border-green-800/50 rounded-2xl text-xs leading-relaxed text-green-800 dark:text-green-300 font-medium">
+            <div class="mb-5 p-3 bg-teal-50 dark:bg-teal-900/20 border border-teal-200 dark:border-teal-800/50 rounded-xl text-xs leading-relaxed text-teal-800 dark:text-teal-300 font-medium">
                 توکن کلودفلر شما در این پنل ذخیره نشده است. برای فعال‌سازی آپدیت خودکار از داخل پنل، لطفاً توکن خود را دریافت کرده و در کادر زیر وارد کنید.
             </div>
 
-            <a href="https://dash.cloudflare.com/profile/api-tokens?permissionGroupKeys=%5B%7B%22key%22%3A%22workers_scripts%22%2C%22type%22%3A%22edit%22%7D%2C%7B%22key%22%3A%22workers_kv_storage%22%2C%22type%22%3A%22edit%22%7D%2C%7B%22key%22%3A%22d1%22%2C%22type%22%3A%22edit%22%7D%2C%7B%22key%22%3A%22account_settings%22%2C%22type%22%3A%22read%22%7D%2C%7B%22key%22%3A%22workers_subdomain%22%2C%22type%22%3A%22edit%22%7D%2C%7B%22key%22%3A%22account_analytics%22%2C%22type%22%3A%22read%22%7D%5D&accountId=*&zoneId=all&name=Zeus-Deployer-Token" target="_blank" class="flex items-center justify-center gap-2 w-full py-3 bg-[#d94800] hover:bg-[#e35802] text-white font-bold rounded-2xl text-sm transition duration-500 mb-4 shadow-lg shadow-green-500/20">
+            <a href="https://dash.cloudflare.com/profile/api-tokens?permissionGroupKeys=%5B%7B%22key%22%3A%22workers_scripts%22%2C%22type%22%3A%22edit%22%7D%2C%7B%22key%22%3A%22workers_kv_storage%22%2C%22type%22%3A%22edit%22%7D%2C%7B%22key%22%3A%22d1%22%2C%22type%22%3A%22edit%22%7D%2C%7B%22key%22%3A%22account_settings%22%2C%22type%22%3A%22read%22%7D%2C%7B%22key%22%3A%22workers_subdomain%22%2C%22type%22%3A%22edit%22%7D%2C%7B%22key%22%3A%22account_analytics%22%2C%22type%22%3A%22read%22%7D%5D&accountId=*&zoneId=all&name=Zeus-Deployer-Token" target="_blank" class="flex items-center justify-center gap-2 w-full py-3 bg-[#d94800] hover:bg-[#e35802] text-white font-bold rounded-xl text-sm transition duration-300 mb-4 shadow-md shadow-teal-500/20">
                 <svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M10 6H6a2 2 0 00-2 2v10a2 2 0 002 2h10a2 2 0 002-2v-4M14 4h6m0 0v6m0-6L10 14"></path></svg>
                 دریافت توکن کلودفلر
             </a>
 
             <div class="space-y-4">
-                <input type="password" id="update-token-input" placeholder="توکن را اینجا وارد کنید" class="w-full px-4 py-3 bg-gray-50 dark:bg-amoled-input border border-gray-300 dark:border-amoled-border rounded-2xl focus:outline-none focus:ring-2 focus:ring-green-500 text-sm font-mono text-center text-gray-900 dark:text-zinc-100 transition" dir="auto">
+                <input type="password" id="update-token-input" placeholder="توکن را اینجا وارد کنید" class="w-full px-4 py-3 bg-gray-50 dark:bg-amoled-input border border-gray-300 dark:border-amoled-border rounded-xl focus:outline-none focus:ring-2 focus:ring-teal-500 text-sm font-mono text-center text-gray-900 dark:text-zinc-100 transition" dir="auto">
                 
-                <button id="submit-token-btn" onclick="submitTokenForUpdate()" class="w-full py-3 bg-gradient-to-r from-indigo-600 to-violet-600 border-0 text-white hover:from-indigo-500 hover:to-violet-500 hover:shadow-xl hover:shadow-indigo-500/30 font-bold rounded-2xl text-sm transition duration-500 shadow-xl">
+                <button id="submit-token-btn" onclick="submitTokenForUpdate()" class="w-full py-3 bg-indigo-600 border-0 text-white hover:bg-indigo-500 hover:shadow-md font-bold rounded-xl text-sm transition duration-300 shadow-lg">
                     ثبت و آپدیت پنل
                 </button>
             </div>
         </div>
     </div>
-<div id="qr-modal" class="fixed inset-0 z-[110] flex items-center justify-center p-4 bg-black/70 opacity-0 pointer-events-none transition-opacity duration-300 ease-out">
-    <div id="qr-modal-card" class="w-full max-w-sm bg-white dark:bg-amoled-card border border-gray-200 dark:border-amoled-border rounded-3xl shadow-2xl p-6 transform transition-all scale-95 opacity-0 duration-300 text-center">
+<div id="qr-modal" class="fixed inset-0 z-[110] flex items-center justify-center p-4 bg-black/70 opacity-0 pointer-events-none transition-opacity duration-200 ease-out">
+    <div id="qr-modal-card" class="w-full max-w-sm bg-white dark:bg-amoled-card border border-gray-200 dark:border-amoled-border rounded-3xl shadow-2xl p-6 transform transition-all scale-95 opacity-0 duration-200 text-center">
         <div class="flex justify-between items-center mb-4">
             <h3 class="text-lg font-bold text-gray-900 dark:text-white">QR Code</h3>
-            <button onclick="toggleQrModal(false)" class="p-1.5 rounded-xl bg-red-50 dark:bg-red-950/30 border border-red-200 dark:border-red-900/50 text-red-600 dark:text-red-500 hover:bg-red-100 dark:hover:bg-red-900/50 transition-all duration-300 shadow-md">
+            <button onclick="toggleQrModal(false)" class="p-1.5 rounded-lg bg-red-50 dark:bg-red-950/30 border border-red-200 dark:border-red-900/50 text-red-600 dark:text-red-500 hover:bg-red-100 dark:hover:bg-red-900/50 transition-all duration-200 shadow-sm">
                 <svg class="w-6 h-6" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M6 18L18 6M6 6l12 12"></path></svg>
             </button>
         </div>
-        <div class="flex justify-center bg-white p-4 rounded-2xl mb-4">
+        <div class="flex justify-center bg-white p-4 rounded-xl mb-4">
             <div id="qrcode-container"></div>
         </div>
     </div>
 </div>
-    <div id="bulk-actions-bar" class="fixed bottom-4 left-1/2 -translate-x-1/2 z-[40] bg-white dark:bg-zinc-900/90 border border-gray-200 dark:border-zinc-800/80 px-6 py-4 rounded-2xl shadow-2xl flex flex-wrap items-center justify-between gap-4 w-[95%] max-w-4xl transition-all duration-500 transform translate-y-28 opacity-0 pointer-events-none backdrop-blur-md">
+    <div id="bulk-actions-bar" class="fixed bottom-4 left-1/2 -translate-x-1/2 z-[40] bg-white dark:bg-zinc-900/90 border border-gray-200 dark:border-zinc-800/80 px-6 py-4 rounded-2xl shadow-2xl flex flex-wrap items-center justify-between gap-4 w-[95%] max-w-4xl transition-all duration-300 transform translate-y-28 opacity-0 pointer-events-none backdrop-blur-md">
         <div class="flex items-center gap-2">
-            <span class="w-3 h-3 bg-indigo-500 rounded-full animate-pulse shadow-md shadow-indigo-500/50"></span>
+            <span class="w-3 h-3 bg-indigo-500 rounded-full animate-pulse shadow-sm shadow-indigo-500/50"></span>
             <span id="bulk-selected-count" class="text-sm font-bold text-gray-800 dark:text-zinc-200">۰ کاربر انتخاب شده</span>
         </div>
         <div class="flex flex-wrap gap-2 justify-end">
-            <button onclick="bulkEdit()" class="px-3 py-1.5 bg-yellow-50 dark:bg-yellow-950/20 text-yellow-600 dark:text-yellow-400 hover:bg-yellow-100 dark:hover:bg-yellow-900/30 rounded-2xl text-xs font-bold transition border border-yellow-200 dark:border-yellow-900/50 flex items-center gap-1">
+            <button onclick="bulkEdit()" class="px-3 py-1.5 bg-yellow-50 dark:bg-yellow-950/20 text-yellow-600 dark:text-yellow-400 hover:bg-yellow-100 dark:hover:bg-yellow-900/30 rounded-xl text-xs font-bold transition border border-yellow-200 dark:border-yellow-900/50 flex items-center gap-1">
                 ✏️ ویرایش گروهی
             </button>
-            <button onclick="bulkToggleStatus(1)" class="px-3 py-1.5 bg-green-50 dark:bg-green-950/20 text-green-700 dark:text-green-500 hover:bg-green-100 dark:hover:bg-green-900/30 rounded-2xl text-xs font-bold transition border border-green-200 dark:border-green-900/50 flex items-center gap-1">
+            <button onclick="bulkToggleStatus(1)" class="px-3 py-1.5 bg-green-50 dark:bg-green-950/20 text-green-700 dark:text-green-500 hover:bg-green-100 dark:hover:bg-green-900/30 rounded-xl text-xs font-bold transition border border-green-200 dark:border-green-900/50 flex items-center gap-1">
                 ✅ فعال‌سازی
             </button>
-            <button onclick="bulkToggleStatus(0)" class="px-3 py-1.5 bg-amber-50 dark:bg-amber-950/20 text-amber-600 dark:text-amber-400 hover:bg-amber-100 dark:hover:bg-amber-900/30 rounded-2xl text-xs font-bold transition border border-amber-200 dark:border-amber-900/50 flex items-center gap-1">
+            <button onclick="bulkToggleStatus(0)" class="px-3 py-1.5 bg-amber-50 dark:bg-amber-950/20 text-amber-600 dark:text-amber-400 hover:bg-amber-100 dark:hover:bg-amber-900/30 rounded-xl text-xs font-bold transition border border-amber-200 dark:border-amber-900/50 flex items-center gap-1">
                 ❌ غیرفعال‌سازی
             </button>
-            <button onclick="bulkReset('volume')" class="px-3 py-1.5 bg-indigo-50 dark:bg-indigo-950/20 text-indigo-600 dark:text-indigo-400 hover:bg-indigo-100 dark:hover:bg-indigo-900/30 rounded-2xl text-xs font-bold transition border border-indigo-200 dark:border-indigo-900/50 flex items-center gap-1">
+            <button onclick="bulkReset('volume')" class="px-3 py-1.5 bg-indigo-50 dark:bg-indigo-950/20 text-indigo-600 dark:text-indigo-400 hover:bg-indigo-100 dark:hover:bg-indigo-900/30 rounded-xl text-xs font-bold transition border border-indigo-200 dark:border-indigo-900/50 flex items-center gap-1">
                 📊 ریست حجم
             </button>
-            <button onclick="bulkReset('req')" class="px-3 py-1.5 bg-indigo-50 dark:bg-indigo-950/20 text-indigo-600 dark:text-indigo-400 hover:bg-indigo-100 dark:hover:bg-indigo-900/30 rounded-2xl text-xs font-bold transition border border-indigo-200 dark:border-indigo-900/50 flex items-center gap-1">
+            <button onclick="bulkReset('req')" class="px-3 py-1.5 bg-cyan-50 dark:bg-cyan-950/20 text-cyan-600 dark:text-cyan-400 hover:bg-cyan-100 dark:hover:bg-cyan-900/30 rounded-xl text-xs font-bold transition border border-cyan-200 dark:border-cyan-900/50 flex items-center gap-1">
                 ⚡ ریست ریکوئست
             </button>
-            <button onclick="bulkReset('time')" class="px-3 py-1.5 bg-indigo-50 dark:bg-indigo-950/20 text-indigo-600 dark:text-indigo-400 hover:bg-indigo-100 dark:hover:bg-indigo-900/30 rounded-2xl text-xs font-bold transition border border-indigo-200 dark:border-indigo-900/50 flex items-center gap-1">
+            <button onclick="bulkReset('time')" class="px-3 py-1.5 bg-sky-50 dark:bg-sky-950/20 text-sky-600 dark:text-sky-400 hover:bg-sky-100 dark:hover:bg-sky-900/30 rounded-xl text-xs font-bold transition border border-sky-200 dark:border-sky-900/50 flex items-center gap-1">
                 ⏳ ریست زمان
             </button>
-            <button onclick="bulkDelete()" class="px-3 py-1.5 bg-red-50 dark:bg-red-950/30 text-red-600 dark:text-red-450 hover:bg-red-100 dark:hover:bg-red-900/40 rounded-2xl text-xs font-bold transition border border-red-200 dark:border-red-900/50 flex items-center gap-1">
+            <button onclick="bulkDelete()" class="px-3 py-1.5 bg-red-50 dark:bg-red-950/30 text-red-600 dark:text-red-450 hover:bg-red-100 dark:hover:bg-red-900/40 rounded-xl text-xs font-bold transition border border-red-200 dark:border-red-900/50 flex items-center gap-1">
                 🗑️ حذف گروهی
             </button>
         </div>
     </div>
-    <div id="bulk-edit-modal" class="fixed inset-0 z-[80] flex items-center justify-center p-4 bg-black/70 opacity-0 pointer-events-none transition-opacity duration-300 ease-out">
-        <div id="bulk-edit-modal-card" class="w-full max-w-xl bg-white dark:bg-zinc-950 border border-gray-200 dark:border-zinc-800 rounded-2xl shadow-xl overflow-hidden transition-[opacity,transform] duration-300 opacity-0 scale-95 ease-out flex flex-col max-h-[90vh] transform-gpu" style="will-change: transform, opacity;">
+    <div id="bulk-edit-modal" class="fixed inset-0 z-[80] flex items-center justify-center p-4 bg-black/70 opacity-0 pointer-events-none transition-opacity duration-200 ease-out">
+        <div id="bulk-edit-modal-card" class="w-full max-w-xl bg-white dark:bg-zinc-950 border border-gray-200 dark:border-zinc-800 rounded-2xl shadow-xl overflow-hidden transition-[opacity,transform] duration-200 opacity-0 scale-95 ease-out flex flex-col max-h-[90vh] transform-gpu" style="will-change: transform, opacity;">
             <div class="px-6 py-4 border-b border-gray-150 dark:border-zinc-800/80 flex justify-between items-center bg-gray-50/50 dark:bg-zinc-900/30">
                 <div class="flex items-center gap-2">
                     <div class="w-2.5 h-2.5 rounded-full bg-yellow-500"></div>
                     <h3 class="font-bold text-gray-900 dark:text-zinc-100 text-base">ویرایش گروهی کاربران</h3>
                 </div>
-                <button onclick="toggleBulkEditModal(false)" class="p-1.5 rounded-xl bg-red-50 dark:bg-red-950/30 border border-red-200 dark:border-red-900/50 text-red-600 dark:text-red-500 hover:bg-red-100 dark:hover:bg-red-900/50 transition-all duration-300 shadow-md">
+                <button onclick="toggleBulkEditModal(false)" class="p-1.5 rounded-lg bg-red-50 dark:bg-red-950/30 border border-red-200 dark:border-red-900/50 text-red-600 dark:text-red-500 hover:bg-red-100 dark:hover:bg-red-900/50 transition-all duration-200 shadow-sm">
                     <svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M6 18L18 6M6 6l12 12"></path></svg>
                 </button>
             </div>
             <form id="bulk-edit-form" class="p-6 space-y-5 overflow-y-auto flex-1 overscroll-contain" style="-webkit-overflow-scrolling: touch; transform: translate3d(0,0,0); will-change: scroll-position, transform;" onsubmit="handleBulkEditSubmit(event)">
                 <p class="text-xs text-amber-600 dark:text-amber-400 font-semibold mb-2">💡 تغییرات فقط روی بخش‌هایی اعمال می‌شوند که دکمه فعال‌ساز تغییر (چپ) آن‌ها روشن باشد.</p>
                 <div class="space-y-4">
-                    <div class="flex items-center gap-3 border border-gray-100 dark:border-zinc-900 p-3 rounded-2xl bg-gray-50/20 dark:bg-zinc-900/10">
+                    <div class="flex items-center gap-3 border border-gray-100 dark:border-zinc-900 p-3 rounded-xl bg-gray-50/20 dark:bg-zinc-900/10">
                         <label class="relative inline-flex items-center cursor-pointer select-none">
                             <input type="checkbox" id="bulk-apply-limit" class="sr-only peer">
                             <div class="w-9 h-5 bg-gray-200 peer-focus:outline-none rounded-full peer dark:bg-zinc-700 peer-checked:after:translate-x-full peer-checked:after:border-white after:content-[''] after:absolute after:top-[2px] after:left-[2px] after:bg-white after:border-gray-300 after:border after:rounded-full after:h-4 after:w-4 after:transition-all dark:border-gray-600 peer-checked:bg-green-700"></div>
                         </label>
                         <div class="flex-1">
                             <label class="block text-xs font-bold text-gray-500 dark:text-zinc-400 mb-1 uppercase tracking-wider">حجم (GB)</label>
-                            <input type="number" id="bulk-input-limit" min="0" step="any" placeholder="بدون تغییر" class="w-full px-3 py-2 bg-gray-50 dark:bg-zinc-900 border border-gray-200 dark:border-zinc-800 rounded-2xl focus:outline-none focus:ring-2 focus:ring-indigo-500/50 text-sm font-semibold text-gray-800 dark:text-zinc-100 placeholder-gray-400/80 transition">
+                            <input type="number" id="bulk-input-limit" min="0" step="any" placeholder="بدون تغییر" class="w-full px-3 py-2 bg-gray-50 dark:bg-zinc-900 border border-gray-200 dark:border-zinc-800 rounded-xl focus:outline-none focus:ring-2 focus:ring-indigo-500/50 text-sm font-semibold text-gray-800 dark:text-zinc-100 placeholder-gray-400/80 transition">
                         </div>
                     </div>
-                    <div class="flex items-center gap-3 border border-gray-100 dark:border-zinc-900 p-3 rounded-2xl bg-gray-50/20 dark:bg-zinc-900/10">
+                    <div class="flex items-center gap-3 border border-gray-100 dark:border-zinc-900 p-3 rounded-xl bg-gray-50/20 dark:bg-zinc-900/10">
                         <label class="relative inline-flex items-center cursor-pointer select-none">
                             <input type="checkbox" id="bulk-apply-expiry" class="sr-only peer">
                             <div class="w-9 h-5 bg-gray-200 peer-focus:outline-none rounded-full peer dark:bg-zinc-700 peer-checked:after:translate-x-full peer-checked:after:border-white after:content-[''] after:absolute after:top-[2px] after:left-[2px] after:bg-white after:border-gray-300 after:border after:rounded-full after:h-4 after:w-4 after:transition-all dark:border-gray-600 peer-checked:bg-green-700"></div>
                         </label>
                         <div class="flex-1">
                             <label class="block text-xs font-bold text-gray-500 dark:text-zinc-400 mb-1 uppercase tracking-wider">اعتبار (روز)</label>
-                            <input type="number" id="bulk-input-expiry" min="0" placeholder="بدون تغییر" class="w-full px-3 py-2 bg-gray-50 dark:bg-zinc-900 border border-gray-200 dark:border-zinc-800 rounded-2xl focus:outline-none focus:ring-2 focus:ring-indigo-500/50 text-sm font-semibold text-gray-800 dark:text-zinc-100 placeholder-gray-400/80 transition">
+                            <input type="number" id="bulk-input-expiry" min="0" placeholder="بدون تغییر" class="w-full px-3 py-2 bg-gray-50 dark:bg-zinc-900 border border-gray-200 dark:border-zinc-800 rounded-xl focus:outline-none focus:ring-2 focus:ring-indigo-500/50 text-sm font-semibold text-gray-800 dark:text-zinc-100 placeholder-gray-400/80 transition">
                         </div>
                     </div>
-                    <div class="flex items-center gap-3 border border-gray-100 dark:border-zinc-900 p-3 rounded-2xl bg-gray-50/20 dark:bg-zinc-900/10">
+                    <div class="flex items-center gap-3 border border-gray-100 dark:border-zinc-900 p-3 rounded-xl bg-gray-50/20 dark:bg-zinc-900/10">
                         <label class="relative inline-flex items-center cursor-pointer select-none">
                             <input type="checkbox" id="bulk-apply-req-limit" class="sr-only peer">
                             <div class="w-9 h-5 bg-gray-200 peer-focus:outline-none rounded-full peer dark:bg-zinc-700 peer-checked:after:translate-x-full peer-checked:after:border-white after:content-[''] after:absolute after:top-[2px] after:left-[2px] after:bg-white after:border-gray-300 after:border after:rounded-full after:h-4 after:w-4 after:transition-all dark:border-gray-600 peer-checked:bg-green-700"></div>
                         </label>
                         <div class="flex-1">
                             <label class="block text-xs font-bold text-gray-500 dark:text-zinc-400 mb-1 uppercase tracking-wider">سقف ریکوئست</label>
-                            <input type="number" id="bulk-input-req-limit" min="0" placeholder="بدون تغییر" class="w-full px-3 py-2 bg-gray-50 dark:bg-zinc-900 border border-gray-200 dark:border-zinc-800 rounded-2xl focus:outline-none focus:ring-2 focus:ring-indigo-500/50 text-sm font-semibold text-gray-800 dark:text-zinc-100 placeholder-gray-400/80 transition">
+                            <input type="number" id="bulk-input-req-limit" min="0" placeholder="بدون تغییر" class="w-full px-3 py-2 bg-gray-50 dark:bg-zinc-900 border border-gray-200 dark:border-zinc-800 rounded-xl focus:outline-none focus:ring-2 focus:ring-indigo-500/50 text-sm font-semibold text-gray-800 dark:text-zinc-100 placeholder-gray-400/80 transition">
                         </div>
                     </div>
-                    <div class="flex items-center gap-3 border border-gray-100 dark:border-zinc-900 p-3 rounded-2xl bg-gray-50/20 dark:bg-zinc-900/10">
+                    <div class="flex items-center gap-3 border border-gray-100 dark:border-zinc-900 p-3 rounded-xl bg-gray-50/20 dark:bg-zinc-900/10">
                         <label class="relative inline-flex items-center cursor-pointer select-none">
                             <input type="checkbox" id="bulk-apply-ip-limit" class="sr-only peer">
                             <div class="w-9 h-5 bg-gray-200 peer-focus:outline-none rounded-full peer dark:bg-zinc-700 peer-checked:after:translate-x-full peer-checked:after:border-white after:content-[''] after:absolute after:top-[2px] after:left-[2px] after:bg-white after:border-gray-300 after:border after:rounded-full after:h-4 after:w-4 after:transition-all dark:border-gray-600 peer-checked:bg-green-700"></div>
                         </label>
                         <div class="flex-1">
                             <label class="block text-xs font-bold text-gray-500 dark:text-zinc-400 mb-1 uppercase tracking-wider">محدودیت کاربر</label>
-                            <input type="number" id="bulk-input-ip-limit" min="0" placeholder="بدون تغییر" class="w-full px-3 py-2 bg-gray-50 dark:bg-zinc-900 border border-gray-200 dark:border-zinc-800 rounded-2xl focus:outline-none focus:ring-2 focus:ring-indigo-500/50 text-sm font-semibold text-gray-800 dark:text-zinc-100 placeholder-gray-400/80 transition">
+                            <input type="number" id="bulk-input-ip-limit" min="0" placeholder="بدون تغییر" class="w-full px-3 py-2 bg-gray-50 dark:bg-zinc-900 border border-gray-200 dark:border-zinc-800 rounded-xl focus:outline-none focus:ring-2 focus:ring-indigo-500/50 text-sm font-semibold text-gray-800 dark:text-zinc-100 placeholder-gray-400/80 transition">
                         </div>
                     </div>
-					<div class="flex flex-col gap-3 border border-gray-100 dark:border-zinc-900 p-3 rounded-2xl bg-gray-50/20 dark:bg-zinc-900/10">
+					<div class="flex flex-col gap-3 border border-gray-100 dark:border-zinc-900 p-3 rounded-xl bg-gray-50/20 dark:bg-zinc-900/10">
 						<div class="flex items-center justify-between">
 							<div class="flex items-center gap-3">
 								<label class="relative inline-flex items-center cursor-pointer select-none">
@@ -4115,25 +3610,25 @@ const HTML_TEMPLATES = {
 								<span class="mr-2 text-xs font-bold text-gray-700 dark:text-zinc-300">فعال‌سازی برای همه</span>
 							</label>
 						</div>
-						<div id="bulk-frag-inputs-container" class="grid grid-cols-2 gap-2 hidden transition-all duration-500 pt-2 border-t border-gray-100 dark:border-zinc-800">
+						<div id="bulk-frag-inputs-container" class="grid grid-cols-2 gap-2 hidden transition-all duration-300 pt-2 border-t border-gray-100 dark:border-zinc-800">
 							<div>
 								<label class="block text-[10px] font-bold text-gray-500 dark:text-zinc-400 mb-1 uppercase tracking-wider">Fragment Length</label>
-								<input type="text" id="bulk-input-frag-len" placeholder="200-3000" value="200-3000" class="w-full px-2 py-1.5 bg-gray-50 dark:bg-zinc-900 border border-gray-200 dark:border-zinc-800 rounded-xl focus:outline-none focus:ring-2 focus:ring-indigo-500/50 text-xs font-mono text-center text-gray-800 dark:text-zinc-100 transition" dir="ltr">
+								<input type="text" id="bulk-input-frag-len" placeholder="200-3000" value="200-3000" class="w-full px-2 py-1.5 bg-gray-50 dark:bg-zinc-900 border border-gray-200 dark:border-zinc-800 rounded-lg focus:outline-none focus:ring-2 focus:ring-indigo-500/50 text-xs font-mono text-center text-gray-800 dark:text-zinc-100 transition" dir="ltr">
 							</div>
 							<div>
 								<label class="block text-[10px] font-bold text-gray-500 dark:text-zinc-400 mb-1 uppercase tracking-wider">Fragment Interval</label>
-								<input type="text" id="bulk-input-frag-int" placeholder="1-2" value="1-2" class="w-full px-2 py-1.5 bg-gray-50 dark:bg-zinc-900 border border-gray-200 dark:border-zinc-800 rounded-xl focus:outline-none focus:ring-2 focus:ring-indigo-500/50 text-xs font-mono text-center text-gray-800 dark:text-zinc-100 transition" dir="ltr">
+								<input type="text" id="bulk-input-frag-int" placeholder="1-2" value="1-2" class="w-full px-2 py-1.5 bg-gray-50 dark:bg-zinc-900 border border-gray-200 dark:border-zinc-800 rounded-lg focus:outline-none focus:ring-2 focus:ring-indigo-500/50 text-xs font-mono text-center text-gray-800 dark:text-zinc-100 transition" dir="ltr">
 							</div>
 						</div>
 					</div>
-                    <div class="flex items-center gap-3 border border-gray-100 dark:border-zinc-900 p-3 rounded-2xl bg-gray-50/20 dark:bg-zinc-900/10">
+                    <div class="flex items-center gap-3 border border-gray-100 dark:border-zinc-900 p-3 rounded-xl bg-gray-50/20 dark:bg-zinc-900/10">
                         <label class="relative inline-flex items-center cursor-pointer select-none">
                             <input type="checkbox" id="bulk-apply-fingerprint" class="sr-only peer">
                             <div class="w-9 h-5 bg-gray-200 peer-focus:outline-none rounded-full peer dark:bg-zinc-700 peer-checked:after:translate-x-full peer-checked:after:border-white after:content-[''] after:absolute after:top-[2px] after:left-[2px] after:bg-white after:border-gray-300 after:border after:rounded-full after:h-4 after:w-4 after:transition-all dark:border-gray-600 peer-checked:bg-green-700"></div>
                         </label>
                         <div class="flex-1">
                             <label class="block text-xs font-bold text-gray-500 dark:text-zinc-400 mb-1.5 uppercase tracking-wider">Fingerprint</label>
-                            <select id="bulk-fingerprint-select" class="w-full px-3 py-2.5 bg-gray-50 dark:bg-zinc-900 border border-gray-200 dark:border-zinc-800 rounded-2xl focus:outline-none focus:ring-2 focus:ring-indigo-500/50 text-xs font-semibold text-gray-700 dark:text-zinc-300 cursor-pointer">
+                            <select id="bulk-fingerprint-select" class="w-full px-3 py-2.5 bg-gray-50 dark:bg-zinc-900 border border-gray-200 dark:border-zinc-800 rounded-xl focus:outline-none focus:ring-2 focus:ring-indigo-500/50 text-xs font-semibold text-gray-700 dark:text-zinc-300 cursor-pointer">
                                 <option value="chrome">🌐 Chrome</option>
                                 <option value="firefox">🦊 Firefox</option>
                                 <option value="safari">🧭 Safari</option>
@@ -4147,7 +3642,7 @@ const HTML_TEMPLATES = {
                             </select>
                         </div>
                     </div>
-                    <div class="flex items-center gap-3 border border-gray-100 dark:border-zinc-900 p-3 rounded-2xl bg-gray-50/20 dark:bg-zinc-900/10">
+                    <div class="flex items-center gap-3 border border-gray-100 dark:border-zinc-900 p-3 rounded-xl bg-gray-50/20 dark:bg-zinc-900/10">
                         <label class="relative inline-flex items-center cursor-pointer select-none">
                             <input type="checkbox" id="bulk-apply-ports" class="sr-only peer">
                             <div class="w-9 h-5 bg-gray-200 peer-focus:outline-none rounded-full peer dark:bg-zinc-700 peer-checked:after:translate-x-full peer-checked:after:border-white after:content-[''] after:absolute after:top-[2px] after:left-[2px] after:bg-white after:border-gray-300 after:border after:rounded-full after:h-4 after:w-4 after:transition-all dark:border-gray-600 peer-checked:bg-green-700"></div>
@@ -4164,30 +3659,30 @@ const HTML_TEMPLATES = {
                             </div>
                             <div>
                                 <label class="block text-[10px] font-bold text-gray-500 dark:text-zinc-400 mb-1">پورت‌های دلخواه (با فاصله جدا کنید)</label>
-                                <input type="text" id="bulk-input-custom-ports" placeholder="8080 2096 5000" dir="ltr" class="w-full px-3 py-2 bg-gray-50 dark:bg-zinc-900 border border-gray-200 dark:border-zinc-800 rounded-xl focus:outline-none focus:ring-2 focus:ring-indigo-500/50 text-xs font-mono text-left text-gray-800 dark:text-zinc-100 transition">
+                                <input type="text" id="bulk-input-custom-ports" placeholder="8080 2096 5000" dir="ltr" class="w-full px-3 py-2 bg-gray-50 dark:bg-zinc-900 border border-gray-200 dark:border-zinc-800 rounded-lg focus:outline-none focus:ring-2 focus:ring-indigo-500/50 text-xs font-mono text-left text-gray-800 dark:text-zinc-100 transition">
                             </div>
                         </div>
                     </div>
-                    <div class="flex items-center gap-3 border border-gray-100 dark:border-zinc-900 p-3 rounded-2xl bg-gray-50/20 dark:bg-zinc-900/10">
+                    <div class="flex items-center gap-3 border border-gray-100 dark:border-zinc-900 p-3 rounded-xl bg-gray-50/20 dark:bg-zinc-900/10">
                         <label class="relative inline-flex items-center cursor-pointer select-none">
                             <input type="checkbox" id="bulk-apply-ips" class="sr-only peer">
                             <div class="w-9 h-5 bg-gray-200 peer-focus:outline-none rounded-full peer dark:bg-zinc-700 peer-checked:after:translate-x-full peer-checked:after:border-white after:content-[''] after:absolute after:top-[2px] after:left-[2px] after:bg-white after:border-gray-300 after:border after:rounded-full after:h-4 after:w-4 after:transition-all dark:border-gray-600 peer-checked:bg-green-700"></div>
                         </label>
                         <div class="flex-1">
                             <label class="block text-xs font-bold text-gray-500 dark:text-zinc-400 mb-1 uppercase tracking-wider">آیپی تمیز (توصیه میشود)</label>
-                            <textarea id="bulk-input-ips" rows="2" placeholder="104.16.0.1" class="w-full px-3 py-2 bg-gray-50 dark:bg-zinc-900 border border-gray-200 dark:border-zinc-800 rounded-2xl focus:outline-none focus:ring-2 focus:ring-indigo-500/50 text-xs font-mono text-gray-800 dark:text-zinc-100 placeholder-gray-400/80 transition resize-none"></textarea>
+                            <textarea id="bulk-input-ips" rows="2" placeholder="104.16.0.1" class="w-full px-3 py-2 bg-gray-50 dark:bg-zinc-900 border border-gray-200 dark:border-zinc-800 rounded-xl focus:outline-none focus:ring-2 focus:ring-indigo-500/50 text-xs font-mono text-gray-800 dark:text-zinc-100 placeholder-gray-400/80 transition resize-none"></textarea>
                         </div>
                     </div>
                 </div>
                 <div class="pt-4 flex gap-3">
-                    <button type="button" onclick="toggleBulkEditModal(false)" class="flex-1 py-3 bg-transparent border-2 border-red-700 text-red-700 hover:bg-red-900/20 hover:text-red-800 dark:border-red-700 dark:text-red-500 dark:hover:bg-red-900/40 dark:hover:text-red-400 font-bold rounded-2xl text-sm transition duration-300 shadow-md">انصراف</button>
-                    <button type="submit" id="bulk-submit-btn" class="flex-1 py-3 bg-gradient-to-r from-indigo-600 to-violet-600 border-0 text-white hover:from-indigo-500 hover:to-violet-500 hover:shadow-xl hover:shadow-indigo-500/30 font-bold rounded-2xl text-sm transition duration-300 shadow-lg">ثبت تغییرات گروهی</button>
+                    <button type="button" onclick="toggleBulkEditModal(false)" class="flex-1 py-3 bg-transparent border-2 border-rose-700 text-rose-700 hover:bg-rose-900/20 hover:text-rose-800 dark:border-rose-700 dark:text-rose-500 dark:hover:bg-rose-900/40 dark:hover:text-rose-400 font-bold rounded-xl text-sm transition duration-200 shadow-sm">انصراف</button>
+                    <button type="submit" id="bulk-submit-btn" class="flex-1 py-3 bg-indigo-600 border-0 text-white hover:bg-indigo-500 hover:shadow-md font-bold rounded-xl text-sm transition duration-200 shadow-md">ثبت تغییرات گروهی</button>
                 </div>
             </form>
         </div>
     </div>
-	<div id="update-success-modal" class="fixed inset-0 z-[120] flex items-center justify-center p-4 bg-black/60 backdrop-blur-sm opacity-0 pointer-events-none transition-all duration-500 ease-out">
-		<div class="w-full max-w-md bg-white dark:bg-amoled-card border border-green-600/50 rounded-3xl shadow-2xl overflow-hidden p-6 text-center transition-all transform duration-500 opacity-0 scale-95 ease-out">
+	<div id="update-success-modal" class="fixed inset-0 z-[120] flex items-center justify-center p-4 bg-black/60 backdrop-blur-sm opacity-0 pointer-events-none transition-all duration-300 ease-out">
+		<div class="w-full max-w-md bg-white dark:bg-amoled-card border border-green-600/50 rounded-3xl shadow-2xl overflow-hidden p-6 text-center transition-all transform duration-300 opacity-0 scale-95 ease-out">
 			<div class="inline-flex items-center justify-center w-16 h-16 rounded-full bg-green-100 dark:bg-green-900/30 text-green-600 mb-4 shadow-inner">
 				<svg class="w-8 h-8" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2.5" d="M5 13l4 4L19 7"></path></svg>
 			</div>
@@ -4195,20 +3690,20 @@ const HTML_TEMPLATES = {
 			<p class="text-sm text-gray-600 dark:text-gray-400 mb-6 leading-relaxed font-medium">
 				آپدیت موفق بود لطفا صفحه را 10 ثانیه دیگر رفرش کنید تا نسخه جدید لود شود
 			</p>
-			<button onclick="window.location.reload()" class="w-full py-3.5 bg-gradient-to-r from-indigo-600 to-violet-600 border-0 text-white hover:from-indigo-500 hover:to-violet-500 hover:shadow-xl hover:shadow-indigo-500/30 font-black rounded-2xl text-sm transition duration-500 shadow-xl">
+			<button onclick="window.location.reload()" class="w-full py-3.5 bg-indigo-600 border-0 text-white hover:bg-indigo-500 hover:shadow-md font-black rounded-xl text-sm transition duration-300 shadow-lg">
 				رفرش صفحه
 			</button>
 		</div>
 	</div>
 <div id="toast-container" class="fixed top-5 left-1/2 -translate-x-1/2 z-[9999] flex flex-col gap-2 pointer-events-none"></div>
 
-<div id="custom-confirm-modal" class="fixed inset-0 z-[9999] flex items-center justify-center p-4 bg-black/60 backdrop-blur-sm opacity-0 pointer-events-none transition-all duration-500 ease-out">
-    <div id="custom-confirm-card" class="w-full max-w-sm bg-white dark:bg-amoled-card border border-gray-200 dark:border-amoled-border rounded-3xl shadow-2xl overflow-hidden p-6 text-center transform transition-all scale-95 duration-500">
+<div id="custom-confirm-modal" class="fixed inset-0 z-[9999] flex items-center justify-center p-4 bg-black/60 backdrop-blur-sm opacity-0 pointer-events-none transition-all duration-300 ease-out">
+    <div id="custom-confirm-card" class="w-full max-w-sm bg-white dark:bg-amoled-card border border-gray-200 dark:border-amoled-border rounded-3xl shadow-2xl overflow-hidden p-6 text-center transform transition-all scale-95 duration-300">
         <h3 class="font-black text-xl text-gray-900 dark:text-white mb-3">تأیید عملیات</h3>
         <p id="custom-confirm-message" class="text-sm text-gray-600 dark:text-gray-400 mb-6 leading-relaxed font-medium"></p>
         <div class="flex gap-3">
-            <button id="custom-confirm-cancel" class="flex-1 py-3 bg-transparent border-2 border-red-700 text-red-700 hover:bg-red-900/20 hover:text-red-800 dark:border-red-700 dark:text-red-500 dark:hover:bg-red-900/40 dark:hover:text-red-400 font-bold rounded-2xl text-sm transition duration-300 shadow-md">انصراف</button>
-            <button id="custom-confirm-ok" class="flex-1 py-3 bg-gradient-to-r from-indigo-600 to-violet-600 border-0 text-white hover:from-indigo-500 hover:to-violet-500 hover:shadow-xl hover:shadow-indigo-500/30 font-bold rounded-2xl text-sm transition duration-300 shadow-xl">تأیید</button>
+            <button id="custom-confirm-cancel" class="flex-1 py-3 bg-transparent border-2 border-rose-700 text-rose-700 hover:bg-rose-900/20 hover:text-rose-800 dark:border-rose-700 dark:text-rose-500 dark:hover:bg-rose-900/40 dark:hover:text-rose-400 font-bold rounded-xl text-sm transition duration-200 shadow-sm">انصراف</button>
+            <button id="custom-confirm-ok" class="flex-1 py-3 bg-indigo-600 border-0 text-white hover:bg-indigo-500 hover:shadow-md font-bold rounded-xl text-sm transition duration-200 shadow-lg">تأیید</button>
         </div>
     </div>
 </div>
@@ -4220,7 +3715,7 @@ const HTML_TEMPLATES = {
                 ? 'bg-red-50 dark:bg-red-900/40 border-red-200 dark:border-red-800 text-red-600 dark:text-red-400' 
                 : 'bg-green-50 dark:bg-green-900/40 border-green-200 dark:border-green-800 text-green-700 dark:text-green-500';
             
-            toast.className = 'px-4 py-3 border rounded-2xl shadow-xl font-bold text-sm transform transition-all duration-500 -translate-y-full opacity-0 ' + colors;
+            toast.className = 'px-4 py-3 border rounded-xl shadow-lg font-bold text-sm transform transition-all duration-300 -translate-y-full opacity-0 ' + colors;
             toast.innerText = message;
             
             container.appendChild(toast);
@@ -4560,7 +4055,7 @@ const HTML_TEMPLATES = {
                 const isCheckedDefault = port === '443' ? 'checked' : '';
                 return '<label class="relative cursor-pointer">' +
                     '<input type="checkbox" name="ports" value="' + port + '" ' + isCheckedDefault + ' class="peer sr-only">' +
-                    '<div class="flex items-center justify-center gap-1 px-1.5 py-1.5 border border-gray-200 dark:border-zinc-800/80 rounded-xl text-[11px] font-semibold select-none transition-all duration-300 hover:bg-gray-50 dark:hover:bg-zinc-800/40 text-gray-700 dark:text-zinc-300 peer-checked:bg-indigo-50 dark:peer-checked:bg-indigo-950/25 peer-checked:border-indigo-500 dark:peer-checked:border-indigo-500/70 peer-checked:text-indigo-600 dark:peer-checked:text-indigo-400 shadow-md">' +
+                    '<div class="flex items-center justify-center gap-1 px-1.5 py-1.5 border border-gray-200 dark:border-zinc-800/80 rounded-lg text-[11px] font-semibold select-none transition-all duration-200 hover:bg-gray-50 dark:hover:bg-zinc-800/40 text-gray-700 dark:text-zinc-300 peer-checked:bg-indigo-50 dark:peer-checked:bg-indigo-950/25 peer-checked:border-indigo-500 dark:peer-checked:border-indigo-500/70 peer-checked:text-indigo-600 dark:peer-checked:text-indigo-400 shadow-sm">' +
                         '<span>' + port + '</span>' +
                         '<svg class="w-3 h-3 hidden peer-checked:block text-indigo-500" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2.5" d="M5 13l4 4L19 7"></path></svg>' +
                     '</div>' +
@@ -4570,7 +4065,7 @@ const HTML_TEMPLATES = {
                 const isCheckedDefault = port === '80' ? 'checked' : '';
                 return '<label class="relative cursor-pointer">' +
                     '<input type="checkbox" name="ports" value="' + port + '" ' + isCheckedDefault + ' class="peer sr-only">' +
-                    '<div class="flex items-center justify-center gap-1 px-1.5 py-1.5 border border-gray-200 dark:border-zinc-800/80 rounded-xl text-[11px] font-semibold select-none transition-all duration-300 hover:bg-gray-50 dark:hover:bg-zinc-800/40 text-gray-700 dark:text-zinc-300 peer-checked:bg-amber-50 dark:peer-checked:bg-amber-950/25 peer-checked:border-amber-500 dark:peer-checked:border-amber-500/70 peer-checked:text-amber-600 dark:peer-checked:text-amber-400 shadow-md">' +
+                    '<div class="flex items-center justify-center gap-1 px-1.5 py-1.5 border border-gray-200 dark:border-zinc-800/80 rounded-lg text-[11px] font-semibold select-none transition-all duration-200 hover:bg-gray-50 dark:hover:bg-zinc-800/40 text-gray-700 dark:text-zinc-300 peer-checked:bg-amber-50 dark:peer-checked:bg-amber-950/25 peer-checked:border-amber-500 dark:peer-checked:border-amber-500/70 peer-checked:text-amber-600 dark:peer-checked:text-amber-400 shadow-sm">' +
                         '<span>' + port + '</span>' +
                         '<svg class="w-3 h-3 hidden peer-checked:block text-amber-500" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2.5" d="M5 13l4 4L19 7"></path></svg>' +
                     '</div>' +
@@ -4597,113 +4092,6 @@ const HTML_TEMPLATES = {
                 card.classList.remove('opacity-100', 'scale-100');
                 card.classList.add('opacity-0', 'scale-95');
             }
-        }
-        let RES_DATA = {};
-        const RES_TYPES_UI = ['vless', 'vmess', 'trojan', 'shadowsocks', 'wireguard', 'hysteria2', 'tuic', 'custom'];
-        const RES_NAMES_UI = { vless: 'VLESS', vmess: 'VMess', trojan: 'Trojan', shadowsocks: 'Shadowsocks', wireguard: 'WireGuard', hysteria2: 'Hysteria2', tuic: 'TUIC', custom: 'Custom' };
-        function toggleResourcesModal(show) {
-            const modal = document.getElementById('resources-modal');
-            const card = modal.querySelector('div');
-            if (show) {
-                modal.classList.remove('opacity-0', 'pointer-events-none');
-                modal.classList.add('opacity-100', 'pointer-events-auto');
-                card.classList.remove('opacity-0', 'scale-95');
-                card.classList.add('opacity-100', 'scale-100');
-                loadResourcesData();
-            } else {
-                modal.classList.remove('opacity-100', 'pointer-events-auto');
-                modal.classList.add('opacity-0', 'pointer-events-none');
-                card.classList.remove('opacity-100', 'scale-100');
-                card.classList.add('opacity-0', 'scale-95');
-            }
-        }
-        async function loadResourcesData() {
-            const listEl = document.getElementById('res-list');
-            listEl.innerHTML = '<div class="text-center text-gray-400 text-[11px] p-3">در حال بارگذاری...</div>';
-            try {
-                const r = await fetch('/api/resources');
-                if (r.status === 401) { location.reload(); return; }
-                RES_DATA = await r.json();
-                renderResourcesList();
-            } catch (e) {
-                listEl.innerHTML = '<div class="text-center text-red-500 text-[11px] p-3">خطا در دریافت اطلاعات</div>';
-            }
-        }
-        function escHtml(s) {
-            return String(s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
-        }
-        function renderResourcesList() {
-            const c = document.getElementById('res-list');
-            c.innerHTML = RES_TYPES_UI.map(function(k) {
-                const items = RES_DATA[k] || [];
-                const bodyId = 'res-body-' + k;
-                let rows = '';
-                if (items.length === 0) {
-                    rows = '<div class="text-center text-gray-400 text-[11px] p-3">کانفیگی ثبت نشده</div>';
-                } else {
-                    rows = items.map(function(item, i) {
-                        const activeClass = item.e ? 'text-emerald-500' : 'text-gray-400';
-                        return '<div class="flex items-center justify-between gap-2 p-2 border-t border-gray-100 dark:border-zinc-800">' +
-                            '<div class="flex items-center gap-2 overflow-hidden flex-1">' +
-                                '<button onclick="toggleResourceLink(\'' + k + '\', ' + i + ')" class="' + activeClass + ' shrink-0" title="فعال/غیرفعال">' +
-                                    '<svg class="w-4 h-4" fill="currentColor" viewBox="0 0 20 20"><circle cx="10" cy="10" r="8"/></svg>' +
-                                '</button>' +
-                                '<span class="text-[10px] font-mono truncate" dir="ltr">' + escHtml(item.c) + '</span>' +
-                            '</div>' +
-                            '<div class="flex items-center gap-1 shrink-0">' +
-                                '<button onclick="editResourceLink(\'' + k + '\', ' + i + ')" class="p-1 text-amber-500 hover:bg-amber-50 dark:hover:bg-amber-900/20 rounded-lg" title="ویرایش">' +
-                                    '<svg class="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M11 5H6a2 2 0 00-2 2v11a2 2 0 002 2h11a2 2 0 002-2v-5m-1.414-9.414a2 2 0 112.828 2.828L11.828 15H9v-2.828l8.586-8.586z"></path></svg>' +
-                                '</button>' +
-                                '<button onclick="deleteResourceLink(\'' + k + '\', ' + i + ')" class="p-1 text-red-500 hover:bg-red-50 dark:hover:bg-red-900/20 rounded-lg" title="حذف">' +
-                                    '<svg class="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M19 7l-.867 12.142A2 2 0 0116.138 21H7.862a2 2 0 01-1.995-1.858L5 7m5 4v6m4-6v6m1-10V4a1 1 0 00-1-1h-4a1 1 0 00-1 1v3M4 7h16"></path></svg>' +
-                                '</button>' +
-                            '</div>' +
-                        '</div>';
-                    }).join('');
-                }
-                return '<div class="border border-gray-200 dark:border-zinc-800 rounded-2xl overflow-hidden">' +
-                    '<div class="flex items-center justify-between p-3 bg-gray-50 dark:bg-zinc-900/50 cursor-pointer" onclick="document.getElementById(\'' + bodyId + '\').classList.toggle(\'hidden\')">' +
-                        '<span class="text-xs font-bold text-gray-700 dark:text-zinc-300">' + RES_NAMES_UI[k] + ' <span class="text-[10px] text-gray-400">(' + items.length + ')</span></span>' +
-                        '<button onclick="event.stopPropagation(); copyResourceLink(\'' + k + '\')" class="text-[10px] px-2 py-1 bg-indigo-50 dark:bg-indigo-900/20 text-indigo-600 dark:text-indigo-400 rounded-lg font-bold">کپی لینک</button>' +
-                    '</div>' +
-                    '<div id="' + bodyId + '" class="hidden">' + rows + '</div>' +
-                '</div>';
-            }).join('');
-        }
-        async function addResourceLink() {
-            const input = document.getElementById('res-new-input');
-            if (!input.value.trim()) return;
-            try {
-                const r = await fetch('/api/resources/add', { method: 'POST', body: JSON.stringify({ content: input.value }) });
-                const d = await r.json();
-                if (r.ok) { input.value = ''; loadResourcesData(); }
-                else alert(d.error || 'خطا در افزودن کانفیگ');
-            } catch (e) { alert('خطا در ارتباط با سرور'); }
-        }
-        async function deleteResourceLink(type, index) {
-            if (!confirm('این کانفیگ حذف شود؟')) return;
-            try {
-                await fetch('/api/resources/del', { method: 'POST', body: JSON.stringify({ type: type, index: index }) });
-            } finally { loadResourcesData(); }
-        }
-        async function toggleResourceLink(type, index) {
-            try {
-                await fetch('/api/resources/toggle', { method: 'POST', body: JSON.stringify({ type: type, index: index }) });
-            } finally { loadResourcesData(); }
-        }
-        async function editResourceLink(type, index) {
-            const current = (RES_DATA[type] && RES_DATA[type][index]) ? RES_DATA[type][index].c : '';
-            const nc = prompt('ویرایش کانفیگ (نوع پروتکل باید همان قبلی بماند):', current);
-            if (nc === null || nc.trim() === '') return;
-            try {
-                const r = await fetch('/api/resources/edit', { method: 'POST', body: JSON.stringify({ type: type, index: index, newContent: nc }) });
-                const d = await r.json();
-                if (!r.ok) alert(d.error || 'خطا در ویرایش');
-            } finally { loadResourcesData(); }
-        }
-        function copyResourceLink(type) {
-            const link = window.location.origin + '/res/' + type;
-            navigator.clipboard.writeText(link).then(function() { alert('✅ لینک با موفقیت کپی شد!'); });
         }
         window.toggleFragInputs = function(show) {
             const container = document.getElementById('frag-inputs-container');
@@ -4901,7 +4289,7 @@ const HTML_TEMPLATES = {
                 const warningBtn = document.getElementById('cf-warning-btn');
                 if (cfRequests >= 90000) {
                     if (reqCard) {
-                        reqCard.className = "bg-red-50 dark:bg-red-950/20 border border-red-500 rounded-2xl p-3 shadow-[0_0_15px_rgba(239,68,68,0.4)] flex flex-col justify-center gap-1 transition duration-500 relative overflow-hidden group min-h-[68px] animate-pulse";
+                        reqCard.className = "bg-red-50 dark:bg-red-950/20 border border-red-500 rounded-2xl p-3 shadow-[0_0_15px_rgba(239,68,68,0.4)] flex flex-col justify-center gap-1 transition duration-300 relative overflow-hidden group min-h-[68px] animate-pulse";
                     }
                     if (warningBtn) {
                         warningBtn.classList.remove('hidden');
@@ -4912,7 +4300,7 @@ const HTML_TEMPLATES = {
                     }
                 } else {
                     if (reqCard) {
-                        reqCard.className = "bg-white/80 dark:bg-amoled-card/80 backdrop-blur-sm border border-gray-200 dark:border-amoled-border rounded-2xl p-3 shadow-md card-lift lk-card flex flex-col justify-center gap-1 hover:border-green-400 dark:hover:border-green-500/50 transition duration-500 relative overflow-hidden group min-h-[64px]";
+                        reqCard.className = "bg-white/80 dark:bg-amoled-card/80 backdrop-blur-sm border border-gray-200 dark:border-amoled-border rounded-2xl p-3 shadow-sm card-lift flex flex-col justify-center gap-1 hover:border-teal-400 dark:hover:border-teal-500/50 transition duration-300 relative overflow-hidden group min-h-[64px]";
                     }
                     if (warningBtn) {
                         warningBtn.classList.add('hidden');
@@ -5053,7 +4441,7 @@ const HTML_TEMPLATES = {
 					    reqHtml = '<div class="flex flex-col gap-1.5 w-full min-w-[65px] max-w-[90px] mx-auto select-none">' +
 					        '<div class="flex flex-row items-center justify-between text-[9px] text-gray-500 dark:text-gray-400 font-medium whitespace-nowrap">' +
 					            '<span class="text-gray-800 dark:text-zinc-200 leading-none font-bold" dir="ltr">' + usedReq.toLocaleString() + '</span>' +
-					            '<button onclick="resetUserData(\\'' + encodeURIComponent(user.username) + '\\', \\'req\\')" title="ریست" class="mx-1.5 w-3.5 h-3.5 flex items-center justify-center bg-amber-50 dark:bg-amber-900/30 text-amber-600 dark:text-amber-400 hover:bg-amber-100 dark:hover:bg-amber-900/50 rounded border border-amber-200 dark:border-amber-800 transition shadow-md cursor-pointer flex-shrink-0"><svg class="w-2.5 h-2.5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2.5" d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15"></path></svg></button>' +
+					            '<button onclick="resetUserData(\\'' + encodeURIComponent(user.username) + '\\', \\'req\\')" title="ریست" class="mx-1.5 w-3.5 h-3.5 flex items-center justify-center bg-amber-50 dark:bg-amber-900/30 text-amber-600 dark:text-amber-400 hover:bg-amber-100 dark:hover:bg-amber-900/50 rounded border border-amber-200 dark:border-amber-800 transition shadow-sm cursor-pointer flex-shrink-0"><svg class="w-2.5 h-2.5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2.5" d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15"></path></svg></button>' +
 					            '<span class="leading-none font-bold" dir="ltr">' + user.limit_req.toLocaleString() + '</span>' +
 					        '</div>' +
 					        '<div class="w-full h-1.5 bg-gray-200 dark:bg-zinc-700 rounded-full overflow-hidden">' +
@@ -5064,7 +4452,7 @@ const HTML_TEMPLATES = {
 					    reqHtml = '<div class="flex flex-col gap-1.5 w-full min-w-[65px] max-w-[90px] mx-auto select-none">' +
 					        '<div class="flex flex-row items-center justify-between text-[9px] text-gray-500 dark:text-gray-400 font-medium whitespace-nowrap">' +
 					            '<span class="text-gray-800 dark:text-zinc-200 leading-none font-bold" dir="ltr">' + usedReq.toLocaleString() + '</span>' +
-					            '<button onclick="resetUserData(\\'' + encodeURIComponent(user.username) + '\\', \\'req\\')" title="ریست" class="mx-1.5 w-3.5 h-3.5 flex items-center justify-center bg-amber-50 dark:bg-amber-900/30 text-amber-600 dark:text-amber-400 hover:bg-amber-100 dark:hover:bg-amber-900/50 rounded border border-amber-200 dark:border-amber-800 transition shadow-md cursor-pointer flex-shrink-0"><svg class="w-2.5 h-2.5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2.5" d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15"></path></svg></button>' +
+					            '<button onclick="resetUserData(\\'' + encodeURIComponent(user.username) + '\\', \\'req\\')" title="ریست" class="mx-1.5 w-3.5 h-3.5 flex items-center justify-center bg-amber-50 dark:bg-amber-900/30 text-amber-600 dark:text-amber-400 hover:bg-amber-100 dark:hover:bg-amber-900/50 rounded border border-amber-200 dark:border-amber-800 transition shadow-sm cursor-pointer flex-shrink-0"><svg class="w-2.5 h-2.5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2.5" d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15"></path></svg></button>' +
 					            '<span class="leading-none text-[12px] font-bold">∞</span>' +
 					        '</div>' +
 					        '<div class="w-full h-1.5 bg-gray-200 dark:bg-zinc-700 rounded-full overflow-hidden">' +
@@ -5081,7 +4469,7 @@ const HTML_TEMPLATES = {
 					    volumeHtml = '<div class="flex flex-col gap-1.5 w-full min-w-[65px] max-w-[90px] mx-auto select-none">' +
 					        '<div class="flex flex-row items-center justify-between text-[9px] text-gray-500 dark:text-gray-400 font-medium whitespace-nowrap">' +
 					            '<span class="text-gray-800 dark:text-zinc-200 leading-none font-bold" dir="ltr">' + formattedUsedClean + '</span>' +
-					            '<button onclick="resetUserData(\\'' + encodeURIComponent(user.username) + '\\', \\'volume\\')" title="ریست" class="mx-1.5 w-3.5 h-3.5 flex items-center justify-center bg-amber-50 dark:bg-amber-900/30 text-amber-600 dark:text-amber-400 hover:bg-amber-100 dark:hover:bg-amber-900/50 rounded border border-amber-200 dark:border-amber-800 transition shadow-md cursor-pointer flex-shrink-0"><svg class="w-2.5 h-2.5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2.5" d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15"></path></svg></button>' +
+					            '<button onclick="resetUserData(\\'' + encodeURIComponent(user.username) + '\\', \\'volume\\')" title="ریست" class="mx-1.5 w-3.5 h-3.5 flex items-center justify-center bg-amber-50 dark:bg-amber-900/30 text-amber-600 dark:text-amber-400 hover:bg-amber-100 dark:hover:bg-amber-900/50 rounded border border-amber-200 dark:border-amber-800 transition shadow-sm cursor-pointer flex-shrink-0"><svg class="w-2.5 h-2.5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2.5" d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15"></path></svg></button>' +
 					            '<span class="leading-none font-bold" dir="ltr">' + formattedLimit + '</span>' +
 					        '</div>' +
 					        '<div class="w-full h-1.5 bg-gray-200 dark:bg-zinc-700 rounded-full overflow-hidden">' +
@@ -5093,7 +4481,7 @@ const HTML_TEMPLATES = {
 					    volumeHtml = '<div class="flex flex-col gap-1.5 w-full min-w-[65px] max-w-[90px] mx-auto select-none">' +
 					        '<div class="flex flex-row items-center justify-between text-[9px] text-gray-500 dark:text-gray-400 font-medium whitespace-nowrap">' +
 					            '<span class="text-gray-800 dark:text-zinc-200 leading-none font-bold" dir="ltr">' + formattedUsedClean + '</span>' +
-					            '<button onclick="resetUserData(\\'' + encodeURIComponent(user.username) + '\\', \\'volume\\')" title="ریست" class="mx-1.5 w-3.5 h-3.5 flex items-center justify-center bg-amber-50 dark:bg-amber-900/30 text-amber-600 dark:text-amber-400 hover:bg-amber-100 dark:hover:bg-amber-900/50 rounded border border-amber-200 dark:border-amber-800 transition shadow-md cursor-pointer flex-shrink-0"><svg class="w-2.5 h-2.5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2.5" d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15"></path></svg></button>' +
+					            '<button onclick="resetUserData(\\'' + encodeURIComponent(user.username) + '\\', \\'volume\\')" title="ریست" class="mx-1.5 w-3.5 h-3.5 flex items-center justify-center bg-amber-50 dark:bg-amber-900/30 text-amber-600 dark:text-amber-400 hover:bg-amber-100 dark:hover:bg-amber-900/50 rounded border border-amber-200 dark:border-amber-800 transition shadow-sm cursor-pointer flex-shrink-0"><svg class="w-2.5 h-2.5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2.5" d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15"></path></svg></button>' +
 					            '<span class="leading-none text-[12px] font-bold">∞</span>' +
 					        '</div>' +
 					        '<div class="w-full h-1.5 bg-gray-200 dark:bg-zinc-700 rounded-full overflow-hidden">' +
@@ -5107,7 +4495,7 @@ const HTML_TEMPLATES = {
 					    expiryHtml = '<div class="flex flex-col gap-1.5 w-full min-w-[65px] max-w-[90px] mx-auto select-none">' +
 					        '<div class="flex flex-row items-center justify-between text-[9px] text-gray-500 dark:text-gray-400 font-medium whitespace-nowrap">' +
 					            '<span class="text-gray-800 dark:text-zinc-200 leading-none font-bold" dir="rtl">' + daysRemaining + ' روز</span>' +
-					            '<button onclick="resetUserData(\\'' + encodeURIComponent(user.username) + '\\', \\'time\\')" title="ریست" class="mx-1.5 w-3.5 h-3.5 flex items-center justify-center bg-amber-50 dark:bg-amber-900/30 text-amber-600 dark:text-amber-400 hover:bg-amber-100 dark:hover:bg-amber-900/50 rounded border border-amber-200 dark:border-amber-800 transition shadow-md cursor-pointer flex-shrink-0"><svg class="w-2.5 h-2.5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2.5" d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15"></path></svg></button>' +
+					            '<button onclick="resetUserData(\\'' + encodeURIComponent(user.username) + '\\', \\'time\\')" title="ریست" class="mx-1.5 w-3.5 h-3.5 flex items-center justify-center bg-amber-50 dark:bg-amber-900/30 text-amber-600 dark:text-amber-400 hover:bg-amber-100 dark:hover:bg-amber-900/50 rounded border border-amber-200 dark:border-amber-800 transition shadow-sm cursor-pointer flex-shrink-0"><svg class="w-2.5 h-2.5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2.5" d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15"></path></svg></button>' +
 					            '<span class="leading-none font-bold" dir="rtl">' + user.expiry_days + ' روز</span>' +
 					        '</div>' +
 					        '<div class="w-full h-1.5 bg-gray-200 dark:bg-zinc-700 rounded-full overflow-hidden flex justify-end">' +
@@ -5118,7 +4506,7 @@ const HTML_TEMPLATES = {
 					    expiryHtml = '<div class="flex flex-col gap-1.5 w-full min-w-[65px] max-w-[90px] mx-auto select-none">' +
 					        '<div class="flex flex-row items-center justify-between text-[9px] text-gray-500 dark:text-gray-400 font-medium whitespace-nowrap">' +
 					            '<span class="text-gray-800 dark:text-zinc-200 leading-none font-bold text-[12px]">∞</span>' +
-					            '<button onclick="resetUserData(\\'' + encodeURIComponent(user.username) + '\\', \\'time\\')" title="ریست" class="mx-1.5 w-3.5 h-3.5 flex items-center justify-center bg-amber-50 dark:bg-amber-900/30 text-amber-600 dark:text-amber-400 hover:bg-amber-100 dark:hover:bg-amber-900/50 rounded border border-amber-200 dark:border-amber-800 transition shadow-md cursor-pointer flex-shrink-0"><svg class="w-2.5 h-2.5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2.5" d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15"></path></svg></button>' +
+					            '<button onclick="resetUserData(\\'' + encodeURIComponent(user.username) + '\\', \\'time\\')" title="ریست" class="mx-1.5 w-3.5 h-3.5 flex items-center justify-center bg-amber-50 dark:bg-amber-900/30 text-amber-600 dark:text-amber-400 hover:bg-amber-100 dark:hover:bg-amber-900/50 rounded border border-amber-200 dark:border-amber-800 transition shadow-sm cursor-pointer flex-shrink-0"><svg class="w-2.5 h-2.5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2.5" d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15"></path></svg></button>' +
 					            '<span class="leading-none text-[12px] font-bold">∞</span>' +
 					        '</div>' +
 					        '<div class="w-full h-1.5 bg-gray-200 dark:bg-zinc-700 rounded-full overflow-hidden">' +
@@ -5186,7 +4574,7 @@ const HTML_TEMPLATES = {
 
                     return '<tr class="hover:bg-gray-50 dark:hover:bg-zinc-900/40 border-b border-gray-100 dark:border-zinc-800 last:border-0">' +
                             '<td class="p-1 border-r border-gray-100 dark:border-zinc-800 text-center select-none">' +
-                                '<input type="checkbox" name="select-user" value="' + encodeURIComponent(user.username) + '" onchange="onUserSelectChange(this)" ' + isChecked + ' class="w-4 h-4 rounded-lg border-2 border-gray-300 dark:border-zinc-700 text-indigo-600 bg-white dark:bg-zinc-800 checked:bg-indigo-600 checked:border-indigo-600 focus:ring-indigo-500/50 focus:ring-offset-0 transition-all duration-300 cursor-pointer hover:scale-105 active:scale-95">' +
+                                '<input type="checkbox" name="select-user" value="' + encodeURIComponent(user.username) + '" onchange="onUserSelectChange(this)" ' + isChecked + ' class="w-4 h-4 rounded-md border-2 border-gray-300 dark:border-zinc-700 text-indigo-600 bg-white dark:bg-zinc-800 checked:bg-indigo-600 checked:border-indigo-600 focus:ring-indigo-500/50 focus:ring-offset-0 transition-all duration-200 cursor-pointer hover:scale-105 active:scale-95">' +
                             '</td>' +
                             '<td class="p-1.5 border-r border-gray-100 dark:border-zinc-800 text-center">' +
                                 '<div class="flex flex-col items-center justify-center gap-1 min-w-[70px] max-w-[100px] mx-auto select-none">' +
@@ -5200,15 +4588,15 @@ const HTML_TEMPLATES = {
                             '</td>' +
                             '<td class="p-1.5 border-r border-gray-100 dark:border-zinc-800 text-center">' +
                                 '<div class="grid grid-cols-2 gap-1 w-max mx-auto">' +
-                                    '<button onclick="copyConfig(\\'' + encodeURIComponent(user.username) + '\\')" title="کپی کانفیگ" class="p-1 flex items-center justify-center bg-white dark:bg-zinc-800 border border-gray-200 dark:border-zinc-700 hover:bg-indigo-50 dark:hover:bg-indigo-900/30 text-indigo-600 dark:text-indigo-400 rounded transition shadow-md"><svg class="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M8 16H6a2 2 0 01-2-2V6a2 2 0 012-2h8a2 2 0 012 2v2m-6 12h8a2 2 0 002-2v-8a2 2 0 00-2-2h-8a2 2 0 00-2 2v8a2 2 0 002 2z"></path></svg></button>' +
-                                    '<button onclick="editUser(\\'' + encodeURIComponent(user.username) + '\\')" title="ویرایش" class="p-1 flex items-center justify-center bg-white dark:bg-zinc-800 border border-gray-200 dark:border-zinc-700 hover:bg-yellow-50 dark:hover:bg-yellow-900/30 text-yellow-600 dark:text-yellow-400 rounded transition shadow-md"><svg class="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M11 5H6a2 2 0 00-2 2v11a2 2 0 002 2h11a2 2 0 002-2v-5m-1.414-9.414a2 2 0 112.828 2.828L11.828 15H9v-2.828l8.586-8.586z"></path></svg></button>' +
-                                    '<button onclick="deleteUser(\\'' + encodeURIComponent(user.username) + '\\')" title="حذف" class="p-1 flex items-center justify-center bg-white dark:bg-zinc-800 border border-gray-200 dark:border-zinc-700 hover:bg-red-50 dark:hover:bg-red-950/20 text-red-600 dark:text-red-400 rounded transition shadow-md"><svg class="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M19 7l-.867 12.142A2 2 0 0116.138 21H7.862a2 2 0 01-1.995-1.858L5 7m5 4v6m4-6v6m1-10V4a1 1 0 00-1-1h-4a1 1 0 00-1 1v3M4 7h16"></path></svg></button>' +
-                                    '<button onclick="toggleUserStatus(\\'' + encodeURIComponent(user.username) + '\\')" title="' + statusBtnTitle + '" class="p-1 flex items-center justify-center bg-white dark:bg-zinc-800 border border-gray-200 dark:border-zinc-700 ' + statusBtnColor + ' rounded transition shadow-md">' + statusBtnIcon + '</button>' +
+                                    '<button onclick="copyConfig(\\'' + encodeURIComponent(user.username) + '\\')" title="کپی کانفیگ" class="p-1 flex items-center justify-center bg-white dark:bg-zinc-800 border border-gray-200 dark:border-zinc-700 hover:bg-indigo-50 dark:hover:bg-indigo-900/30 text-indigo-600 dark:text-indigo-400 rounded transition shadow-sm"><svg class="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M8 16H6a2 2 0 01-2-2V6a2 2 0 012-2h8a2 2 0 012 2v2m-6 12h8a2 2 0 002-2v-8a2 2 0 00-2-2h-8a2 2 0 00-2 2v8a2 2 0 002 2z"></path></svg></button>' +
+                                    '<button onclick="editUser(\\'' + encodeURIComponent(user.username) + '\\')" title="ویرایش" class="p-1 flex items-center justify-center bg-white dark:bg-zinc-800 border border-gray-200 dark:border-zinc-700 hover:bg-yellow-50 dark:hover:bg-yellow-900/30 text-yellow-600 dark:text-yellow-400 rounded transition shadow-sm"><svg class="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M11 5H6a2 2 0 00-2 2v11a2 2 0 002 2h11a2 2 0 002-2v-5m-1.414-9.414a2 2 0 112.828 2.828L11.828 15H9v-2.828l8.586-8.586z"></path></svg></button>' +
+                                    '<button onclick="deleteUser(\\'' + encodeURIComponent(user.username) + '\\')" title="حذف" class="p-1 flex items-center justify-center bg-white dark:bg-zinc-800 border border-gray-200 dark:border-zinc-700 hover:bg-red-50 dark:hover:bg-red-950/20 text-red-600 dark:text-red-400 rounded transition shadow-sm"><svg class="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M19 7l-.867 12.142A2 2 0 0116.138 21H7.862a2 2 0 01-1.995-1.858L5 7m5 4v6m4-6v6m1-10V4a1 1 0 00-1-1h-4a1 1 0 00-1 1v3M4 7h16"></path></svg></button>' +
+                                    '<button onclick="toggleUserStatus(\\'' + encodeURIComponent(user.username) + '\\')" title="' + statusBtnTitle + '" class="p-1 flex items-center justify-center bg-white dark:bg-zinc-800 border border-gray-200 dark:border-zinc-700 ' + statusBtnColor + ' rounded transition shadow-sm">' + statusBtnIcon + '</button>' +
                                 '</div>' +
                             '</td>' +
                             '<td class="p-1 border-r border-gray-100 dark:border-zinc-800">' +
 							    '<div class="flex flex-col gap-0.5 w-[90px] mx-auto">' +
-							        '<button onclick="copySubLink(\\'' + encodeURIComponent(user.username) + '\\')" class="w-full flex items-center justify-center gap-1 px-1 py-0.5 bg-indigo-50 dark:bg-indigo-900/30 text-indigo-600 dark:text-indigo-400 hover:bg-indigo-100 dark:hover:bg-indigo-900/50 rounded text-[9px] font-bold transition border border-indigo-200 dark:border-indigo-800">' +
+							        '<button onclick="copySubLink(\\'' + encodeURIComponent(user.username) + '\\')" class="w-full flex items-center justify-center gap-1 px-1 py-0.5 bg-purple-50 dark:bg-purple-900/30 text-purple-600 dark:text-purple-400 hover:bg-purple-100 dark:hover:bg-purple-900/50 rounded text-[9px] font-bold transition border border-purple-200 dark:border-purple-800">' +
 							            '<svg class="w-3 h-3" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M13.828 10.172a4 4 0 00-5.656 0l-4 4a4 4 0 105.656 5.656l1.102-1.101m-.758-4.899a4 4 0 005.656 0l4-4a4 4 0 00-5.656-5.656l-1.1 1.1"></path></svg>' +
 							            'ساب متنی' +
 							        '</button>' +
@@ -6409,7 +5797,6 @@ document.addEventListener('DOMContentLoaded', () => {
                 if (e.target.id === 'user-modal') toggleModal(false);
                 if (e.target.id === 'ip-selector-modal') toggleIpSelectorModal(false);
                 if (e.target.id === 'settings-modal') toggleSettingsModal(false);
-                if (e.target.id === 'resources-modal') toggleResourcesModal(false);
                 if (e.target.id === 'update-modal') toggleUpdateModal(false);
                 if (e.target.id === 'token-modal') toggleTokenModal(false);
                 if (e.target.id === 'qr-modal') toggleQrModal(false);
@@ -6746,7 +6133,7 @@ window.addEventListener('click', (e) => {
 </body>
 </html>`,
 	status: `<!DOCTYPE html>
-<html lang="fa" dir="rtl" class="dark">
+<html lang="fa" dir="rtl">
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
@@ -6760,91 +6147,13 @@ window.addEventListener('click', (e) => {
             theme: {
                 extend: {
                     fontFamily: { sans: ['Vazirmatn', 'sans-serif'] },
-                    colors: {
-                        amoled: { bg: '#0a0a12', card: '#131320', input: '#181826', border: '#26263b' },
-                        brand: { primary: '#4F46E5', accent: '#22C55E', danger: '#EF4444' }
-                    },
-                    boxShadow: {
-                        glow: '0 8px 30px -8px rgba(79,70,229,0.35)',
-                        card: '0 1px 2px rgba(0,0,0,0.04), 0 8px 24px -12px rgba(15,23,42,0.12)'
-                    }
+                    colors: { amoled: { bg: '#0a0612', card: '#120c1f', input: '#170f28', border: '#2c1f45' } }
                 }
             }
         }
     </script>
     <style>
-        /* ===== LowKey Premium UI Kit ===== */
-        :root{
-            --lk-primary:#4F46E5; --lk-primary-light:#6366F1; --lk-primary-dark:#4338CA;
-            --lk-accent:#22C55E; --lk-danger:#EF4444; --lk-warning:#F59E0B;
-        }
-        .lk-glass{
-            background:rgba(255,255,255,.72); backdrop-filter:blur(16px) saturate(160%);
-            -webkit-backdrop-filter:blur(16px) saturate(160%);
-            border:1px solid rgba(148,163,184,.18);
-        }
-        .dark .lk-glass{ background:rgba(19,19,32,.62); border-color:rgba(148,163,184,.10); }
-        .lk-fade-in{ opacity:0; transform:translateY(10px); animation:lkFadeIn .5s cubic-bezier(.16,1,.3,1) forwards; }
-        @keyframes lkFadeIn{ to{ opacity:1; transform:translateY(0); } }
-        .lk-stagger > *{ opacity:0; transform:translateY(8px); animation:lkFadeIn .45s cubic-bezier(.16,1,.3,1) forwards; }
-        .lk-stagger > *:nth-child(1){ animation-delay:.02s } .lk-stagger > *:nth-child(2){ animation-delay:.06s }
-        .lk-stagger > *:nth-child(3){ animation-delay:.10s } .lk-stagger > *:nth-child(4){ animation-delay:.14s }
-        .lk-stagger > *:nth-child(5){ animation-delay:.18s } .lk-stagger > *:nth-child(6){ animation-delay:.22s }
-        .lk-stagger > *:nth-child(n+7){ animation-delay:.26s }
-        .lk-skeleton{
-            position:relative; overflow:hidden; background:#e5e7eb; border-radius:.5rem;
-            background-image:linear-gradient(90deg, rgba(255,255,255,0) 0, rgba(255,255,255,.55) 20%, rgba(255,255,255,0) 40%);
-            background-size:200% 100%; animation:lkShimmer 1.4s ease-in-out infinite;
-        }
-        .dark .lk-skeleton{ background:#1c1c2e; background-image:linear-gradient(90deg, rgba(255,255,255,0) 0, rgba(255,255,255,.06) 20%, rgba(255,255,255,0) 40%); background-size:200% 100%; }
-        @keyframes lkShimmer{ 0%{ background-position:150% 0 } 100%{ background-position:-50% 0 } }
-        .lk-btn{
-            display:inline-flex; align-items:center; justify-content:center; gap:.4rem;
-            font-weight:600; border-radius:.85rem; padding:.55rem 1.1rem; font-size:.85rem;
-            transition:transform .15s ease, box-shadow .2s ease, filter .2s ease, background-color .2s ease;
-            border:1px solid transparent; white-space:nowrap;
-        }
-        .lk-btn:active{ transform:scale(.96); }
-        .lk-btn-primary{ background:linear-gradient(135deg, var(--lk-primary-light), var(--lk-primary)); color:#fff; box-shadow:0 6px 18px -6px rgba(79,70,229,.55); }
-        .lk-btn-primary:hover{ filter:brightness(1.08); box-shadow:0 10px 24px -6px rgba(79,70,229,.6); }
-        .lk-btn-accent{ background:linear-gradient(135deg, #34D399, var(--lk-accent)); color:#fff; box-shadow:0 6px 18px -6px rgba(34,197,94,.5); }
-        .lk-btn-accent:hover{ filter:brightness(1.08); }
-        .lk-btn-danger{ background:linear-gradient(135deg, #F87171, var(--lk-danger)); color:#fff; box-shadow:0 6px 18px -6px rgba(239,68,68,.5); }
-        .lk-btn-danger:hover{ filter:brightness(1.08); }
-        .lk-btn-ghost{ background:rgba(148,163,184,.12); color:inherit; }
-        .lk-btn-ghost:hover{ background:rgba(148,163,184,.22); }
-        .lk-card{
-            border-radius:1.1rem; border:1px solid rgba(148,163,184,.16);
-            box-shadow:0 1px 2px rgba(15,23,42,.04), 0 10px 28px -14px rgba(15,23,42,.14);
-            transition:transform .25s cubic-bezier(.16,1,.3,1), box-shadow .25s ease, border-color .25s ease;
-        }
-        .lk-card:hover{ transform:translateY(-3px); box-shadow:0 18px 36px -16px rgba(79,70,229,.30); border-color:rgba(79,70,229,.35); }
-        .lk-badge{
-            display:inline-flex; align-items:center; gap:.3rem; font-size:.68rem; font-weight:700;
-            padding:.22rem .6rem; border-radius:999px; letter-spacing:.01em; line-height:1.4;
-        }
-        .lk-badge-dot{ width:6px; height:6px; border-radius:999px; flex-shrink:0; }
-        .lk-badge-success{ background:rgba(34,197,94,.12); color:#16A34A; }
-        .dark .lk-badge-success{ background:rgba(34,197,94,.14); color:#4ADE80; }
-        .lk-badge-danger{ background:rgba(239,68,68,.12); color:#DC2626; }
-        .dark .lk-badge-danger{ background:rgba(239,68,68,.14); color:#F87171; }
-        .lk-badge-warning{ background:rgba(245,158,11,.14); color:#B45309; }
-        .dark .lk-badge-warning{ background:rgba(245,158,11,.16); color:#FBBF24; }
-        .lk-badge-neutral{ background:rgba(148,163,184,.16); color:#475569; }
-        .dark .lk-badge-neutral{ background:rgba(148,163,184,.14); color:#CBD5E1; }
-        .lk-modal-backdrop{ backdrop-filter:blur(6px); -webkit-backdrop-filter:blur(6px); animation:lkFadeIn .2s ease forwards; }
-        .lk-modal-panel{ animation:lkModalIn .28s cubic-bezier(.16,1,.3,1) forwards; }
-        @keyframes lkModalIn{ from{ opacity:0; transform:translateY(14px) scale(.97) } to{ opacity:1; transform:translateY(0) scale(1) } }
-        table.lk-table tbody tr{ transition:background-color .15s ease; }
-        table.lk-table tbody tr:hover{ background:rgba(79,70,229,.05); }
-        .dark table.lk-table tbody tr:hover{ background:rgba(99,102,241,.08); }
-        input:focus, select:focus, textarea:focus{ outline:none; box-shadow:0 0 0 3px rgba(79,70,229,.18); border-color:var(--lk-primary) !important; }
-        ::selection{ background:rgba(79,70,229,.25); }
-        @media (prefers-reduced-motion: reduce){
-            .lk-fade-in, .lk-stagger > *, .lk-skeleton, .lk-modal-panel{ animation:none !important; opacity:1 !important; transform:none !important; }
-        }
-
-        :root { --brand-1: #4F46E5; --brand-2: #6366F1; --brand-3: #22C55E; }
+        :root { --brand-1: #4f46e5; --brand-2: #7c3aed; --brand-3: #14b8a6; }
         body { font-family: 'Vazirmatn', sans-serif; }
         .glass {
             background: rgba(10, 10, 10, 0.6);
@@ -6854,45 +6163,42 @@ window.addEventListener('click', (e) => {
         }
         .brand-bar { height: 3px; background: linear-gradient(90deg, var(--brand-2), var(--brand-1), var(--brand-3)); }
         .btn-shine { position: relative; overflow: hidden; }
-        .btn-shine::after {
-            content: ''; position: absolute; inset: 0; background: linear-gradient(120deg, transparent 30%, rgba(255,255,255,0.28) 50%, transparent 70%);
-            transform: translateX(-100%); transition: transform 0.6s ease;
-        }
+        .btn-shine::after { display: none; }
         .btn-shine:hover::after { transform: translateX(100%); }
         ::-webkit-scrollbar { width: 6px; height: 6px; }
         ::-webkit-scrollbar-track { background: #f1f0fb; border-radius: 4px; }
         ::-webkit-scrollbar-thumb { background: linear-gradient(180deg, var(--brand-2), var(--brand-3)); border-radius: 4px; }
         ::-webkit-scrollbar-thumb:hover { background: var(--brand-1); }
         .dark ::-webkit-scrollbar-track { background: #0d0a17; }
-        .dark ::-webkit-scrollbar-thumb { background: linear-gradient(180deg, #6366F1, #22C55E); }
-        * { scrollbar-width: thin; scrollbar-color: #6366F1 #f1f0fb; }
-        .dark * { scrollbar-color: #4F46E5 #0d0a17; }
+        .dark ::-webkit-scrollbar-thumb { background: linear-gradient(180deg, #4f46e5, #0d9488); }
+        * { scrollbar-width: thin; scrollbar-color: #7c3aed #f1f0fb; }
+        .dark * { scrollbar-color: #4f46e5 #0d0a17; }
     </style>
 </head>
 <body class="bg-gray-50 text-gray-900 dark:bg-amoled-bg dark:text-zinc-100 min-h-screen flex flex-col items-center py-12 px-4 overflow-x-hidden">
     <div class="w-full max-w-xl glass rounded-3xl shadow-2xl p-6 md:p-8 relative overflow-hidden">
         <div class="brand-bar w-full absolute top-0 left-0 rounded-t-3xl"></div>
-        <div class="absolute -left-16 -top-16 w-48 h-48 bg-green-500/10 rounded-full blur-3xl pointer-events-none"></div>
+        <div class="absolute -left-16 -top-16 w-48 h-48 bg-teal-500/10 rounded-full blur-3xl pointer-events-none"></div>
         <div class="absolute -right-16 -bottom-16 w-48 h-48 bg-indigo-500/10 rounded-full blur-3xl pointer-events-none"></div>
         <div class="text-center mb-8 relative z-10">
-            <div class="inline-flex items-center justify-center p-3.5 bg-gradient-to-br from-indigo-950/80 to-green-950/60 border border-indigo-500/60 text-green-400 rounded-full mb-4 shadow-[0_0_20px_rgba(45,212,191,0.35)]">
-                <svg class="w-8 h-8 text-green-400" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 12.75L11.25 15 15 9.75M21 12c0 1.268-.63 2.39-1.593 3.068a3.745 3.745 0 01-1.043 3.296 3.745 3.745 0 01-3.296 1.043A3.745 3.745 0 0112 21c-1.268 0-2.39-.63-3.068-1.593a3.746 3.746 0 01-3.296-1.043 3.745 3.745 0 01-1.043-3.296A3.745 3.745 0 013 12c0-1.268.63-2.39 1.593-3.068a3.745 3.745 0 011.043-3.296 3.746 3.746 0 013.296-1.043A3.746 3.746 0 0112 3c1.268 0 2.39.63 3.068 1.593a3.746 3.746 0 013.296 1.043 3.746 3.746 0 011.043 3.296A3.745 3.745 0 0121 12z"></path></svg>
+            <div class="inline-flex items-center justify-center p-3.5 bg-gradient-to-br from-indigo-950/80 to-teal-950/60 border border-indigo-500/60 text-teal-400 rounded-full mb-4 shadow-[0_0_20px_rgba(45,212,191,0.35)]">
+                <svg class="w-8 h-8 text-teal-400" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 12.75L11.25 15 15 9.75M21 12c0 1.268-.63 2.39-1.593 3.068a3.745 3.745 0 01-1.043 3.296 3.745 3.745 0 01-3.296 1.043A3.745 3.745 0 0112 21c-1.268 0-2.39-.63-3.068-1.593a3.746 3.746 0 01-3.296-1.043 3.745 3.745 0 01-1.043-3.296A3.745 3.745 0 013 12c0-1.268.63-2.39 1.593-3.068a3.745 3.745 0 011.043-3.296 3.746 3.746 0 013.296-1.043A3.746 3.746 0 0112 3c1.268 0 2.39.63 3.068 1.593a3.746 3.746 0 013.296 1.043 3.746 3.746 0 011.043 3.296A3.745 3.745 0 0121 12z"></path></svg>
             </div>
             <h1 class="text-xl font-bold tracking-tight text-gray-900 dark:text-white mb-1">وضعیت اشتراک</h1>
-            <p id="display-username" class="text-sm font-bold text-green-500 tracking-wide font-mono mb-2"></p>
+            <p id="display-username" class="text-sm font-bold text-teal-500 tracking-wide font-mono mb-2"></p>
             <div id="live-connections-badge" style="display: none !important;">
                 <span class="w-2 h-2 rounded-full bg-green-600 animate-pulse"></span>
                 <span id="live-connections-text" dir="rtl">۰ دستگاه متصل</span>
             </div>
         </div>
-        <div id="status-card" class="mb-6 rounded-2xl p-4 text-center border font-bold relative z-10 transition duration-500">
+        <div id="status-card" class="mb-6 rounded-2xl p-4 text-center border font-bold relative z-10 transition duration-300">
             <span id="status-text" class="text-sm">در حال بارگذاری وضعیت...</span>
         </div>
         <div class="grid grid-cols-2 gap-3 mb-8 relative z-10">
-            <div class="bg-white/60 dark:bg-zinc-900/40 border border-gray-200 dark:border-amoled-border rounded-2xl p-3.5 shadow-md flex flex-col justify-between hover:border-indigo-400/60 dark:hover:border-indigo-500/50 transition-colors">
+            <div class="bg-white/60 dark:bg-zinc-900/40 border border-gray-200 dark:border-amoled-border rounded-2xl p-3.5 shadow-sm flex flex-col justify-between hover:border-indigo-400/60 dark:hover:border-indigo-500/50 transition-colors">
                 <div class="flex justify-between items-center mb-2.5">
                     <span class="text-[10px] font-bold text-gray-600 dark:text-zinc-400 flex items-center gap-1.5">
-                        <span class="w-6 h-6 rounded-xl bg-indigo-100 dark:bg-indigo-900/40 flex items-center justify-center text-indigo-500 shrink-0">
+                        <span class="w-6 h-6 rounded-lg bg-indigo-100 dark:bg-indigo-900/40 flex items-center justify-center text-indigo-500 shrink-0">
                             <svg class="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M19 11H5m14 0a2 2 0 012 2v6a2 2 0 01-2 2H5a2 2 0 01-2-2v-6a2 2 0 012-2m14 0V9a2 2 0 00-2-2M5 11V9a2 2 0 012-2m0 0V5a2 2 0 012-2h6a2 2 0 012 2v2M7 7h10"></path></svg>
                         </span>
                         حجم مصرفی
@@ -6908,10 +6214,10 @@ window.addEventListener('click', (e) => {
                 </div>
             </div>
             
-            <div class="bg-white/60 dark:bg-zinc-900/40 border border-gray-200 dark:border-amoled-border rounded-2xl p-3.5 shadow-md flex flex-col justify-between hover:border-indigo-400/60 dark:hover:border-indigo-500/50 transition-colors">
+            <div class="bg-white/60 dark:bg-zinc-900/40 border border-gray-200 dark:border-amoled-border rounded-2xl p-3.5 shadow-sm flex flex-col justify-between hover:border-sky-400/60 dark:hover:border-sky-500/50 transition-colors">
                 <div class="flex justify-between items-center mb-2.5">
                     <span class="text-[10px] font-bold text-gray-600 dark:text-zinc-400 flex items-center gap-1.5">
-                        <span class="w-6 h-6 rounded-xl bg-indigo-100 dark:bg-indigo-900/40 flex items-center justify-center text-indigo-500 shrink-0">
+                        <span class="w-6 h-6 rounded-lg bg-sky-100 dark:bg-sky-900/40 flex items-center justify-center text-sky-500 shrink-0">
                             <svg class="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 8v4l3 3m6-3a9 9 0 11-18 0 9 9 0 0118 0z"></path></svg>
                         </span>
                         زمان باقی‌مانده
@@ -6927,10 +6233,10 @@ window.addEventListener('click', (e) => {
                 </div>
             </div>
 
-            <div class="bg-white/60 dark:bg-zinc-900/40 border border-gray-200 dark:border-amoled-border rounded-2xl p-3.5 shadow-md flex flex-col justify-between hover:border-green-400/60 dark:hover:border-green-500/50 transition-colors">
+            <div class="bg-white/60 dark:bg-zinc-900/40 border border-gray-200 dark:border-amoled-border rounded-2xl p-3.5 shadow-sm flex flex-col justify-between hover:border-teal-400/60 dark:hover:border-teal-500/50 transition-colors">
                 <div class="flex justify-between items-center mb-2.5">
                     <span class="text-[10px] font-bold text-gray-600 dark:text-zinc-400 flex items-center gap-1.5">
-                        <span class="w-6 h-6 rounded-xl bg-green-100 dark:bg-green-900/40 flex items-center justify-center text-green-600 shrink-0">
+                        <span class="w-6 h-6 rounded-lg bg-teal-100 dark:bg-teal-900/40 flex items-center justify-center text-teal-600 shrink-0">
                             <svg class="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M13 10V3L4 14h7v7l9-11h-7z"></path></svg>
                         </span>
                         ریکوئست‌ها
@@ -6946,10 +6252,10 @@ window.addEventListener('click', (e) => {
                 </div>
             </div>
 
-            <div class="bg-white/60 dark:bg-zinc-900/40 border border-gray-200 dark:border-amoled-border rounded-2xl p-3.5 shadow-md flex flex-col justify-between hover:border-indigo-400/60 dark:hover:border-indigo-500/50 transition-colors">
+            <div class="bg-white/60 dark:bg-zinc-900/40 border border-gray-200 dark:border-amoled-border rounded-2xl p-3.5 shadow-sm flex flex-col justify-between hover:border-purple-400/60 dark:hover:border-purple-500/50 transition-colors">
                 <div class="flex justify-between items-center mb-2.5">
                     <span class="text-[10px] font-bold text-gray-600 dark:text-zinc-400 flex items-center gap-1.5">
-                        <span class="w-6 h-6 rounded-xl bg-indigo-100 dark:bg-indigo-900/40 flex items-center justify-center text-indigo-500 shrink-0">
+                        <span class="w-6 h-6 rounded-lg bg-purple-100 dark:bg-purple-900/40 flex items-center justify-center text-purple-500 shrink-0">
                             <svg class="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M17 20h5v-2a3 3 0 00-5.356-1.857M17 20H7m10 0v-2c0-.656-.126-1.283-.356-1.857M7 20H2v-2a3 3 0 015.356-1.857M7 20v-2c0-.656.126-1.283.356-1.857m0 0a5.002 5.002 0 019.288 0M15 7a3 3 0 11-6 0 3 3 0 016 0zm6 3a2 2 0 11-4 0 2 2 0 014 0zM7 10a2 2 0 11-4 0 2 2 0 014 0z"></path></svg>
                         </span>
                         دستگاه متصل
@@ -6967,44 +6273,44 @@ window.addEventListener('click', (e) => {
         </div>
         <div class="border-t border-gray-100 dark:border-zinc-800 pt-6 relative z-10">
             <h2 class="text-sm font-bold mb-4 flex items-center gap-2">
-                <span class="w-7 h-7 rounded-xl bg-gradient-to-br from-indigo-600 to-green-500 flex items-center justify-center text-white shrink-0">
+                <span class="w-7 h-7 rounded-lg bg-gradient-to-br from-indigo-600 to-teal-500 flex items-center justify-center text-white shrink-0">
                     <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M8 16H6a2 2 0 01-2-2V6a2 2 0 012-2h8a2 2 0 012 2v2m-6 12h8a2 2 0 002-2v-8a2 2 0 00-2-2h-8a2 2 0 00-2 2v8a2 2 0 002 2z"></path></svg>
                 </span>
                 دریافت کانفیگ و اشتراک‌ها
             </h2>
             <div class="space-y-2.5">
-                <button onclick="copyTextSub()" class="w-full flex justify-between items-center px-4 py-3.5 bg-white dark:bg-amoled-card border border-gray-200 dark:border-amoled-border hover:border-indigo-500 dark:hover:border-indigo-500 rounded-2xl text-xs font-bold transition shadow-md hover:shadow-lg">
-                    <span class="flex items-center gap-2.5"><span class="w-7 h-7 rounded-xl bg-indigo-100 dark:bg-indigo-900/40 flex items-center justify-center shrink-0">⛓️</span> کپی لینک ساب‌اسکریپشن متنی</span>
-                    <span class="text-indigo-500 bg-indigo-50 dark:bg-indigo-950/40 px-2.5 py-1 rounded-xl">کپی</span>
+                <button onclick="copyTextSub()" class="w-full flex justify-between items-center px-4 py-3.5 bg-white dark:bg-amoled-card border border-gray-200 dark:border-amoled-border hover:border-purple-500 dark:hover:border-purple-500 rounded-2xl text-xs font-bold transition shadow-sm hover:shadow-md">
+                    <span class="flex items-center gap-2.5"><span class="w-7 h-7 rounded-lg bg-purple-100 dark:bg-purple-900/40 flex items-center justify-center shrink-0">⛓️</span> کپی لینک ساب‌اسکریپشن متنی</span>
+                    <span class="text-purple-500 bg-purple-50 dark:bg-purple-950/40 px-2.5 py-1 rounded-lg">کپی</span>
                 </button>
-				<button onclick="showSubQr()" class="w-full flex justify-between items-center px-4 py-3.5 bg-white dark:bg-amoled-card border border-gray-200 dark:border-amoled-border hover:border-amber-500 dark:hover:border-amber-500 rounded-2xl text-xs font-bold transition shadow-md hover:shadow-lg">
-                    <span class="flex items-center gap-2.5"><span class="w-7 h-7 rounded-xl bg-amber-100 dark:bg-amber-900/40 flex items-center justify-center shrink-0">📱</span> دریافت کیوآر کد ساب</span>
-                    <span class="text-amber-500 bg-amber-50 dark:bg-amber-950/40 px-2.5 py-1 rounded-xl">نمایش</span>
+				<button onclick="showSubQr()" class="w-full flex justify-between items-center px-4 py-3.5 bg-white dark:bg-amoled-card border border-gray-200 dark:border-amoled-border hover:border-amber-500 dark:hover:border-amber-500 rounded-2xl text-xs font-bold transition shadow-sm hover:shadow-md">
+                    <span class="flex items-center gap-2.5"><span class="w-7 h-7 rounded-lg bg-amber-100 dark:bg-amber-900/40 flex items-center justify-center shrink-0">📱</span> دریافت کیوآر کد ساب</span>
+                    <span class="text-amber-500 bg-amber-50 dark:bg-amber-950/40 px-2.5 py-1 rounded-lg">نمایش</span>
                 </button>
-                <button onclick="copyVlessConfig()" class="w-full flex justify-between items-center px-4 py-3.5 bg-white dark:bg-amoled-card border border-gray-200 dark:border-amoled-border hover:border-indigo-500 dark:hover:border-indigo-500 rounded-2xl text-xs font-bold transition shadow-md hover:shadow-lg">
-                    <span class="flex items-center gap-2.5"><span class="w-7 h-7 rounded-xl bg-indigo-100 dark:bg-indigo-900/40 flex items-center justify-center shrink-0">🚀</span> کپی کانفیگ VLESS (مستقیم)</span>
-                    <span class="text-indigo-500 bg-indigo-50 dark:bg-indigo-950/40 px-2.5 py-1 rounded-xl">کپی</span>
+                <button onclick="copyVlessConfig()" class="w-full flex justify-between items-center px-4 py-3.5 bg-white dark:bg-amoled-card border border-gray-200 dark:border-amoled-border hover:border-indigo-500 dark:hover:border-indigo-500 rounded-2xl text-xs font-bold transition shadow-sm hover:shadow-md">
+                    <span class="flex items-center gap-2.5"><span class="w-7 h-7 rounded-lg bg-indigo-100 dark:bg-indigo-900/40 flex items-center justify-center shrink-0">🚀</span> کپی کانفیگ VLESS (مستقیم)</span>
+                    <span class="text-indigo-500 bg-indigo-50 dark:bg-indigo-950/40 px-2.5 py-1 rounded-lg">کپی</span>
                 </button>
             </div>
         </div>
     </div>
-<div id="qr-modal" class="fixed inset-0 z-[110] flex items-center justify-center p-4 bg-black/70 opacity-0 pointer-events-none transition-opacity duration-300 ease-out">
-    <div id="qr-modal-card" class="w-full max-w-sm bg-white dark:bg-amoled-card border border-gray-200 dark:border-amoled-border rounded-3xl shadow-2xl p-6 transform transition-all scale-95 opacity-0 duration-300 text-center">
+<div id="qr-modal" class="fixed inset-0 z-[110] flex items-center justify-center p-4 bg-black/70 opacity-0 pointer-events-none transition-opacity duration-200 ease-out">
+    <div id="qr-modal-card" class="w-full max-w-sm bg-white dark:bg-amoled-card border border-gray-200 dark:border-amoled-border rounded-3xl shadow-2xl p-6 transform transition-all scale-95 opacity-0 duration-200 text-center">
         <div class="flex justify-between items-center mb-4">
             <h3 class="text-lg font-bold text-gray-900 dark:text-white">QR Code</h3>
-            <button onclick="toggleQrModal(false)" class="p-1.5 rounded-xl bg-red-50 dark:bg-red-950/30 border border-red-200 dark:border-red-900/50 text-red-600 dark:text-red-500 hover:bg-red-100 dark:hover:bg-red-900/50 transition-all duration-300 shadow-md">
+            <button onclick="toggleQrModal(false)" class="p-1.5 rounded-lg bg-red-50 dark:bg-red-950/30 border border-red-200 dark:border-red-900/50 text-red-600 dark:text-red-500 hover:bg-red-100 dark:hover:bg-red-900/50 transition-all duration-200 shadow-sm">
                 <svg class="w-6 h-6" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M6 18L18 6M6 6l12 12"></path></svg>
             </button>
         </div>
-        <div class="flex justify-center bg-white p-4 rounded-2xl mb-4">
+        <div class="flex justify-center bg-white p-4 rounded-xl mb-4">
             <div id="qrcode-container"></div>
         </div>
     </div>
 </div>
 <div class="flex flex-col gap-4 mt-6 z-10">
     <div class="flex flex-wrap items-center gap-3 sm:gap-4 justify-center">
-        <a href="https://t.me/lowkey878" target="_blank" class="flex items-center gap-2 px-4 py-2 bg-white dark:bg-amoled-card border border-gray-200 dark:border-amoled-border rounded-full shadow-md hover:shadow-lg transition text-sm font-bold text-gray-700 dark:text-zinc-300 hover:text-indigo-500 dark:hover:text-indigo-400 group">
-            <svg class="w-5 h-5 text-indigo-500 group-hover:scale-110 transition" viewBox="0 0 24 24" fill="currentColor">
+        <a href="https://t.me/lowkey878" target="_blank" class="flex items-center gap-2 px-4 py-2 bg-white dark:bg-amoled-card border border-gray-200 dark:border-amoled-border rounded-full shadow-sm hover:shadow-md transition text-sm font-bold text-gray-700 dark:text-zinc-300 hover:text-cyan-500 dark:hover:text-cyan-400 group">
+            <svg class="w-5 h-5 text-cyan-500 group-hover:scale-110 transition" viewBox="0 0 24 24" fill="currentColor">
                 <path d="M12 2C6.48 2 2 6.48 2 12s4.48 10 10 10 10-4.48 10-10S17.52 2 12 2zm4.64 6.8c-.15 1.58-.8 5.42-1.13 7.19-.14.75-.42 1-.68 1.03-.58.05-1.02-.38-1.58-.75-.88-.58-1.38-.94-2.23-1.5-.99-.65-.35-1.01.22-1.59.15-.15 2.71-2.48 2.76-2.69a.2.2 0 00-.05-.18c-.06-.05-.14-.03-.21-.02-.09.02-1.49.94-4.22 2.79-.4.27-.76.41-1.08.4-.36-.01-1.04-.2-1.55-.37-.63-.2-1.12-.31-1.08-.66.02-.18.27-.36.74-.55 2.92-1.27 4.86-2.11 5.83-2.51 2.78-1.16 3.35-1.36 3.73-1.37.08 0 .27.02.39.12.1.08.13.19.14.27-.01.06.01.24 0 .24z"/>
             </svg>
             lowkey878@
@@ -7021,7 +6327,7 @@ window.addEventListener('click', (e) => {
                 ? 'bg-red-50 dark:bg-red-900/40 border-red-200 dark:border-red-800 text-red-600 dark:text-red-400' 
                 : 'bg-green-50 dark:bg-green-900/40 border-green-200 dark:border-green-800 text-green-700 dark:text-green-500';
             
-            toast.className = 'px-4 py-3 border rounded-2xl shadow-xl font-bold text-sm transform transition-all duration-500 -translate-y-full opacity-0 ' + colors;
+            toast.className = 'px-4 py-3 border rounded-xl shadow-lg font-bold text-sm transform transition-all duration-300 -translate-y-full opacity-0 ' + colors;
             toast.innerText = message;
             
             container.appendChild(toast);
@@ -7114,11 +6420,11 @@ window.addEventListener('click', (e) => {
             badge.classList.remove('hidden');
             if (u.online_count && u.online_count > 0) {
                 document.getElementById('live-connections-text').innerText = u.online_count + (limit ? '/' + limit : '') + ' دستگاه متصل';
-                badge.className = 'inline-flex items-center gap-1.5 px-3 py-1 bg-green-600/10 border border-green-600/20 text-green-600 rounded-full text-xs font-bold shadow-md';
+                badge.className = 'inline-flex items-center gap-1.5 px-3 py-1 bg-green-600/10 border border-green-600/20 text-green-600 rounded-full text-xs font-bold shadow-sm';
                 badge.querySelector('span.w-2').className = 'w-2 h-2 rounded-full bg-green-600 animate-pulse';
             } else {
                 document.getElementById('live-connections-text').innerText = '۰ دستگاه متصل';
-                badge.className = 'inline-flex items-center gap-1.5 px-3 py-1 bg-gray-500/10 border border-gray-500/20 text-gray-500 dark:text-zinc-400 rounded-full text-xs font-bold shadow-md';
+                badge.className = 'inline-flex items-center gap-1.5 px-3 py-1 bg-gray-500/10 border border-gray-500/20 text-gray-500 dark:text-zinc-400 rounded-full text-xs font-bold shadow-sm';
                 badge.querySelector('span.w-2').className = 'w-2 h-2 rounded-full bg-gray-500';
             }
             const usedGb = u.used_gb || 0;
@@ -7200,20 +6506,20 @@ window.addEventListener('click', (e) => {
             const statusCard = document.getElementById('status-card');
             const statusText = document.getElementById('status-text');
             if (u.is_active === 0) {
-                statusCard.className = 'mb-6 rounded-2xl p-4 text-center border font-bold relative z-10 bg-red-500/10 border-red-500/30 text-red-500 shadow-lg shadow-red-500/5';
+                statusCard.className = 'mb-6 rounded-2xl p-4 text-center border font-bold relative z-10 bg-red-500/10 border-red-500/30 text-red-500 shadow-md shadow-red-500/5';
                 statusCard.style.boxShadow = 'inset 0 0 12px rgba(239, 68, 68, 0.1)';
                 statusText.innerText = '❌ وضعیت اشتراک: غیرفعال / مسدود دستی';
             } else if (isVolumeExpired) {
-                statusCard.className = 'mb-6 rounded-2xl p-4 text-center border font-bold relative z-10 bg-yellow-500/10 border-yellow-500/30 text-yellow-500 shadow-lg shadow-yellow-500/5';
+                statusCard.className = 'mb-6 rounded-2xl p-4 text-center border font-bold relative z-10 bg-yellow-500/10 border-yellow-500/30 text-yellow-500 shadow-md shadow-yellow-500/5';
                 statusText.innerText = '⚠️ وضعیت اشتراک: تمام شدن حجم مجاز';
             } else if (isReqExpired) {
-                statusCard.className = 'mb-6 rounded-2xl p-4 text-center border font-bold relative z-10 bg-yellow-500/10 border-yellow-500/30 text-yellow-500 shadow-lg shadow-yellow-500/5';
+                statusCard.className = 'mb-6 rounded-2xl p-4 text-center border font-bold relative z-10 bg-yellow-500/10 border-yellow-500/30 text-yellow-500 shadow-md shadow-yellow-500/5';
                 statusText.innerText = '📈 وضعیت اشتراک: تمام شدن ریکوئست مجاز';
             } else if (isTimeExpired) {
-                statusCard.className = 'mb-6 rounded-2xl p-4 text-center border font-bold relative z-10 bg-yellow-500/10 border-yellow-500/30 text-yellow-500 shadow-lg shadow-yellow-500/5';
+                statusCard.className = 'mb-6 rounded-2xl p-4 text-center border font-bold relative z-10 bg-yellow-500/10 border-yellow-500/30 text-yellow-500 shadow-md shadow-yellow-500/5';
                 statusText.innerText = '⏳ وضعیت اشتراک: منقضی شده (پایان زمان اعتبار)';
             } else {
-                statusCard.className = 'mb-6 rounded-2xl p-4 text-center border font-bold relative z-10 bg-green-600/10 border-green-600/30 text-green-600 shadow-lg shadow-green-600/5';
+                statusCard.className = 'mb-6 rounded-2xl p-4 text-center border font-bold relative z-10 bg-green-600/10 border-green-600/30 text-green-600 shadow-md shadow-green-600/5';
                 statusText.innerText = '✅ وضعیت اشتراک: فعال و متصل';
             }
         });
